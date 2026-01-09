@@ -1,0 +1,8 @@
+{
+    "name": "test/called-before-test",
+    "autoload": {
+        "psr-4": {
+            "Test\\": "src/"
+        }
+    }
+}
