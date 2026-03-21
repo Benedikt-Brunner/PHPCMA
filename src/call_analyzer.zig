@@ -861,12 +861,18 @@ pub const CalledBeforeAnalyzer = struct {
     // Reverse call graph: callee -> list of callers
     callers_of: std.StringHashMap(std.ArrayListUnmanaged(CallerInfo)),
 
+    // Pre-computed match sets: callee strings that match before_fn/after_fn patterns
+    before_match_set: std.StringHashMap(void),
+    after_match_set: std.StringHashMap(void),
+
     pub fn init(allocator: std.mem.Allocator, call_graph: *const ProjectCallGraph) CalledBeforeAnalyzer {
         return .{
             .allocator = allocator,
             .call_graph = call_graph,
             .calls_by_caller = std.StringHashMap(std.ArrayListUnmanaged(CallInfo)).init(allocator),
             .callers_of = std.StringHashMap(std.ArrayListUnmanaged(CallerInfo)).init(allocator),
+            .before_match_set = std.StringHashMap(void).init(allocator),
+            .after_match_set = std.StringHashMap(void).init(allocator),
         };
     }
 
@@ -882,6 +888,9 @@ pub const CalledBeforeAnalyzer = struct {
             list.deinit(self.allocator);
         }
         self.callers_of.deinit();
+
+        self.before_match_set.deinit();
+        self.after_match_set.deinit();
     }
 
     /// Build indexes for efficient lookup
@@ -913,6 +922,27 @@ pub const CalledBeforeAnalyzer = struct {
         }
     }
 
+    /// Pre-compute sets of callee strings that match before_fn/after_fn patterns.
+    /// Scans calls_by_caller once so that inner loops can use O(1) set lookups
+    /// instead of repeated O(n) matchesFunction calls.
+    fn buildMatchSets(self: *CalledBeforeAnalyzer, before_fn: []const u8, after_fn: []const u8) !void {
+        var caller_it = self.calls_by_caller.iterator();
+        while (caller_it.next()) |entry| {
+            for (entry.value_ptr.items) |call| {
+                if (!self.before_match_set.contains(call.callee)) {
+                    if (matchesFunction(call.callee, before_fn)) {
+                        try self.before_match_set.put(call.callee, {});
+                    }
+                }
+                if (!self.after_match_set.contains(call.callee)) {
+                    if (matchesFunction(call.callee, after_fn)) {
+                        try self.after_match_set.put(call.callee, {});
+                    }
+                }
+            }
+        }
+    }
+
     /// Check if `before_fn` is always called before `after_fn`
     /// The function names can be:
     /// - Fully qualified: "App\\Service\\UserService::validate"
@@ -930,6 +960,9 @@ pub const CalledBeforeAnalyzer = struct {
         // Build indexes for efficient lookup
         try self.buildIndexes();
 
+        // Pre-compute match sets for O(1) lookups in inner loops
+        try self.buildMatchSets(before_fn, after_fn);
+
         var violations: std.ArrayListUnmanaged(CalledBeforeResult.Violation) = .empty;
         var matches: std.ArrayListUnmanaged(CalledBeforeResult.Match) = .empty;
         var satisfied_in: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -945,7 +978,7 @@ pub const CalledBeforeAnalyzer = struct {
             const calls = entry.value_ptr.items;
 
             for (calls) |call| {
-                if (self.matchesFunction(call.callee, after_fn)) {
+                if (self.after_match_set.contains(call.callee)) {
                     try functions_calling_after.append(self.allocator, caller);
                     break;
                 }
@@ -966,13 +999,13 @@ pub const CalledBeforeAnalyzer = struct {
 
             for (calls.items) |call| {
                 file_path = call.file_path;
-                if (self.matchesFunction(call.callee, before_fn)) {
+                if (self.before_match_set.contains(call.callee)) {
                     try before_calls.append(self.allocator, .{
                         .line = call.line,
                         .callee = call.callee,
                     });
                 }
-                if (self.matchesFunction(call.callee, after_fn)) {
+                if (self.after_match_set.contains(call.callee)) {
                     try after_calls.append(self.allocator, .{
                         .line = call.line,
                         .callee = call.callee,
@@ -1199,7 +1232,7 @@ pub const CalledBeforeAnalyzer = struct {
             var satisfying_before: ?BeforeCallInfo = null;
 
             for (caller_calls.items) |call| {
-                if (self.matchesFunction(call.callee, before_fn) and call.line < call_line) {
+                if (self.before_match_set.contains(call.callee) and call.line < call_line) {
                     has_before_before_call = true;
                     if (satisfying_before == null or call.line > satisfying_before.?.line) {
                         satisfying_before = .{
@@ -1316,9 +1349,7 @@ pub const CalledBeforeAnalyzer = struct {
     }
 
     /// Check if a callee matches a function pattern
-    fn matchesFunction(self: *CalledBeforeAnalyzer, callee: []const u8, pattern: []const u8) bool {
-        _ = self;
-
+    fn matchesFunction(callee: []const u8, pattern: []const u8) bool {
         // Exact match
         if (std.mem.eql(u8, callee, pattern)) {
             return true;
