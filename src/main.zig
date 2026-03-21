@@ -6,9 +6,14 @@ const cli = @import("cli");
 const types = @import("types.zig");
 const symbol_table = @import("symbol_table.zig");
 const composer = @import("composer.zig");
+const config_parser = @import("config.zig");
 const phpdoc = @import("phpdoc.zig");
 const type_resolver = @import("type_resolver.zig");
 const call_analyzer = @import("call_analyzer.zig");
+
+// Plugin imports
+const plugin_interface = @import("plugins/plugin_interface.zig");
+const plugin_registry = @import("plugins/plugin_registry.zig");
 
 // Function defined in the compiled C files
 extern fn tree_sitter_php() callconv(.c) *ts.Language;
@@ -193,14 +198,17 @@ const SymbolCollector = struct {
         class.file_path = self.file_context.file_path;
         class.start_line = node.startPoint().row + 1;
 
-        // Get extends
-        if (node.childByFieldName("base_clause")) |base| {
-            try self.parseExtendsClause(base, &class);
-        }
-
-        // Get implements
-        if (node.childByFieldName("interfaces")) |ifaces| {
-            try self.parseImplementsClause(ifaces, &class);
+        // Get extends and implements by iterating children (tree-sitter-php uses child nodes not fields)
+        var i: u32 = 0;
+        while (i < node.namedChildCount()) : (i += 1) {
+            if (node.namedChild(i)) |child| {
+                const child_kind = child.kind();
+                if (std.mem.eql(u8, child_kind, "base_clause")) {
+                    try self.parseExtendsClause(child, &class);
+                } else if (std.mem.eql(u8, child_kind, "class_interface_clause")) {
+                    try self.parseImplementsClause(child, &class);
+                }
+            }
         }
 
         // Store current class context
@@ -718,8 +726,10 @@ var project_config = struct {
 
 var called_before_config = struct {
     composer: []const u8 = "",
+    config: []const u8 = "", // Path to .phpcma.json for monorepo mode
     before: []const u8 = "",
     after: []const u8 = "",
+    plugins: []const u8 = "",
     output: []const u8 = "",
     verbose: bool = false,
 }{};
@@ -800,9 +810,14 @@ pub fn main() !void {
                             .{
                                 .long_name = "composer",
                                 .short_alias = 'c',
-                                .help = "Path to composer.json",
+                                .help = "Path to composer.json (single project mode)",
                                 .value_ref = r.mkRef(&called_before_config.composer),
-                                .required = true,
+                            },
+                            .{
+                                .long_name = "config",
+                                .short_alias = 'g',
+                                .help = "Path to .phpcma.json (monorepo mode)",
+                                .value_ref = r.mkRef(&called_before_config.config),
                             },
                             .{
                                 .long_name = "before",
@@ -829,6 +844,12 @@ pub fn main() !void {
                                 .short_alias = 'v',
                                 .help = "Verbose output",
                                 .value_ref = r.mkRef(&called_before_config.verbose),
+                            },
+                            .{
+                                .long_name = "plugins",
+                                .short_alias = 'p',
+                                .help = "Comma-separated list of plugins (e.g., 'symfony-events')",
+                                .value_ref = r.mkRef(&called_before_config.plugins),
                             },
                         }),
                         .target = cli.CommandTarget{
@@ -1046,18 +1067,73 @@ fn analyzeCalledBefore() !void {
 
     const stdout: std.fs.File = .{ .handle = std.posix.STDOUT_FILENO };
 
-    // Pass 1: Parse composer.json and discover files
-    if (called_before_config.verbose) {
-        try stdout.writeAll("Pass 1: Discovering files from composer.json...\n");
+    // Validate that either -c or -g is provided (but not both or neither)
+    const has_composer = called_before_config.composer.len > 0;
+    const has_config = called_before_config.config.len > 0;
+
+    if (!has_composer and !has_config) {
+        try stdout.writeAll("Error: Either --composer (-c) or --config (-g) must be specified\n");
+        return;
     }
 
-    const config = composer.parseComposerJson(allocator, called_before_config.composer) catch |err| {
-        const msg = try std.fmt.allocPrint(allocator, "Error parsing composer.json: {}\n", .{err});
-        try stdout.writeAll(msg);
+    if (has_composer and has_config) {
+        try stdout.writeAll("Error: Cannot use both --composer (-c) and --config (-g) at the same time\n");
         return;
-    };
+    }
 
-    const files = try composer.discoverFiles(allocator, &config);
+    // Pass 1: Parse configuration and discover files
+    var project_configs: []ProjectConfig = undefined;
+    var files: []const []const u8 = undefined;
+
+    if (has_config) {
+        // Monorepo mode: parse .phpcma.json
+        if (called_before_config.verbose) {
+            try stdout.writeAll("Pass 1: Discovering files from .phpcma.json (monorepo mode)...\n");
+        }
+
+        var phpcma_config = config_parser.parseConfigFile(allocator, called_before_config.config) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "Error parsing .phpcma.json: {}\n", .{err});
+            try stdout.writeAll(msg);
+            return;
+        };
+
+        if (called_before_config.verbose) {
+            try config_parser.printConfig(&phpcma_config, stdout);
+            try stdout.writeAll("\n");
+        }
+
+        // Parse all discovered composer.json files
+        project_configs = config_parser.parseDiscoveredProjects(allocator, &phpcma_config) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "Error parsing projects: {}\n", .{err});
+            try stdout.writeAll(msg);
+            return;
+        };
+
+        // Discover files from all projects
+        files = config_parser.discoverFilesFromConfigs(allocator, project_configs) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "Error discovering files: {}\n", .{err});
+            try stdout.writeAll(msg);
+            return;
+        };
+    } else {
+        // Single project mode: parse composer.json
+        if (called_before_config.verbose) {
+            try stdout.writeAll("Pass 1: Discovering files from composer.json...\n");
+        }
+
+        const single_config = composer.parseComposerJson(allocator, called_before_config.composer) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "Error parsing composer.json: {}\n", .{err});
+            try stdout.writeAll(msg);
+            return;
+        };
+
+        // Create a single-element slice
+        var configs_array = try allocator.alloc(ProjectConfig, 1);
+        configs_array[0] = single_config;
+        project_configs = configs_array;
+
+        files = try composer.discoverFiles(allocator, &single_config);
+    }
 
     if (called_before_config.verbose) {
         const msg = try std.fmt.allocPrint(allocator, "Discovered {d} PHP files\n\n", .{files.len});
@@ -1088,6 +1164,10 @@ fn analyzeCalledBefore() !void {
         file_contexts.deinit();
     }
 
+    // Store file sources for plugins that need to re-parse
+    var file_sources = std.StringHashMap([]const u8).init(allocator);
+    defer file_sources.deinit();
+
     for (files) |file_path| {
         const file = std.fs.openFileAbsolute(file_path, .{}) catch continue;
         defer file.close();
@@ -1097,12 +1177,20 @@ fn analyzeCalledBefore() !void {
         defer tree.destroy();
 
         var file_ctx = FileContext.init(allocator, file_path);
-        file_ctx.project_config = &config;
+
+        // Find the matching project config for this file
+        for (project_configs) |*cfg| {
+            if (std.mem.startsWith(u8, file_path, cfg.root_path)) {
+                file_ctx.project_config = cfg;
+                break;
+            }
+        }
 
         var collector = SymbolCollector.init(allocator, &sym_table, &file_ctx, source);
         collector.collect(tree) catch continue;
 
         try file_contexts.put(file_path, file_ctx);
+        try file_sources.put(file_path, source);
     }
 
     // Pass 3: Resolve inheritance
@@ -1137,9 +1225,68 @@ fn analyzeCalledBefore() !void {
         try call_graph.addCalls(&analyzer);
     }
 
-    // Pass 5: Called-before analysis
+    // Pass 5: Plugin execution (synthetic edges)
+    if (called_before_config.plugins.len > 0) {
+        if (called_before_config.verbose) {
+            try stdout.writeAll("Pass 5: Running plugins...\n");
+        }
+
+        // Create plugin context with all project configs
+        const plugin_context = plugin_interface.PluginContext{
+            .allocator = allocator,
+            .sym_table = &sym_table,
+            .calls = call_graph.calls.items,
+            .file_sources = &file_sources,
+            .project_configs = project_configs,
+        };
+
+        // Parse and run each enabled plugin
+        var plugin_iter = std.mem.splitSequence(u8, called_before_config.plugins, ",");
+        while (plugin_iter.next()) |plugin_name_raw| {
+            const plugin_name = std.mem.trim(u8, plugin_name_raw, " ");
+            if (plugin_name.len == 0) continue;
+
+            if (plugin_registry.getPlugin(plugin_name)) |plugin| {
+                if (called_before_config.verbose) {
+                    const msg = try std.fmt.allocPrint(allocator, "  Running plugin: {s}\n", .{plugin.name});
+                    try stdout.writeAll(msg);
+                }
+
+                const edges = plugin.analyze(&plugin_context) catch |err| {
+                    const err_msg = try std.fmt.allocPrint(allocator, "  Plugin error: {}\n", .{err});
+                    try stdout.writeAll(err_msg);
+                    continue;
+                };
+
+                // Add synthetic edges to call graph
+                for (edges) |edge| {
+                    try call_graph.addSyntheticEdge(
+                        edge.caller_fqn,
+                        edge.callee_fqn,
+                        edge.file_path,
+                        edge.line,
+                        edge.confidence,
+                    );
+                }
+
+                if (called_before_config.verbose) {
+                    const msg = try std.fmt.allocPrint(allocator, "    Added {d} synthetic edges\n", .{edges.len});
+                    try stdout.writeAll(msg);
+                }
+            } else {
+                const warn_msg = try std.fmt.allocPrint(allocator, "  Warning: Unknown plugin '{s}'\n", .{plugin_name});
+                try stdout.writeAll(warn_msg);
+            }
+        }
+
+        if (called_before_config.verbose) {
+            try stdout.writeAll("\n");
+        }
+    }
+
+    // Pass 6: Called-before analysis
     if (called_before_config.verbose) {
-        try stdout.writeAll("Pass 5: Running called-before analysis...\n\n");
+        try stdout.writeAll("Pass 6: Running called-before analysis...\n\n");
     }
 
     var cb_analyzer = call_analyzer.CalledBeforeAnalyzer.init(allocator, &call_graph);

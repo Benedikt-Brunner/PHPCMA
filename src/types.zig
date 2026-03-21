@@ -546,6 +546,7 @@ pub const ResolutionMethod = enum {
     static_call, // Foo::method()
     property_type, // From property type declaration
     return_type_chain, // From return type of previous call
+    plugin_generated, // Synthetic edge from plugin (e.g., event dispatch -> handler)
     unresolved,
 };
 
