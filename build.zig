@@ -229,6 +229,29 @@ pub fn build(b: *std.Build) void {
     const run_generics_tests = b.addRunArtifact(generics_tests);
     test_step.dependOn(&run_generics_tests.step);
 
+    const return_type_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/return_type_checker.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    return_type_tests.root_module.addImport("tree-sitter", ts_dep.module("tree_sitter"));
+    return_type_tests.root_module.addImport("cli", cli_dep.module("cli"));
+    return_type_tests.addIncludePath(php_src_root);
+    return_type_tests.addCSourceFile(.{
+        .file = php_src_root.path(b, "parser.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    return_type_tests.addCSourceFile(.{
+        .file = php_src_root.path(b, "scanner.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    return_type_tests.linkLibC();
+
+    const run_return_type_tests = b.addRunArtifact(return_type_tests);
+    test_step.dependOn(&run_return_type_tests.step);
+
     // ----------------------------------------------------------------
     // Benchmarks (ReleaseFast)
     // ----------------------------------------------------------------
