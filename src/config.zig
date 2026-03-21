@@ -194,29 +194,25 @@ pub fn discoverFilesFromConfigs(allocator: std.mem.Allocator, configs: []const P
 // ============================================================================
 
 pub fn printConfig(phpcma_config: *const PhpcmaConfig, file: std.fs.File) !void {
-    const allocator = phpcma_config.allocator;
+    var buf: [4096]u8 = undefined;
+    var w = file.writer(&buf);
+    const writer = &w.interface;
 
-    try file.writeAll("PHPCMA Configuration:\n");
+    try writer.writeAll("PHPCMA Configuration:\n");
 
-    const root_msg = try std.fmt.allocPrint(allocator, "  Config Root: {s}\n", .{phpcma_config.config_root});
-    defer allocator.free(root_msg);
-    try file.writeAll(root_msg);
+    try writer.print("  Config Root: {s}\n", .{phpcma_config.config_root});
 
-    try file.writeAll("\n  Scan Paths:\n");
+    try writer.writeAll("\n  Scan Paths:\n");
     for (phpcma_config.scan_paths) |path| {
-        const path_msg = try std.fmt.allocPrint(allocator, "    - {s}\n", .{path});
-        defer allocator.free(path_msg);
-        try file.writeAll(path_msg);
+        try writer.print("    - {s}\n", .{path});
     }
 
-    try file.writeAll("\n  Discovered Projects:\n");
+    try writer.writeAll("\n  Discovered Projects:\n");
     for (phpcma_config.discovered_projects) |path| {
-        const path_msg = try std.fmt.allocPrint(allocator, "    - {s}\n", .{path});
-        defer allocator.free(path_msg);
-        try file.writeAll(path_msg);
+        try writer.print("    - {s}\n", .{path});
     }
 
-    const count_msg = try std.fmt.allocPrint(allocator, "\n  Total: {d} projects\n", .{phpcma_config.discovered_projects.len});
-    defer allocator.free(count_msg);
-    try file.writeAll(count_msg);
+    try writer.print("\n  Total: {d} projects\n", .{phpcma_config.discovered_projects.len});
+
+    try writer.flush();
 }

@@ -330,7 +330,10 @@ pub const SymbolTable = struct {
 
     pub fn printStats(self: *const SymbolTable, file: std.fs.File) !void {
         const stats = self.getStats();
-        const msg = try std.fmt.allocPrint(self.allocator,
+        var buf: [4096]u8 = undefined;
+        var w = file.writer(&buf);
+        const writer = &w.interface;
+        try writer.print(
             \\Symbol Table Statistics:
             \\  Classes:    {d}
             \\  Interfaces: {d}
@@ -347,8 +350,7 @@ pub const SymbolTable = struct {
             stats.method_count,
             stats.property_count,
         });
-        defer self.allocator.free(msg);
-        try file.writeAll(msg);
+        try writer.flush();
     }
 };
 
