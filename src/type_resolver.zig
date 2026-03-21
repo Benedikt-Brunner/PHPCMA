@@ -214,7 +214,7 @@ pub const TypeResolver = struct {
             const class_kind = class_node.kind();
             if (std.mem.eql(u8, class_kind, "name") or std.mem.eql(u8, class_kind, "qualified_name")) {
                 const class_name = getNodeText(source, class_node);
-                const fqcn = self.file_context.resolveFQCN(class_name);
+                const fqcn = try self.file_context.resolveFQCN(class_name);
 
                 return TypeInfo{
                     .kind = .simple,
@@ -276,7 +276,7 @@ pub const TypeResolver = struct {
                 return null;
             }
         } else {
-            fqcn = self.file_context.resolveFQCN(class_name);
+            fqcn = try self.file_context.resolveFQCN(class_name);
         }
 
         // Look up method
