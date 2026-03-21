@@ -2,6 +2,7 @@ const std = @import("std");
 const types = @import("types.zig");
 
 const TypeInfo = types.TypeInfo;
+const TemplateParam = types.TemplateParam;
 
 // ============================================================================
 // PHPDoc Parser
@@ -17,6 +18,11 @@ pub const DocBlock = struct {
     deprecated: bool,
     inheritdoc: bool,
 
+    // Generic type annotations
+    template_params: []const TemplateParam, // @template T, @template T of Foo
+    generic_extends: ?TypeInfo, // @extends Collection<User>
+    generic_implements: []const TypeInfo, // @implements Repository<User>
+
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) DocBlock {
@@ -28,6 +34,9 @@ pub const DocBlock = struct {
             .throws = &.{},
             .deprecated = false,
             .inheritdoc = false,
+            .template_params = &.{},
+            .generic_extends = null,
+            .generic_implements = &.{},
             .allocator = allocator,
         };
     }
@@ -51,6 +60,10 @@ pub fn parsePhpDoc(allocator: std.mem.Allocator, comment: []const u8) !DocBlock 
     var doc = DocBlock.init(allocator);
     var throws_list: std.ArrayListUnmanaged(TypeInfo) = .empty;
     errdefer throws_list.deinit(allocator);
+    var template_list: std.ArrayListUnmanaged(TemplateParam) = .empty;
+    errdefer template_list.deinit(allocator);
+    var generic_impl_list: std.ArrayListUnmanaged(TypeInfo) = .empty;
+    errdefer generic_impl_list.deinit(allocator);
 
     // Split into lines and process
     var lines = std.mem.splitSequence(u8, comment, "\n");
@@ -75,6 +88,28 @@ pub fn parsePhpDoc(allocator: std.mem.Allocator, comment: []const u8) !DocBlock 
             if (try parseTypeAnnotation(allocator, rest)) |t| {
                 try throws_list.append(allocator, t);
             }
+        } else if (std.mem.startsWith(u8, line, "@template")) {
+            if (parseTemplateAnnotation(allocator, line)) |tpl| {
+                try template_list.append(allocator, tpl);
+            }
+        } else if (std.mem.startsWith(u8, line, "@extends") or std.mem.startsWith(u8, line, "@phpstan-extends") or std.mem.startsWith(u8, line, "@psalm-extends")) {
+            const rest = if (std.mem.startsWith(u8, line, "@phpstan-extends"))
+                line["@phpstan-extends".len..]
+            else if (std.mem.startsWith(u8, line, "@psalm-extends"))
+                line["@psalm-extends".len..]
+            else
+                line["@extends".len..];
+            doc.generic_extends = try parseTypeAnnotation(allocator, rest);
+        } else if (std.mem.startsWith(u8, line, "@implements") or std.mem.startsWith(u8, line, "@phpstan-implements") or std.mem.startsWith(u8, line, "@psalm-implements")) {
+            const rest = if (std.mem.startsWith(u8, line, "@phpstan-implements"))
+                line["@phpstan-implements".len..]
+            else if (std.mem.startsWith(u8, line, "@psalm-implements"))
+                line["@psalm-implements".len..]
+            else
+                line["@implements".len..];
+            if (try parseTypeAnnotation(allocator, rest)) |t| {
+                try generic_impl_list.append(allocator, t);
+            }
         } else if (std.mem.startsWith(u8, line, "@deprecated")) {
             doc.deprecated = true;
         } else if (std.mem.startsWith(u8, line, "@inheritdoc") or std.mem.startsWith(u8, line, "{@inheritdoc}")) {
@@ -83,6 +118,8 @@ pub fn parsePhpDoc(allocator: std.mem.Allocator, comment: []const u8) !DocBlock 
     }
 
     doc.throws = try throws_list.toOwnedSlice(allocator);
+    doc.template_params = try template_list.toOwnedSlice(allocator);
+    doc.generic_implements = try generic_impl_list.toOwnedSlice(allocator);
     return doc;
 }
 
@@ -124,6 +161,38 @@ fn parseParamAnnotation(allocator: std.mem.Allocator, line: []const u8) !?struct
     }
 
     return null;
+}
+
+/// Parse @template annotation: @template T or @template T of SomeClass
+fn parseTemplateAnnotation(allocator: std.mem.Allocator, line: []const u8) ?TemplateParam {
+    // Skip "@template" and whitespace
+    var rest = std.mem.trimLeft(u8, line["@template".len..], " \t");
+    if (rest.len == 0) return null;
+
+    // Parse template name (single identifier)
+    var end: usize = 0;
+    while (end < rest.len and (std.ascii.isAlphanumeric(rest[end]) or rest[end] == '_')) : (end += 1) {}
+    if (end == 0) return null;
+
+    const name = rest[0..end];
+    rest = std.mem.trimLeft(u8, rest[end..], " \t");
+
+    // Check for "of" bound
+    var bound: ?[]const u8 = null;
+    if (std.mem.startsWith(u8, rest, "of ") or std.mem.startsWith(u8, rest, "of\t")) {
+        rest = std.mem.trimLeft(u8, rest[2..], " \t");
+        // Parse bound type name
+        var bound_end: usize = 0;
+        while (bound_end < rest.len and rest[bound_end] != ' ' and rest[bound_end] != '\t' and rest[bound_end] != '\n') : (bound_end += 1) {}
+        if (bound_end > 0) {
+            bound = allocator.dupe(u8, rest[0..bound_end]) catch return null;
+        }
+    }
+
+    return .{
+        .name = allocator.dupe(u8, name) catch return null,
+        .bound = bound,
+    };
 }
 
 /// Parse a type annotation (the type part after @return, @var, etc.)
@@ -221,15 +290,56 @@ pub fn parseTypeString(allocator: std.mem.Allocator, type_str: []const u8) !Type
         };
     }
 
-    // Check for generic array syntax array<Key, Value>
-    if (std.mem.startsWith(u8, trimmed, "array<") or std.mem.startsWith(u8, trimmed, "Array<")) {
-        // For now, just treat as array
-        return TypeInfo{
-            .kind = .array_type,
-            .base_type = try allocator.dupe(u8, trimmed),
-            .type_parts = &.{},
-            .is_builtin = true,
-        };
+    // Check for generic type syntax: Name<Params>
+    if (std.mem.indexOf(u8, trimmed, "<")) |angle_pos| {
+        // Find matching '>'
+        if (std.mem.lastIndexOf(u8, trimmed, ">")) |close_pos| {
+            const base = std.mem.trim(u8, trimmed[0..angle_pos], " \t");
+            const params_str = trimmed[angle_pos + 1 .. close_pos];
+
+            // Special case: array<Key, Value> stays as array_type
+            if (std.mem.eql(u8, base, "array") or std.mem.eql(u8, base, "Array")) {
+                return TypeInfo{
+                    .kind = .array_type,
+                    .base_type = try allocator.dupe(u8, trimmed),
+                    .type_parts = &.{},
+                    .is_builtin = true,
+                };
+            }
+
+            // Parse generic type params (comma-separated, respecting nesting)
+            var param_list: std.ArrayListUnmanaged(TypeInfo) = .empty;
+            errdefer param_list.deinit(allocator);
+
+            var depth: usize = 0;
+            var start: usize = 0;
+            for (params_str, 0..) |c, i| {
+                if (c == '<') {
+                    depth += 1;
+                } else if (c == '>') {
+                    if (depth > 0) depth -= 1;
+                } else if (c == ',' and depth == 0) {
+                    const param_str = std.mem.trim(u8, params_str[start..i], " \t");
+                    if (param_str.len > 0) {
+                        try param_list.append(allocator, try parseTypeString(allocator, param_str));
+                    }
+                    start = i + 1;
+                }
+            }
+            // Last param
+            const last_param = std.mem.trim(u8, params_str[start..], " \t");
+            if (last_param.len > 0) {
+                try param_list.append(allocator, try parseTypeString(allocator, last_param));
+            }
+
+            return TypeInfo{
+                .kind = .generic,
+                .base_type = try allocator.dupe(u8, base),
+                .type_parts = &.{},
+                .type_params = try param_list.toOwnedSlice(allocator),
+                .is_builtin = false,
+            };
+        }
     }
 
     // Check for special types
@@ -476,6 +586,108 @@ test "parse complex generics type" {
 
     try std.testing.expect(type_info.kind == .array_type);
     try std.testing.expect(type_info.is_builtin);
+}
+
+test "parse generic type Collection<User>" {
+    var arena = testAllocator();
+    defer arena.deinit();
+    const type_info = try parseTypeString(arena.allocator(), "Collection<User>");
+
+    try std.testing.expect(type_info.kind == .generic);
+    try std.testing.expectEqualStrings("Collection", type_info.base_type);
+    try std.testing.expect(type_info.type_params.len == 1);
+    try std.testing.expectEqualStrings("User", type_info.type_params[0].base_type);
+    try std.testing.expect(!type_info.is_builtin);
+}
+
+test "parse nested generic type Repository<Collection<User>>" {
+    var arena = testAllocator();
+    defer arena.deinit();
+    const type_info = try parseTypeString(arena.allocator(), "Repository<Collection<User>>");
+
+    try std.testing.expect(type_info.kind == .generic);
+    try std.testing.expectEqualStrings("Repository", type_info.base_type);
+    try std.testing.expect(type_info.type_params.len == 1);
+    try std.testing.expect(type_info.type_params[0].kind == .generic);
+    try std.testing.expectEqualStrings("Collection", type_info.type_params[0].base_type);
+    try std.testing.expect(type_info.type_params[0].type_params.len == 1);
+    try std.testing.expectEqualStrings("User", type_info.type_params[0].type_params[0].base_type);
+}
+
+test "parse @template annotation" {
+    var arena = testAllocator();
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const doc = try parsePhpDoc(allocator,
+        \\/**
+        \\ * @template T
+        \\ * @template V of SomeClass
+        \\ */
+    );
+
+    try std.testing.expect(doc.template_params.len == 2);
+    try std.testing.expectEqualStrings("T", doc.template_params[0].name);
+    try std.testing.expect(doc.template_params[0].bound == null);
+    try std.testing.expectEqualStrings("V", doc.template_params[1].name);
+    try std.testing.expect(doc.template_params[1].bound != null);
+    try std.testing.expectEqualStrings("SomeClass", doc.template_params[1].bound.?);
+}
+
+test "parse @extends with generic param" {
+    var arena = testAllocator();
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const doc = try parsePhpDoc(allocator,
+        \\/**
+        \\ * @extends Collection<User>
+        \\ */
+    );
+
+    try std.testing.expect(doc.generic_extends != null);
+    try std.testing.expect(doc.generic_extends.?.kind == .generic);
+    try std.testing.expectEqualStrings("Collection", doc.generic_extends.?.base_type);
+    try std.testing.expect(doc.generic_extends.?.type_params.len == 1);
+    try std.testing.expectEqualStrings("User", doc.generic_extends.?.type_params[0].base_type);
+}
+
+test "parse @phpstan-extends and @psalm-extends" {
+    var arena = testAllocator();
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const doc1 = try parsePhpDoc(allocator,
+        \\/**
+        \\ * @phpstan-extends Repository<Product>
+        \\ */
+    );
+    try std.testing.expect(doc1.generic_extends != null);
+    try std.testing.expect(doc1.generic_extends.?.kind == .generic);
+    try std.testing.expectEqualStrings("Repository", doc1.generic_extends.?.base_type);
+
+    const doc2 = try parsePhpDoc(allocator,
+        \\/**
+        \\ * @psalm-extends Repository<Product>
+        \\ */
+    );
+    try std.testing.expect(doc2.generic_extends != null);
+    try std.testing.expect(doc2.generic_extends.?.kind == .generic);
+    try std.testing.expectEqualStrings("Repository", doc2.generic_extends.?.base_type);
+}
+
+test "parse @implements with generic param" {
+    var arena = testAllocator();
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const doc = try parsePhpDoc(allocator,
+        \\/**
+        \\ * @implements Repository<User>
+        \\ */
+    );
+
+    try std.testing.expect(doc.generic_implements.len == 1);
+    try std.testing.expect(doc.generic_implements[0].kind == .generic);
+    try std.testing.expectEqualStrings("Repository", doc.generic_implements[0].base_type);
+    try std.testing.expect(doc.generic_implements[0].type_params.len == 1);
+    try std.testing.expectEqualStrings("User", doc.generic_implements[0].type_params[0].base_type);
 }
 
 test "parse multi-annotation docblock" {

@@ -3,6 +3,7 @@ const ts = @import("tree-sitter");
 const types = @import("types.zig");
 const symbol_table = @import("symbol_table.zig");
 const phpdoc = @import("phpdoc.zig");
+const generics = @import("generics.zig");
 
 const TypeInfo = types.TypeInfo;
 const ClassSymbol = types.ClassSymbol;
@@ -242,6 +243,20 @@ pub const TypeResolver = struct {
 
         // Look up method in symbol table
         if (self.symbol_table.resolveMethod(object_type.base_type, method_name)) |method| {
+            // If the object type is generic and the class has template params,
+            // use the generic substitution engine
+            if (object_type.kind == .generic and object_type.type_params.len > 0) {
+                if (self.symbol_table.getClass(object_type.base_type)) |class| {
+                    if (class.template_params.len > 0) {
+                        return generics.resolveGenericMethodReturn(
+                            self.allocator,
+                            class,
+                            method,
+                            object_type,
+                        ) catch return method.effectiveReturnType();
+                    }
+                }
+            }
             return method.effectiveReturnType();
         }
 
