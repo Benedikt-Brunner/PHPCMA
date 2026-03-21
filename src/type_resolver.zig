@@ -466,3 +466,539 @@ fn getNodeText(source: []const u8, node: ts.Node) []const u8 {
     }
     return source[start..end];
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+extern fn tree_sitter_php() callconv(.c) *ts.Language;
+
+/// Helper: parse PHP source and return the tree (caller must destroy)
+fn testParse(source: []const u8) ?*ts.Tree {
+    const parser = ts.Parser.create();
+    defer parser.destroy();
+    const php_lang = tree_sitter_php();
+    parser.setLanguage(php_lang) catch return null;
+    return parser.parseString(source, null);
+}
+
+/// Helper: recursively find first node matching a given kind string
+fn findNodeByKind(node: ts.Node, kind_str: []const u8) ?ts.Node {
+    if (std.mem.eql(u8, node.kind(), kind_str)) {
+        return node;
+    }
+    var i: u32 = 0;
+    while (i < node.namedChildCount()) : (i += 1) {
+        if (node.namedChild(i)) |child| {
+            if (findNodeByKind(child, kind_str)) |found| {
+                return found;
+            }
+        }
+    }
+    return null;
+}
+
+/// Helper: find all nodes matching a given kind string
+fn findAllNodesByKind(allocator: std.mem.Allocator, node: ts.Node, kind_str: []const u8, results: *std.ArrayListUnmanaged(ts.Node)) !void {
+    if (std.mem.eql(u8, node.kind(), kind_str)) {
+        try results.append(allocator, node);
+    }
+    var i: u32 = 0;
+    while (i < node.namedChildCount()) : (i += 1) {
+        if (node.namedChild(i)) |child| {
+            try findAllNodesByKind(allocator, child, kind_str, results);
+        }
+    }
+}
+
+test "resolveThisType in class context" {
+    const allocator = std.testing.allocator;
+    var sym_table = SymbolTable.init(allocator);
+    defer sym_table.deinit();
+
+    var file_ctx = types.FileContext.init(allocator, "test.php");
+    defer file_ctx.deinit();
+    file_ctx.namespace = "App\\Service";
+
+    var resolver = TypeResolver.init(allocator, &sym_table, &file_ctx);
+    defer resolver.deinit();
+
+    // Set up current class context
+    const class = types.ClassSymbol.init(allocator, "App\\Service\\UserService");
+    try sym_table.addClass(class);
+    resolver.current_class = sym_table.getClass("App\\Service\\UserService");
+
+    // Parse PHP with $this reference
+    const source = "<?php $this->doSomething();";
+    const tree = testParse(source) orelse return error.ParseFailed;
+    defer tree.destroy();
+
+    // Find the variable_name node for $this
+    const root = tree.rootNode();
+    const var_node = findNodeByKind(root, "variable_name") orelse return error.NodeNotFound;
+    const text = getNodeText(source, var_node);
+    try std.testing.expectEqualStrings("$this", text);
+
+    // Resolve type
+    const type_info = try resolver.resolveExpressionType(var_node, source);
+    try std.testing.expect(type_info != null);
+    try std.testing.expectEqualStrings("App\\Service\\UserService", type_info.?.base_type);
+}
+
+test "resolveNewExpressionType" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer _ = arena.deinit();
+    const allocator = arena.allocator();
+
+    var sym_table = SymbolTable.init(allocator);
+    var file_ctx = types.FileContext.init(allocator, "test.php");
+    file_ctx.namespace = "App";
+    var resolver = TypeResolver.init(allocator, &sym_table, &file_ctx);
+
+    const source = "<?php $x = new Foo();";
+    const tree = testParse(source) orelse return error.ParseFailed;
+    defer tree.destroy();
+
+    const root = tree.rootNode();
+    const new_node = findNodeByKind(root, "object_creation_expression") orelse return error.NodeNotFound;
+
+    const type_info = try resolver.resolveExpressionType(new_node, source);
+    try std.testing.expect(type_info != null);
+    try std.testing.expectEqualStrings("App\\Foo", type_info.?.base_type);
+    try std.testing.expect(!type_info.?.is_builtin);
+}
+
+test "variable type from assignment tracking" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer _ = arena.deinit();
+    const allocator = arena.allocator();
+
+    var sym_table = SymbolTable.init(allocator);
+    var file_ctx = types.FileContext.init(allocator, "test.php");
+    file_ctx.namespace = "App";
+    var resolver = TypeResolver.init(allocator, &sym_table, &file_ctx);
+
+    // Push a scope
+    _ = try resolver.pushScope();
+
+    const source = "<?php $x = new Foo();";
+    const tree = testParse(source) orelse return error.ParseFailed;
+    defer tree.destroy();
+
+    const root = tree.rootNode();
+
+    // Find assignment and track it
+    const assign_node = findNodeByKind(root, "assignment_expression") orelse return error.NodeNotFound;
+    try resolver.trackAssignment(assign_node, source);
+
+    // Now resolve $x — find the variable_name node for $x
+    var var_nodes: std.ArrayListUnmanaged(ts.Node) = .empty;
+    defer var_nodes.deinit(allocator);
+    try findAllNodesByKind(allocator, root, "variable_name", &var_nodes);
+
+    // Find $x (not in the new expression context, but on the LHS)
+    var x_node: ?ts.Node = null;
+    for (var_nodes.items) |vn| {
+        if (std.mem.eql(u8, getNodeText(source, vn), "$x")) {
+            x_node = vn;
+            break;
+        }
+    }
+    const var_node = x_node orelse return error.NodeNotFound;
+
+    const type_info = try resolver.resolveExpressionType(var_node, source);
+    try std.testing.expect(type_info != null);
+    try std.testing.expectEqualStrings("App\\Foo", type_info.?.base_type);
+}
+
+test "parameter type resolution" {
+    const allocator = std.testing.allocator;
+    var sym_table = SymbolTable.init(allocator);
+    defer sym_table.deinit();
+
+    var file_ctx = types.FileContext.init(allocator, "test.php");
+    defer file_ctx.deinit();
+
+    var resolver = TypeResolver.init(allocator, &sym_table, &file_ctx);
+    defer resolver.deinit();
+
+    // Set up a method with a typed parameter
+    const param = types.ParameterInfo{
+        .name = "service",
+        .type_info = TypeInfo{
+            .kind = .simple,
+            .base_type = "App\\UserService",
+            .type_parts = &.{},
+            .is_builtin = false,
+        },
+        .has_default = false,
+        .is_variadic = false,
+        .is_by_reference = false,
+        .is_promoted = false,
+        .phpdoc_type = null,
+    };
+
+    const params = [_]types.ParameterInfo{param};
+
+    const method = types.MethodSymbol{
+        .name = "handle",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &params,
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 1,
+        .end_line = 10,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\Controller",
+        .file_path = "test.php",
+    };
+
+    resolver.current_method = &method;
+
+    // Parse PHP with $service variable
+    const source = "<?php $service->doWork();";
+    const tree = testParse(source) orelse return error.ParseFailed;
+    defer tree.destroy();
+
+    const root = tree.rootNode();
+    const var_node = findNodeByKind(root, "variable_name") orelse return error.NodeNotFound;
+    const text = getNodeText(source, var_node);
+    try std.testing.expectEqualStrings("$service", text);
+
+    const type_info = try resolver.resolveExpressionType(var_node, source);
+    try std.testing.expect(type_info != null);
+    try std.testing.expectEqualStrings("App\\UserService", type_info.?.base_type);
+}
+
+test "method return type chain" {
+    const allocator = std.testing.allocator;
+    var sym_table = SymbolTable.init(allocator);
+    defer sym_table.deinit();
+
+    var file_ctx = types.FileContext.init(allocator, "test.php");
+    defer file_ctx.deinit();
+    file_ctx.namespace = "App";
+
+    var resolver = TypeResolver.init(allocator, &sym_table, &file_ctx);
+    defer resolver.deinit();
+
+    // Set up class with a method that has a return type
+    var class = types.ClassSymbol.init(allocator, "App\\Repository");
+    try class.addMethod(.{
+        .name = "findAll",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = TypeInfo{
+            .kind = .simple,
+            .base_type = "App\\Collection",
+            .type_parts = &.{},
+            .is_builtin = false,
+        },
+        .phpdoc_return = null,
+        .start_line = 1,
+        .end_line = 5,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\Repository",
+        .file_path = "test.php",
+    });
+    try sym_table.addClass(class);
+
+    // Push a scope and set $repo type
+    const scope = try resolver.pushScope();
+    try scope.setVariableType("$repo", TypeInfo{
+        .kind = .simple,
+        .base_type = "App\\Repository",
+        .type_parts = &.{},
+        .is_builtin = false,
+    });
+
+    const source = "<?php $repo->findAll();";
+    const tree = testParse(source) orelse return error.ParseFailed;
+    defer tree.destroy();
+
+    const root = tree.rootNode();
+    const call_node = findNodeByKind(root, "member_call_expression") orelse return error.NodeNotFound;
+
+    const type_info = try resolver.resolveExpressionType(call_node, source);
+    try std.testing.expect(type_info != null);
+    try std.testing.expectEqualStrings("App\\Collection", type_info.?.base_type);
+}
+
+test "static call Foo::bar()" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer _ = arena.deinit();
+    const allocator = arena.allocator();
+
+    var sym_table = SymbolTable.init(allocator);
+    var file_ctx = types.FileContext.init(allocator, "test.php");
+    file_ctx.namespace = "App";
+    var resolver = TypeResolver.init(allocator, &sym_table, &file_ctx);
+
+    // Set up class with static method
+    var class = types.ClassSymbol.init(allocator, "App\\Factory");
+    try class.addMethod(.{
+        .name = "create",
+        .visibility = .public,
+        .is_static = true,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = TypeInfo{
+            .kind = .simple,
+            .base_type = "App\\Product",
+            .type_parts = &.{},
+            .is_builtin = false,
+        },
+        .phpdoc_return = null,
+        .start_line = 1,
+        .end_line = 5,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\Factory",
+        .file_path = "test.php",
+    });
+    try sym_table.addClass(class);
+
+    const source = "<?php Factory::create();";
+    const tree = testParse(source) orelse return error.ParseFailed;
+    defer tree.destroy();
+
+    const root = tree.rootNode();
+    const call_node = findNodeByKind(root, "scoped_call_expression") orelse return error.NodeNotFound;
+
+    const type_info = try resolver.resolveExpressionType(call_node, source);
+    try std.testing.expect(type_info != null);
+    try std.testing.expectEqualStrings("App\\Product", type_info.?.base_type);
+}
+
+test "self:: static:: parent:: references" {
+    const allocator = std.testing.allocator;
+    var sym_table = SymbolTable.init(allocator);
+    defer sym_table.deinit();
+
+    var file_ctx = types.FileContext.init(allocator, "test.php");
+    defer file_ctx.deinit();
+
+    var resolver = TypeResolver.init(allocator, &sym_table, &file_ctx);
+    defer resolver.deinit();
+
+    // Set up parent class with method
+    var parent_class = types.ClassSymbol.init(allocator, "App\\BaseService");
+    try parent_class.addMethod(.{
+        .name = "baseMethod",
+        .visibility = .public,
+        .is_static = true,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = TypeInfo{
+            .kind = .simple,
+            .base_type = "App\\Result",
+            .type_parts = &.{},
+            .is_builtin = false,
+        },
+        .phpdoc_return = null,
+        .start_line = 1,
+        .end_line = 5,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\BaseService",
+        .file_path = "test.php",
+    });
+    try sym_table.addClass(parent_class);
+
+    // Set up current class with method, extending parent
+    var class = types.ClassSymbol.init(allocator, "App\\UserService");
+    class.extends = "App\\BaseService";
+    try class.addMethod(.{
+        .name = "getData",
+        .visibility = .public,
+        .is_static = true,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = TypeInfo{
+            .kind = .simple,
+            .base_type = "App\\Data",
+            .type_parts = &.{},
+            .is_builtin = false,
+        },
+        .phpdoc_return = null,
+        .start_line = 1,
+        .end_line = 5,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\UserService",
+        .file_path = "test.php",
+    });
+    try sym_table.addClass(class);
+
+    resolver.current_class = sym_table.getClass("App\\UserService");
+
+    // Test self::getData()
+    {
+        const source = "<?php self::getData();";
+        const tree = testParse(source) orelse return error.ParseFailed;
+        defer tree.destroy();
+        const root = tree.rootNode();
+        const node = findNodeByKind(root, "scoped_call_expression") orelse return error.NodeNotFound;
+        const type_info = try resolver.resolveExpressionType(node, source);
+        try std.testing.expect(type_info != null);
+        try std.testing.expectEqualStrings("App\\Data", type_info.?.base_type);
+    }
+
+    // Test static::getData()
+    {
+        const source = "<?php static::getData();";
+        const tree = testParse(source) orelse return error.ParseFailed;
+        defer tree.destroy();
+        const root = tree.rootNode();
+        const node = findNodeByKind(root, "scoped_call_expression") orelse return error.NodeNotFound;
+        const type_info = try resolver.resolveExpressionType(node, source);
+        try std.testing.expect(type_info != null);
+        try std.testing.expectEqualStrings("App\\Data", type_info.?.base_type);
+    }
+
+    // Test parent::baseMethod()
+    {
+        const source = "<?php parent::baseMethod();";
+        const tree = testParse(source) orelse return error.ParseFailed;
+        defer tree.destroy();
+        const root = tree.rootNode();
+        const node = findNodeByKind(root, "scoped_call_expression") orelse return error.NodeNotFound;
+        const type_info = try resolver.resolveExpressionType(node, source);
+        try std.testing.expect(type_info != null);
+        try std.testing.expectEqualStrings("App\\Result", type_info.?.base_type);
+    }
+}
+
+test "property access type" {
+    const allocator = std.testing.allocator;
+    var sym_table = SymbolTable.init(allocator);
+    defer sym_table.deinit();
+
+    var file_ctx = types.FileContext.init(allocator, "test.php");
+    defer file_ctx.deinit();
+    file_ctx.namespace = "App";
+
+    var resolver = TypeResolver.init(allocator, &sym_table, &file_ctx);
+    defer resolver.deinit();
+
+    // Set up class with a typed property
+    var class = types.ClassSymbol.init(allocator, "App\\User");
+    try class.addProperty(.{
+        .name = "email",
+        .visibility = .public,
+        .is_static = false,
+        .is_readonly = false,
+        .declared_type = TypeInfo{
+            .kind = .simple,
+            .base_type = "string",
+            .type_parts = &.{},
+            .is_builtin = true,
+        },
+        .phpdoc_type = null,
+        .default_value_type = null,
+        .line = 5,
+    });
+    try sym_table.addClass(class);
+
+    // Push a scope with $user typed
+    const scope = try resolver.pushScope();
+    try scope.setVariableType("$user", TypeInfo{
+        .kind = .simple,
+        .base_type = "App\\User",
+        .type_parts = &.{},
+        .is_builtin = false,
+    });
+
+    const source = "<?php $user->email;";
+    const tree = testParse(source) orelse return error.ParseFailed;
+    defer tree.destroy();
+
+    const root = tree.rootNode();
+    const access_node = findNodeByKind(root, "member_access_expression") orelse return error.NodeNotFound;
+
+    const type_info = try resolver.resolveExpressionType(access_node, source);
+    try std.testing.expect(type_info != null);
+    try std.testing.expectEqualStrings("string", type_info.?.base_type);
+    try std.testing.expect(type_info.?.is_builtin);
+}
+
+test "scope push/pop with nested closures" {
+    const allocator = std.testing.allocator;
+    var sym_table = SymbolTable.init(allocator);
+    defer sym_table.deinit();
+
+    var file_ctx = types.FileContext.init(allocator, "test.php");
+    defer file_ctx.deinit();
+
+    var resolver = TypeResolver.init(allocator, &sym_table, &file_ctx);
+    defer resolver.deinit();
+
+    // Push outer scope
+    const outer = try resolver.pushScope();
+    try outer.setVariableType("$outer_var", TypeInfo{
+        .kind = .simple,
+        .base_type = "string",
+        .type_parts = &.{},
+        .is_builtin = true,
+    });
+
+    // Push inner scope (nested closure)
+    const inner = try resolver.pushScope();
+    try inner.setVariableType("$inner_var", TypeInfo{
+        .kind = .simple,
+        .base_type = "int",
+        .type_parts = &.{},
+        .is_builtin = true,
+    });
+
+    // Inner scope should see both variables (parent chain)
+    const current = resolver.currentScope() orelse return error.NoScope;
+    try std.testing.expect(current.getVariableType("$inner_var") != null);
+    try std.testing.expectEqualStrings("int", current.getVariableType("$inner_var").?.base_type);
+    try std.testing.expect(current.getVariableType("$outer_var") != null);
+    try std.testing.expectEqualStrings("string", current.getVariableType("$outer_var").?.base_type);
+
+    // Pop inner scope
+    resolver.popScope();
+
+    // Outer scope should only see outer variable
+    const outer_current = resolver.currentScope() orelse return error.NoScope;
+    try std.testing.expect(outer_current.getVariableType("$outer_var") != null);
+    try std.testing.expect(outer_current.getVariableType("$inner_var") == null);
+}
+
+test "unresolvable variable returns null" {
+    const allocator = std.testing.allocator;
+    var sym_table = SymbolTable.init(allocator);
+    defer sym_table.deinit();
+
+    var file_ctx = types.FileContext.init(allocator, "test.php");
+    defer file_ctx.deinit();
+
+    var resolver = TypeResolver.init(allocator, &sym_table, &file_ctx);
+    defer resolver.deinit();
+
+    // Push empty scope, no class context, no method context
+    _ = try resolver.pushScope();
+
+    const source = "<?php $unknown;";
+    const tree = testParse(source) orelse return error.ParseFailed;
+    defer tree.destroy();
+
+    const root = tree.rootNode();
+    const var_node = findNodeByKind(root, "variable_name") orelse return error.NodeNotFound;
+
+    const type_info = try resolver.resolveExpressionType(var_node, source);
+    try std.testing.expect(type_info == null);
+}
