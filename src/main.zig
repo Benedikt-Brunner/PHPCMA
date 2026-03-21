@@ -10,6 +10,7 @@ const config_parser = @import("config.zig");
 const phpdoc = @import("phpdoc.zig");
 const type_resolver = @import("type_resolver.zig");
 const call_analyzer = @import("call_analyzer.zig");
+const NodeKindIds = @import("node_kind_ids.zig").NodeKindIds;
 
 // Plugin imports
 const plugin_interface = @import("plugins/plugin_interface.zig");
@@ -40,6 +41,7 @@ const SymbolCollector = struct {
     symbol_table: *SymbolTable,
     file_context: *FileContext,
     source: []const u8,
+    ids: NodeKindIds,
 
     // Current context
     current_namespace: ?[]const u8 = null,
@@ -50,12 +52,14 @@ const SymbolCollector = struct {
         sym_table: *SymbolTable,
         file_ctx: *FileContext,
         source: []const u8,
+        language: *const ts.Language,
     ) SymbolCollector {
         return .{
             .allocator = allocator,
             .symbol_table = sym_table,
             .file_context = file_ctx,
             .source = source,
+            .ids = NodeKindIds.init(language),
         };
     }
 
@@ -65,33 +69,33 @@ const SymbolCollector = struct {
     }
 
     fn traverseNode(self: *SymbolCollector, node: ts.Node) error{OutOfMemory}!void {
-        const kind = node.kind();
+        const kind_id = node.kindId();
 
-        if (std.mem.eql(u8, kind, "namespace_definition")) {
+        if (kind_id == self.ids.namespace_definition) {
             try self.handleNamespace(node);
             return;
         }
 
-        if (std.mem.eql(u8, kind, "namespace_use_declaration")) {
+        if (kind_id == self.ids.namespace_use_declaration) {
             try self.handleUseStatement(node);
         }
 
-        if (std.mem.eql(u8, kind, "class_declaration")) {
+        if (kind_id == self.ids.class_declaration) {
             try self.handleClass(node);
             return;
         }
 
-        if (std.mem.eql(u8, kind, "interface_declaration")) {
+        if (kind_id == self.ids.interface_declaration) {
             try self.handleInterface(node);
             return;
         }
 
-        if (std.mem.eql(u8, kind, "trait_declaration")) {
+        if (kind_id == self.ids.trait_declaration) {
             try self.handleTrait(node);
             return;
         }
 
-        if (std.mem.eql(u8, kind, "function_definition")) {
+        if (kind_id == self.ids.function_definition) {
             try self.handleFunction(node);
             return;
         }
@@ -121,10 +125,10 @@ const SymbolCollector = struct {
         var i: u32 = 0;
         while (i < node.namedChildCount()) : (i += 1) {
             if (node.namedChild(i)) |child| {
-                const child_kind = child.kind();
-                if (!std.mem.eql(u8, child_kind, "namespace_name") and
-                    !std.mem.eql(u8, child_kind, "name") and
-                    !std.mem.eql(u8, child_kind, "compound_statement"))
+                const child_kind_id = child.kindId();
+                if (child_kind_id != self.ids.namespace_name and
+                    child_kind_id != self.ids.name and
+                    child_kind_id != self.ids.compound_statement)
                 {
                     try self.traverseNode(child);
                 }
@@ -138,8 +142,7 @@ const SymbolCollector = struct {
         var i: u32 = 0;
         while (i < node.namedChildCount()) : (i += 1) {
             if (node.namedChild(i)) |child| {
-                const child_kind = child.kind();
-                if (std.mem.eql(u8, child_kind, "namespace_use_clause")) {
+                if (child.kindId() == self.ids.namespace_use_clause) {
                     try self.parseUseClause(child);
                 }
             }
@@ -153,10 +156,10 @@ const SymbolCollector = struct {
         var i: u32 = 0;
         while (i < node.namedChildCount()) : (i += 1) {
             if (node.namedChild(i)) |child| {
-                const child_kind = child.kind();
-                if (std.mem.eql(u8, child_kind, "qualified_name") or std.mem.eql(u8, child_kind, "name")) {
+                const child_kind_id = child.kindId();
+                if (child_kind_id == self.ids.qualified_name or child_kind_id == self.ids.name) {
                     fqcn = getNodeText(self.source, child);
-                } else if (std.mem.eql(u8, child_kind, "namespace_aliasing_clause")) {
+                } else if (child_kind_id == self.ids.namespace_aliasing_clause) {
                     if (child.namedChild(0)) |alias_node| {
                         alias = getNodeText(self.source, alias_node);
                     }
@@ -202,10 +205,10 @@ const SymbolCollector = struct {
         var i: u32 = 0;
         while (i < node.namedChildCount()) : (i += 1) {
             if (node.namedChild(i)) |child| {
-                const child_kind = child.kind();
-                if (std.mem.eql(u8, child_kind, "base_clause")) {
+                const child_kind_id = child.kindId();
+                if (child_kind_id == self.ids.base_clause) {
                     try self.parseExtendsClause(child, &class);
-                } else if (std.mem.eql(u8, child_kind, "class_interface_clause")) {
+                } else if (child_kind_id == self.ids.class_interface_clause) {
                     try self.parseImplementsClause(child, &class);
                 }
             }
@@ -227,8 +230,8 @@ const SymbolCollector = struct {
         var i: u32 = 0;
         while (i < node.namedChildCount()) : (i += 1) {
             if (node.namedChild(i)) |child| {
-                const child_kind = child.kind();
-                if (std.mem.eql(u8, child_kind, "name") or std.mem.eql(u8, child_kind, "qualified_name")) {
+                const child_kind_id = child.kindId();
+                if (child_kind_id == self.ids.name or child_kind_id == self.ids.qualified_name) {
                     const parent_name = getNodeText(self.source, child);
                     class.extends = try self.allocator.dupe(u8, try self.file_context.resolveFQCN(parent_name));
                     break;
@@ -242,8 +245,8 @@ const SymbolCollector = struct {
         var i: u32 = 0;
         while (i < node.namedChildCount()) : (i += 1) {
             if (node.namedChild(i)) |child| {
-                const child_kind = child.kind();
-                if (std.mem.eql(u8, child_kind, "name") or std.mem.eql(u8, child_kind, "qualified_name")) {
+                const child_kind_id = child.kindId();
+                if (child_kind_id == self.ids.name or child_kind_id == self.ids.qualified_name) {
                     const iface_name = getNodeText(self.source, child);
                     const fqcn = try self.file_context.resolveFQCN(iface_name);
                     try implements_list.append(self.allocator, try self.allocator.dupe(u8, fqcn));
@@ -257,12 +260,12 @@ const SymbolCollector = struct {
         var i: u32 = 0;
         while (i < body.namedChildCount()) : (i += 1) {
             if (body.namedChild(i)) |child| {
-                const child_kind = child.kind();
-                if (std.mem.eql(u8, child_kind, "method_declaration")) {
+                const child_kind_id = child.kindId();
+                if (child_kind_id == self.ids.method_declaration) {
                     try self.handleMethod(child, class);
-                } else if (std.mem.eql(u8, child_kind, "property_declaration")) {
+                } else if (child_kind_id == self.ids.property_declaration) {
                     try self.handleProperty(child, class);
-                } else if (std.mem.eql(u8, child_kind, "use_declaration")) {
+                } else if (child_kind_id == self.ids.use_declaration) {
                     try self.handleTraitUse(child, class);
                 }
             }
@@ -313,19 +316,19 @@ const SymbolCollector = struct {
         var i: u32 = 0;
         while (i < node.childCount()) : (i += 1) {
             if (node.child(i)) |child| {
-                const child_kind = child.kind();
-                if (std.mem.eql(u8, child_kind, "visibility_modifier")) {
+                const child_kind_id = child.kindId();
+                if (child_kind_id == self.ids.visibility_modifier) {
                     const text = getNodeText(self.source, child);
                     if (std.mem.eql(u8, text, "private")) {
                         method.visibility = .private;
                     } else if (std.mem.eql(u8, text, "protected")) {
                         method.visibility = .protected;
                     }
-                } else if (std.mem.eql(u8, child_kind, "static_modifier")) {
+                } else if (child_kind_id == self.ids.static_modifier) {
                     method.is_static = true;
-                } else if (std.mem.eql(u8, child_kind, "abstract_modifier")) {
+                } else if (child_kind_id == self.ids.abstract_modifier) {
                     method.is_abstract = true;
-                } else if (std.mem.eql(u8, child_kind, "final_modifier")) {
+                } else if (child_kind_id == self.ids.final_modifier) {
                     method.is_final = true;
                 }
             }
@@ -338,10 +341,10 @@ const SymbolCollector = struct {
         var i: u32 = 0;
         while (i < params_node.namedChildCount()) : (i += 1) {
             if (params_node.namedChild(i)) |param| {
-                const param_kind = param.kind();
-                if (std.mem.eql(u8, param_kind, "simple_parameter") or
-                    std.mem.eql(u8, param_kind, "variadic_parameter") or
-                    std.mem.eql(u8, param_kind, "property_promotion_parameter"))
+                const param_kind_id = param.kindId();
+                if (param_kind_id == self.ids.simple_parameter or
+                    param_kind_id == self.ids.variadic_parameter or
+                    param_kind_id == self.ids.property_promotion_parameter)
                 {
                     if (try self.parseParameter(param)) |p| {
                         try params.append(self.allocator, p);
@@ -354,14 +357,15 @@ const SymbolCollector = struct {
     }
 
     fn parseParameter(self: *SymbolCollector, node: ts.Node) !?types.ParameterInfo {
+        const node_kind_id = node.kindId();
         var param = types.ParameterInfo{
             .name = "",
             .type_info = null,
             .phpdoc_type = null,
             .has_default = false,
-            .is_variadic = std.mem.eql(u8, node.kind(), "variadic_parameter"),
+            .is_variadic = node_kind_id == self.ids.variadic_parameter,
             .is_by_reference = false, // TODO: parse & references
-            .is_promoted = std.mem.eql(u8, node.kind(), "property_promotion_parameter"),
+            .is_promoted = node_kind_id == self.ids.property_promotion_parameter,
         };
 
         // Get name
@@ -398,8 +402,7 @@ const SymbolCollector = struct {
     fn parseMethodPhpDoc(self: *SymbolCollector, node: ts.Node, method: *MethodSymbol) !void {
         // Look for preceding comment node
         if (node.prevSibling()) |prev| {
-            const prev_kind = prev.kind();
-            if (std.mem.eql(u8, prev_kind, "comment")) {
+            if (prev.kindId() == self.ids.comment) {
                 const comment = getNodeText(self.source, prev);
                 if (phpdoc.isPhpDoc(comment)) {
                     const doc = try phpdoc.parsePhpDoc(self.allocator, comment);
@@ -421,24 +424,24 @@ const SymbolCollector = struct {
         var i: u32 = 0;
         while (i < node.childCount()) : (i += 1) {
             if (node.child(i)) |child| {
-                const child_kind = child.kind();
-                if (std.mem.eql(u8, child_kind, "visibility_modifier")) {
+                const child_kind_id = child.kindId();
+                if (child_kind_id == self.ids.visibility_modifier) {
                     const text = getNodeText(self.source, child);
                     if (std.mem.eql(u8, text, "private")) {
                         visibility = .private;
                     } else if (std.mem.eql(u8, text, "protected")) {
                         visibility = .protected;
                     }
-                } else if (std.mem.eql(u8, child_kind, "static_modifier")) {
+                } else if (child_kind_id == self.ids.static_modifier) {
                     is_static = true;
-                } else if (std.mem.eql(u8, child_kind, "readonly_modifier")) {
+                } else if (child_kind_id == self.ids.readonly_modifier) {
                     is_readonly = true;
-                } else if (std.mem.eql(u8, child_kind, "named_type") or
-                    std.mem.eql(u8, child_kind, "optional_type") or
-                    std.mem.eql(u8, child_kind, "union_type"))
+                } else if (child_kind_id == self.ids.named_type or
+                    child_kind_id == self.ids.optional_type or
+                    child_kind_id == self.ids.union_type)
                 {
                     declared_type = try self.parseTypeNode(child);
-                } else if (std.mem.eql(u8, child_kind, "property_element")) {
+                } else if (child_kind_id == self.ids.property_element) {
                     // Get property name
                     if (child.namedChild(0)) |name_node| {
                         const name_text = getNodeText(self.source, name_node);
@@ -470,8 +473,8 @@ const SymbolCollector = struct {
         var i: u32 = 0;
         while (i < node.namedChildCount()) : (i += 1) {
             if (node.namedChild(i)) |child| {
-                const child_kind = child.kind();
-                if (std.mem.eql(u8, child_kind, "name") or std.mem.eql(u8, child_kind, "qualified_name")) {
+                const child_kind_id = child.kindId();
+                if (child_kind_id == self.ids.name or child_kind_id == self.ids.qualified_name) {
                     const trait_name = getNodeText(self.source, child);
                     const fqcn = try self.file_context.resolveFQCN(trait_name);
                     try traits.append(self.allocator, try self.allocator.dupe(u8, fqcn));
@@ -508,7 +511,7 @@ const SymbolCollector = struct {
             var i: u32 = 0;
             while (i < body.namedChildCount()) : (i += 1) {
                 if (body.namedChild(i)) |child| {
-                    if (std.mem.eql(u8, child.kind(), "method_declaration")) {
+                    if (child.kindId() == self.ids.method_declaration) {
                         try self.handleInterfaceMethod(child, &iface);
                     }
                 }
@@ -567,10 +570,10 @@ const SymbolCollector = struct {
             var i: u32 = 0;
             while (i < body.namedChildCount()) : (i += 1) {
                 if (body.namedChild(i)) |child| {
-                    const child_kind = child.kind();
-                    if (std.mem.eql(u8, child_kind, "method_declaration")) {
+                    const child_kind_id = child.kindId();
+                    if (child_kind_id == self.ids.method_declaration) {
                         try self.handleTraitMethod(child, &trait);
-                    } else if (std.mem.eql(u8, child_kind, "property_declaration")) {
+                    } else if (child_kind_id == self.ids.property_declaration) {
                         try self.handleTraitProperty(child, &trait);
                     }
                 }
@@ -622,21 +625,21 @@ const SymbolCollector = struct {
         var i: u32 = 0;
         while (i < node.childCount()) : (i += 1) {
             if (node.child(i)) |child| {
-                const child_kind = child.kind();
-                if (std.mem.eql(u8, child_kind, "visibility_modifier")) {
+                const child_kind_id = child.kindId();
+                if (child_kind_id == self.ids.visibility_modifier) {
                     const text = getNodeText(self.source, child);
                     if (std.mem.eql(u8, text, "private")) {
                         visibility = .private;
                     } else if (std.mem.eql(u8, text, "protected")) {
                         visibility = .protected;
                     }
-                } else if (std.mem.eql(u8, child_kind, "static_modifier")) {
+                } else if (child_kind_id == self.ids.static_modifier) {
                     is_static = true;
-                } else if (std.mem.eql(u8, child_kind, "named_type") or
-                    std.mem.eql(u8, child_kind, "optional_type"))
+                } else if (child_kind_id == self.ids.named_type or
+                    child_kind_id == self.ids.optional_type)
                 {
                     declared_type = try self.parseTypeNode(child);
-                } else if (std.mem.eql(u8, child_kind, "property_element")) {
+                } else if (child_kind_id == self.ids.property_element) {
                     if (child.namedChild(0)) |name_node| {
                         const name_text = getNodeText(self.source, name_node);
                         const prop_name = if (name_text.len > 0 and name_text[0] == '$')
@@ -892,11 +895,11 @@ fn analyzeFile() !void {
     defer file_ctx.deinit();
 
     // Collect symbols
-    var collector = SymbolCollector.init(allocator, &sym_table, &file_ctx, source);
+    var collector = SymbolCollector.init(allocator, &sym_table, &file_ctx, source, php_lang);
     try collector.collect(tree);
 
     // Analyze calls
-    var analyzer = CallAnalyzer.init(allocator, &sym_table, &file_ctx);
+    var analyzer = CallAnalyzer.init(allocator, &sym_table, &file_ctx, php_lang);
     defer analyzer.deinit();
     try analyzer.analyzeFile(tree, source, file_config.file);
 
@@ -996,7 +999,7 @@ fn analyzeProject() !void {
         var file_ctx = FileContext.init(allocator, file_path);
         file_ctx.project_config = &config;
 
-        var collector = SymbolCollector.init(allocator, &sym_table, &file_ctx, source);
+        var collector = SymbolCollector.init(allocator, &sym_table, &file_ctx, source, php_lang);
         collector.collect(tree) catch continue;
 
         try file_contexts.put(file_path, file_ctx);
@@ -1030,7 +1033,7 @@ fn analyzeProject() !void {
 
         const file_ctx_ptr = file_contexts.getPtr(file_path) orelse continue;
 
-        var analyzer = CallAnalyzer.init(allocator, &sym_table, file_ctx_ptr);
+        var analyzer = CallAnalyzer.init(allocator, &sym_table, file_ctx_ptr, php_lang);
         defer analyzer.deinit();
 
         analyzer.analyzeFile(tree, source, file_path) catch continue;
@@ -1188,7 +1191,7 @@ fn analyzeCalledBefore() !void {
             }
         }
 
-        var collector = SymbolCollector.init(allocator, &sym_table, &file_ctx, source);
+        var collector = SymbolCollector.init(allocator, &sym_table, &file_ctx, source, php_lang);
         collector.collect(tree) catch continue;
 
         try file_contexts.put(file_path, file_ctx);
@@ -1217,7 +1220,7 @@ fn analyzeCalledBefore() !void {
 
         const file_ctx_ptr = file_contexts.getPtr(file_path) orelse continue;
 
-        var analyzer = CallAnalyzer.init(allocator, &sym_table, file_ctx_ptr);
+        var analyzer = CallAnalyzer.init(allocator, &sym_table, file_ctx_ptr, php_lang);
         defer analyzer.deinit();
 
         analyzer.analyzeFile(tree, source, file_path) catch continue;
