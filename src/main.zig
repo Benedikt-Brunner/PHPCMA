@@ -16,6 +16,9 @@ const type_violation_analyzer = @import("type_violation_analyzer.zig");
 const NodeKindIds = @import("node_kind_ids.zig").NodeKindIds;
 const parallel = @import("parallel.zig");
 
+// Report module
+const report = @import("report.zig");
+
 // Plugin imports
 const plugin_interface = @import("plugins/plugin_interface.zig");
 const plugin_registry = @import("plugins/plugin_registry.zig");
@@ -748,6 +751,14 @@ var project_config = struct {
     verbose: bool = false,
 }{};
 
+var report_config = struct {
+    composer: []const u8 = "",
+    config: []const u8 = "",
+    output: []const u8 = "",
+    format: []const u8 = "text",
+    verbose: bool = false,
+}{};
+
 var called_before_config = struct {
     composer: []const u8 = "",
     config: []const u8 = "", // Path to .phpcma.json for monorepo mode
@@ -958,6 +969,45 @@ pub fn main() !void {
                         }),
                         .target = cli.CommandTarget{
                             .action = cli.CommandAction{ .exec = analyzeCheckTypes },
+                        },
+                    },
+                    .{
+                        .name = "report",
+                        .description = .{ .one_line = "Generate a unified analysis report (text, JSON, or SARIF)" },
+                        .options = try r.allocOptions(&.{
+                            .{
+                                .long_name = "composer",
+                                .short_alias = 'c',
+                                .help = "Path to composer.json (single project mode)",
+                                .value_ref = r.mkRef(&report_config.composer),
+                            },
+                            .{
+                                .long_name = "config",
+                                .short_alias = 'g',
+                                .help = "Path to .phpcma.json (monorepo mode)",
+                                .value_ref = r.mkRef(&report_config.config),
+                            },
+                            .{
+                                .long_name = "output",
+                                .short_alias = 'o',
+                                .help = "Output file (default: stdout)",
+                                .value_ref = r.mkRef(&report_config.output),
+                            },
+                            .{
+                                .long_name = "format",
+                                .short_alias = 'f',
+                                .help = "Output format: text, json, or sarif (default: text)",
+                                .value_ref = r.mkRef(&report_config.format),
+                            },
+                            .{
+                                .long_name = "verbose",
+                                .short_alias = 'v',
+                                .help = "Verbose output",
+                                .value_ref = r.mkRef(&report_config.verbose),
+                            },
+                        }),
+                        .target = cli.CommandTarget{
+                            .action = cli.CommandAction{ .exec = analyzeReport },
                         },
                     },
                 }),
@@ -1645,6 +1695,173 @@ fn analyzeCheckTypes() !void {
     // Exit with error code if there are errors
     if (result.error_count > 0) {
         std.process.exit(1);
+    }
+}
+
+fn analyzeReport() !void {
+    var arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
+    defer _ = arena.deinit();
+    const allocator = arena.allocator();
+
+    const stdout: std.fs.File = .{ .handle = std.posix.STDOUT_FILENO };
+
+    // Validate input
+    const has_composer = report_config.composer.len > 0;
+    const has_config = report_config.config.len > 0;
+
+    if (!has_composer and !has_config) {
+        try stdout.writeAll("Error: Either --composer (-c) or --config (-g) must be specified\n");
+        return;
+    }
+
+    if (has_composer and has_config) {
+        try stdout.writeAll("Error: Cannot use both --composer (-c) and --config (-g) at the same time\n");
+        return;
+    }
+
+    // Discover files
+    var project_configs: []ProjectConfig = undefined;
+    var files: []const []const u8 = undefined;
+
+    if (has_config) {
+        if (report_config.verbose) {
+            try stdout.writeAll("Pass 1: Discovering files from .phpcma.json (monorepo mode)...\n");
+        }
+
+        var phpcma_config = config_parser.parseConfigFile(allocator, report_config.config) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "Error parsing .phpcma.json: {}\n", .{err});
+            try stdout.writeAll(msg);
+            return;
+        };
+
+        if (report_config.verbose) {
+            try config_parser.printConfig(&phpcma_config, stdout);
+            try stdout.writeAll("\n");
+        }
+
+        project_configs = config_parser.parseDiscoveredProjects(allocator, &phpcma_config) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "Error parsing projects: {}\n", .{err});
+            try stdout.writeAll(msg);
+            return;
+        };
+
+        files = config_parser.discoverFilesFromConfigs(allocator, project_configs) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "Error discovering files: {}\n", .{err});
+            try stdout.writeAll(msg);
+            return;
+        };
+    } else {
+        if (report_config.verbose) {
+            try stdout.writeAll("Pass 1: Discovering files from composer.json...\n");
+        }
+
+        const single_config = composer.parseComposerJson(allocator, report_config.composer) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "Error parsing composer.json: {}\n", .{err});
+            try stdout.writeAll(msg);
+            return;
+        };
+
+        var configs_array = try allocator.alloc(ProjectConfig, 1);
+        configs_array[0] = single_config;
+        project_configs = configs_array;
+        files = try composer.discoverFiles(allocator, &single_config);
+    }
+
+    if (report_config.verbose) {
+        const msg = try std.fmt.allocPrint(allocator, "Discovered {d} PHP files\n\n", .{files.len});
+        try stdout.writeAll(msg);
+    }
+
+    // Pass 2: Collect symbols
+    if (report_config.verbose) {
+        const thread_count = parallel.getThreadCount(files.len);
+        const msg = try std.fmt.allocPrint(allocator, "Pass 2: Collecting symbols ({d} threads)...\n", .{thread_count});
+        try stdout.writeAll(msg);
+    }
+
+    var sym_table = SymbolTable.init(allocator);
+    defer sym_table.deinit();
+
+    var file_contexts = std.StringHashMap(FileContext).init(allocator);
+    defer {
+        var it = file_contexts.valueIterator();
+        while (it.next()) |ctx| {
+            ctx.deinit();
+        }
+        file_contexts.deinit();
+    }
+
+    var file_sources = std.StringHashMap([]const u8).init(allocator);
+    defer file_sources.deinit();
+
+    try parallel.parallelSymbolCollect(
+        allocator,
+        files,
+        project_configs,
+        &sym_table,
+        &file_contexts,
+        &file_sources,
+        &collectSymbolsFromSource,
+    );
+
+    // Pass 3: Resolve inheritance
+    if (report_config.verbose) {
+        try stdout.writeAll("Pass 3: Resolving inheritance...\n");
+    }
+
+    try sym_table.resolveInheritance();
+
+    // Pass 4: Analyze calls
+    if (report_config.verbose) {
+        const thread_count = parallel.getThreadCount(files.len);
+        const msg = try std.fmt.allocPrint(allocator, "Pass 4: Analyzing calls ({d} threads)...\n", .{thread_count});
+        try stdout.writeAll(msg);
+    }
+
+    var call_graph = ProjectCallGraph.init(allocator, &sym_table);
+    defer call_graph.deinit();
+
+    try parallel.parallelCallAnalysis(
+        allocator,
+        files,
+        &file_sources,
+        &file_contexts,
+        &sym_table,
+        &call_graph,
+    );
+
+    // Pass 5: Generate unified report
+    if (report_config.verbose) {
+        try stdout.writeAll("Pass 5: Generating unified report...\n\n");
+    }
+
+    var unified_report = report.UnifiedReport.init(allocator);
+    defer unified_report.deinit();
+    unified_report.populate(&sym_table, &call_graph);
+    unified_report.coverage.total_files = files.len;
+
+    // Output
+    const out_file = if (report_config.output.len > 0) blk: {
+        break :blk try std.fs.cwd().createFile(report_config.output, .{});
+    } else stdout;
+
+    defer {
+        if (report_config.output.len > 0) {
+            out_file.close();
+        }
+    }
+
+    if (std.mem.eql(u8, report_config.format, "json")) {
+        try unified_report.toJson(out_file);
+    } else if (std.mem.eql(u8, report_config.format, "sarif")) {
+        try unified_report.toSarif(out_file);
+    } else {
+        try unified_report.toText(out_file);
+    }
+
+    if (report_config.output.len > 0) {
+        const msg = try std.fmt.allocPrint(allocator, "Report written to: {s}\n", .{report_config.output});
+        try stdout.writeAll(msg);
     }
 }
 
