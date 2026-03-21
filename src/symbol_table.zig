@@ -210,11 +210,16 @@ pub const SymbolTable = struct {
     fn resolveClassInheritance(self: *SymbolTable, fqcn: []const u8) !void {
         const class = self.classes.getPtr(fqcn) orelse return;
 
-        // Build parent chain
+        // Build parent chain (with cycle detection)
         var chain: std.ArrayListUnmanaged([]const u8) = .empty;
+        var seen = std.StringHashMap(void).init(self.allocator);
+        defer seen.deinit();
+        try seen.put(fqcn, {});
         var current_fqcn = class.extends;
         while (current_fqcn) |parent_fqcn| {
+            if (seen.contains(parent_fqcn)) break; // Cycle detected
             try chain.append(self.allocator, parent_fqcn);
+            try seen.put(parent_fqcn, {});
             if (self.classes.get(parent_fqcn)) |parent| {
                 current_fqcn = parent.extends;
             } else {
@@ -374,7 +379,7 @@ test "SymbolTable basic operations" {
     try std.testing.expectEqualStrings("UserService", found.?.name);
 }
 
-test "SymbolTable inheritance resolution" {
+test "SymbolTable inheritance resolution - simple inheritance" {
     const allocator = std.testing.allocator;
     var table = SymbolTable.init(allocator);
     defer table.deinit();
@@ -399,15 +404,455 @@ test "SymbolTable inheritance resolution" {
     });
     try table.addClass(parent);
 
-    // Create child class
+    // Create child class with no own methods
     var child = ClassSymbol.init(allocator, "App\\UserService");
     child.extends = "App\\BaseService";
     try table.addClass(child);
 
-    // Resolve inheritance
     try table.resolveInheritance();
 
     // Child should have parent's method
     const method = table.resolveMethod("App\\UserService", "doSomething");
     try std.testing.expect(method != null);
+    try std.testing.expectEqualStrings("doSomething", method.?.name);
+}
+
+test "SymbolTable inheritance resolution - method override" {
+    const allocator = std.testing.allocator;
+    var table = SymbolTable.init(allocator);
+    defer table.deinit();
+
+    var parent = ClassSymbol.init(allocator, "App\\Base");
+    try parent.addMethod(.{
+        .name = "render",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 10,
+        .end_line = 15,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\Base",
+        .file_path = "base.php",
+    });
+    try table.addClass(parent);
+
+    var child = ClassSymbol.init(allocator, "App\\Child");
+    child.extends = "App\\Base";
+    try child.addMethod(.{
+        .name = "render",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 20,
+        .end_line = 25,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\Child",
+        .file_path = "child.php",
+    });
+    try table.addClass(child);
+
+    try table.resolveInheritance();
+
+    // Child's version should win (override)
+    const method = table.resolveMethod("App\\Child", "render");
+    try std.testing.expect(method != null);
+    try std.testing.expectEqualStrings("App\\Child", method.?.containing_class);
+}
+
+test "SymbolTable inheritance resolution - deep chain (A extends B extends C)" {
+    const allocator = std.testing.allocator;
+    var table = SymbolTable.init(allocator);
+    defer table.deinit();
+
+    // C (root ancestor) with method
+    var class_c = ClassSymbol.init(allocator, "App\\C");
+    try class_c.addMethod(.{
+        .name = "baseMethod",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 1,
+        .end_line = 5,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\C",
+        .file_path = "",
+    });
+    try table.addClass(class_c);
+
+    // B extends C
+    var class_b = ClassSymbol.init(allocator, "App\\B");
+    class_b.extends = "App\\C";
+    try class_b.addMethod(.{
+        .name = "middleMethod",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 10,
+        .end_line = 15,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\B",
+        .file_path = "",
+    });
+    try table.addClass(class_b);
+
+    // A extends B
+    var class_a = ClassSymbol.init(allocator, "App\\A");
+    class_a.extends = "App\\B";
+    try table.addClass(class_a);
+
+    try table.resolveInheritance();
+
+    // A should have both baseMethod (from C) and middleMethod (from B)
+    try std.testing.expect(table.resolveMethod("App\\A", "baseMethod") != null);
+    try std.testing.expect(table.resolveMethod("App\\A", "middleMethod") != null);
+
+    // Verify parent chain for A
+    const class_a_ptr = table.getClass("App\\A").?;
+    try std.testing.expectEqual(@as(usize, 2), class_a_ptr.parent_chain.len);
+}
+
+test "SymbolTable inheritance resolution - diamond via traits" {
+    const allocator = std.testing.allocator;
+    var table = SymbolTable.init(allocator);
+    defer table.deinit();
+
+    // Two traits with methods
+    var trait_a = TraitSymbol.init(allocator, "App\\TraitA");
+    try trait_a.addMethod(.{
+        .name = "helperA",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 1,
+        .end_line = 5,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\TraitA",
+        .file_path = "",
+    });
+    try table.addTrait(trait_a);
+
+    var trait_b = TraitSymbol.init(allocator, "App\\TraitB");
+    try trait_b.addMethod(.{
+        .name = "helperB",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 1,
+        .end_line = 5,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\TraitB",
+        .file_path = "",
+    });
+    try table.addTrait(trait_b);
+
+    // Parent uses TraitA
+    var parent = ClassSymbol.init(allocator, "App\\Parent");
+    parent.uses = &.{"App\\TraitA"};
+    try table.addClass(parent);
+
+    // Child extends Parent, also uses TraitB
+    var child = ClassSymbol.init(allocator, "App\\Child");
+    child.extends = "App\\Parent";
+    child.uses = &.{"App\\TraitB"};
+    try table.addClass(child);
+
+    try table.resolveInheritance();
+
+    // Child should have both trait methods
+    try std.testing.expect(table.resolveMethod("App\\Child", "helperA") != null);
+    try std.testing.expect(table.resolveMethod("App\\Child", "helperB") != null);
+}
+
+test "SymbolTable inheritance resolution - trait method override" {
+    const allocator = std.testing.allocator;
+    var table = SymbolTable.init(allocator);
+    defer table.deinit();
+
+    // Trait with a method
+    var trait = TraitSymbol.init(allocator, "App\\MyTrait");
+    try trait.addMethod(.{
+        .name = "action",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 1,
+        .end_line = 5,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\MyTrait",
+        .file_path = "",
+    });
+    try table.addTrait(trait);
+
+    // Class uses trait but overrides the method
+    var class = ClassSymbol.init(allocator, "App\\MyClass");
+    class.uses = &.{"App\\MyTrait"};
+    try class.addMethod(.{
+        .name = "action",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 20,
+        .end_line = 25,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\MyClass",
+        .file_path = "",
+    });
+    try table.addClass(class);
+
+    try table.resolveInheritance();
+
+    // Class's own method should win over trait method
+    const method = table.resolveMethod("App\\MyClass", "action");
+    try std.testing.expect(method != null);
+    try std.testing.expectEqualStrings("App\\MyClass", method.?.containing_class);
+}
+
+test "SymbolTable inheritance resolution - interface methods" {
+    const allocator = std.testing.allocator;
+    var table = SymbolTable.init(allocator);
+    defer table.deinit();
+
+    // Interface with a method
+    var iface = InterfaceSymbol.init(allocator, "App\\Renderable");
+    try iface.addMethod(.{
+        .name = "render",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = true,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 1,
+        .end_line = 1,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\Renderable",
+        .file_path = "",
+    });
+    try table.addInterface(iface);
+
+    // Class implements interface
+    var class = ClassSymbol.init(allocator, "App\\Widget");
+    class.implements = &.{"App\\Renderable"};
+    try class.addMethod(.{
+        .name = "render",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 10,
+        .end_line = 15,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\Widget",
+        .file_path = "",
+    });
+    try table.addClass(class);
+
+    try table.resolveInheritance();
+
+    // Interface method should exist
+    const iface_method = table.getInterface("App\\Renderable").?.methods.getPtr("render");
+    try std.testing.expect(iface_method != null);
+
+    // Class has its own implementation
+    const class_method = table.resolveMethod("App\\Widget", "render");
+    try std.testing.expect(class_method != null);
+    try std.testing.expectEqualStrings("App\\Widget", class_method.?.containing_class);
+}
+
+test "SymbolTable inheritance resolution - cycle detection" {
+    const allocator = std.testing.allocator;
+    var table = SymbolTable.init(allocator);
+    defer table.deinit();
+
+    // A extends B, B extends A — circular inheritance
+    var class_a = ClassSymbol.init(allocator, "App\\CycleA");
+    class_a.extends = "App\\CycleB";
+    try class_a.addMethod(.{
+        .name = "methodA",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 1,
+        .end_line = 5,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\CycleA",
+        .file_path = "",
+    });
+    try table.addClass(class_a);
+
+    var class_b = ClassSymbol.init(allocator, "App\\CycleB");
+    class_b.extends = "App\\CycleA";
+    try class_b.addMethod(.{
+        .name = "methodB",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 10,
+        .end_line = 15,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\CycleB",
+        .file_path = "",
+    });
+    try table.addClass(class_b);
+
+    // Should NOT crash — cycle is detected and skipped
+    try table.resolveInheritance();
+
+    // Both classes should still have their own methods
+    try std.testing.expect(table.resolveMethod("App\\CycleA", "methodA") != null);
+    try std.testing.expect(table.resolveMethod("App\\CycleB", "methodB") != null);
+}
+
+test "SymbolTable inheritance resolution - properties inherited" {
+    const allocator = std.testing.allocator;
+    var table = SymbolTable.init(allocator);
+    defer table.deinit();
+
+    var parent = ClassSymbol.init(allocator, "App\\BaseEntity");
+    try parent.addProperty(.{
+        .name = "id",
+        .visibility = .protected,
+        .is_static = false,
+        .is_readonly = false,
+        .declared_type = null,
+        .phpdoc_type = null,
+        .default_value_type = null,
+        .line = 5,
+    });
+    try parent.addProperty(.{
+        .name = "createdAt",
+        .visibility = .protected,
+        .is_static = false,
+        .is_readonly = false,
+        .declared_type = null,
+        .phpdoc_type = null,
+        .default_value_type = null,
+        .line = 6,
+    });
+    try table.addClass(parent);
+
+    var child = ClassSymbol.init(allocator, "App\\User");
+    child.extends = "App\\BaseEntity";
+    try child.addProperty(.{
+        .name = "email",
+        .visibility = .private,
+        .is_static = false,
+        .is_readonly = false,
+        .declared_type = null,
+        .phpdoc_type = null,
+        .default_value_type = null,
+        .line = 10,
+    });
+    try table.addClass(child);
+
+    try table.resolveInheritance();
+
+    // Child should have its own + inherited properties
+    const user = table.getClass("App\\User").?;
+    try std.testing.expect(user.all_properties.contains("id"));
+    try std.testing.expect(user.all_properties.contains("createdAt"));
+    try std.testing.expect(user.all_properties.contains("email"));
+    try std.testing.expectEqual(@as(usize, 3), user.all_properties.count());
+}
+
+test "SymbolTable inheritance resolution - topological sort order" {
+    const allocator = std.testing.allocator;
+    var table = SymbolTable.init(allocator);
+    defer table.deinit();
+
+    // Add classes in reverse order (child first, then parent)
+    // to verify topological sort processes parents before children
+    var child = ClassSymbol.init(allocator, "App\\Child");
+    child.extends = "App\\Mid";
+    try table.addClass(child);
+
+    var mid = ClassSymbol.init(allocator, "App\\Mid");
+    mid.extends = "App\\Root";
+    try table.addClass(mid);
+
+    var root = ClassSymbol.init(allocator, "App\\Root");
+    try root.addMethod(.{
+        .name = "rootMethod",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 1,
+        .end_line = 5,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\Root",
+        .file_path = "",
+    });
+    try table.addClass(root);
+
+    try table.resolveInheritance();
+
+    // Even though child was added first, topological sort should ensure
+    // Root is resolved before Mid, Mid before Child
+    try std.testing.expect(table.resolveMethod("App\\Child", "rootMethod") != null);
+    try std.testing.expect(table.resolveMethod("App\\Mid", "rootMethod") != null);
+
+    // Verify parent chain
+    const child_ptr = table.getClass("App\\Child").?;
+    try std.testing.expectEqual(@as(usize, 2), child_ptr.parent_chain.len);
 }
