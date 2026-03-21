@@ -422,57 +422,47 @@ pub fn getProjectInfo(allocator: std.mem.Allocator, composer_path: []const u8) !
 // ============================================================================
 
 pub fn printConfig(config: *const ProjectConfig, file: std.fs.File) !void {
-    const allocator = config.allocator;
+    var buf: [4096]u8 = undefined;
+    var w = file.writer(&buf);
+    const writer = &w.interface;
 
-    try file.writeAll("Project Configuration:\n");
+    try writer.writeAll("Project Configuration:\n");
 
-    const root_msg = try std.fmt.allocPrint(allocator, "  Root: {s}\n", .{config.root_path});
-    defer allocator.free(root_msg);
-    try file.writeAll(root_msg);
+    try writer.print("  Root: {s}\n", .{config.root_path});
 
-    try file.writeAll("\n  PSR-4 Autoload:\n");
+    try writer.writeAll("\n  PSR-4 Autoload:\n");
     var psr4_it = config.autoload_psr4.iterator();
     while (psr4_it.next()) |entry| {
-        const ns_msg = try std.fmt.allocPrint(allocator, "    {s} =>\n", .{entry.key_ptr.*});
-        defer allocator.free(ns_msg);
-        try file.writeAll(ns_msg);
+        try writer.print("    {s} =>\n", .{entry.key_ptr.*});
         for (entry.value_ptr.*) |path| {
-            const path_msg = try std.fmt.allocPrint(allocator, "      - {s}\n", .{path});
-            defer allocator.free(path_msg);
-            try file.writeAll(path_msg);
+            try writer.print("      - {s}\n", .{path});
         }
     }
 
     if (config.autoload_psr0.count() > 0) {
-        try file.writeAll("\n  PSR-0 Autoload:\n");
+        try writer.writeAll("\n  PSR-0 Autoload:\n");
         var psr0_it = config.autoload_psr0.iterator();
         while (psr0_it.next()) |entry| {
-            const ns_msg = try std.fmt.allocPrint(allocator, "    {s} =>\n", .{entry.key_ptr.*});
-            defer allocator.free(ns_msg);
-            try file.writeAll(ns_msg);
+            try writer.print("    {s} =>\n", .{entry.key_ptr.*});
             for (entry.value_ptr.*) |path| {
-                const path_msg = try std.fmt.allocPrint(allocator, "      - {s}\n", .{path});
-                defer allocator.free(path_msg);
-                try file.writeAll(path_msg);
+                try writer.print("      - {s}\n", .{path});
             }
         }
     }
 
     if (config.autoload_classmap.len > 0) {
-        try file.writeAll("\n  Classmap:\n");
+        try writer.writeAll("\n  Classmap:\n");
         for (config.autoload_classmap) |path| {
-            const path_msg = try std.fmt.allocPrint(allocator, "    - {s}\n", .{path});
-            defer allocator.free(path_msg);
-            try file.writeAll(path_msg);
+            try writer.print("    - {s}\n", .{path});
         }
     }
 
     if (config.autoload_files.len > 0) {
-        try file.writeAll("\n  Files:\n");
+        try writer.writeAll("\n  Files:\n");
         for (config.autoload_files) |path| {
-            const path_msg = try std.fmt.allocPrint(allocator, "    - {s}\n", .{path});
-            defer allocator.free(path_msg);
-            try file.writeAll(path_msg);
+            try writer.print("    - {s}\n", .{path});
         }
     }
+
+    try writer.flush();
 }

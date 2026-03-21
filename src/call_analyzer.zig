@@ -540,10 +540,14 @@ pub const ProjectCallGraph = struct {
 
     /// Output as DOT graph format
     pub fn toDot(self: *const ProjectCallGraph, file: std.fs.File) !void {
-        try file.writeAll("digraph CallGraph {\n");
-        try file.writeAll("    rankdir=LR;\n");
-        try file.writeAll("    node [shape=box, fontname=\"Helvetica\"];\n");
-        try file.writeAll("    edge [fontname=\"Helvetica\", fontsize=10];\n\n");
+        var buf: [4096]u8 = undefined;
+        var w = file.writer(&buf);
+        const writer = &w.interface;
+
+        try writer.writeAll("digraph CallGraph {\n");
+        try writer.writeAll("    rankdir=LR;\n");
+        try writer.writeAll("    node [shape=box, fontname=\"Helvetica\"];\n");
+        try writer.writeAll("    edge [fontname=\"Helvetica\", fontsize=10];\n\n");
 
         // Collect unique nodes
         var callers = std.StringHashMap(void).init(self.allocator);
@@ -559,31 +563,27 @@ pub const ProjectCallGraph = struct {
         }
 
         // Output caller nodes
-        try file.writeAll("    // Callers\n");
+        try writer.writeAll("    // Callers\n");
         var caller_it = callers.keyIterator();
         while (caller_it.next()) |caller| {
             const escaped = try escapeForDot(self.allocator, caller.*);
             defer self.allocator.free(escaped);
-            const msg = try std.fmt.allocPrint(self.allocator, "    \"{s}\" [style=filled, fillcolor=\"#e1f5fe\"];\n", .{escaped});
-            defer self.allocator.free(msg);
-            try file.writeAll(msg);
+            try writer.print("    \"{s}\" [style=filled, fillcolor=\"#e1f5fe\"];\n", .{escaped});
         }
 
         // Output callee nodes
-        try file.writeAll("\n    // Callees\n");
+        try writer.writeAll("\n    // Callees\n");
         var callee_it = callees.keyIterator();
         while (callee_it.next()) |callee| {
             if (!callers.contains(callee.*)) {
                 const escaped = try escapeForDot(self.allocator, callee.*);
                 defer self.allocator.free(escaped);
-                const msg = try std.fmt.allocPrint(self.allocator, "    \"{s}\" [style=filled, fillcolor=\"#fff3e0\"];\n", .{escaped});
-                defer self.allocator.free(msg);
-                try file.writeAll(msg);
+                try writer.print("    \"{s}\" [style=filled, fillcolor=\"#fff3e0\"];\n", .{escaped});
             }
         }
 
         // Output edges
-        try file.writeAll("\n    // Calls\n");
+        try writer.writeAll("\n    // Calls\n");
         for (self.calls.items) |call| {
             if (call.resolved_target) |target| {
                 const caller_escaped = try escapeForDot(self.allocator, call.caller_fqn);
@@ -599,23 +599,25 @@ pub const ProjectCallGraph = struct {
                 else
                     "\"#f44336\"";
 
-                const msg = try std.fmt.allocPrint(
-                    self.allocator,
+                try writer.print(
                     "    \"{s}\" -> \"{s}\" [color={s}];\n",
                     .{ caller_escaped, target_escaped, color },
                 );
-                defer self.allocator.free(msg);
-                try file.writeAll(msg);
             }
         }
 
-        try file.writeAll("}\n");
+        try writer.writeAll("}\n");
+        try writer.flush();
     }
 
     /// Output as text summary
     pub fn toText(self: *const ProjectCallGraph, file: std.fs.File) !void {
+        var buf: [4096]u8 = undefined;
+        var w = file.writer(&buf);
+        const writer = &w.interface;
+
         // Header
-        const header = try std.fmt.allocPrint(self.allocator,
+        try writer.print(
             \\Call Graph Analysis
             \\===================
             \\Total calls: {d}
@@ -629,8 +631,6 @@ pub const ProjectCallGraph = struct {
             self.getResolutionRate(),
             self.unresolved_calls,
         });
-        defer self.allocator.free(header);
-        try file.writeAll(header);
 
         // Group by caller
         var by_caller = std.StringHashMap(std.ArrayListUnmanaged(EnhancedFunctionCall)).init(self.allocator);
@@ -666,30 +666,23 @@ pub const ProjectCallGraph = struct {
         }.lessThan);
 
         for (caller_keys.items) |caller| {
-            const caller_msg = try std.fmt.allocPrint(self.allocator, "{s}:\n", .{caller});
-            defer self.allocator.free(caller_msg);
-            try file.writeAll(caller_msg);
+            try writer.print("{s}:\n", .{caller});
 
             if (by_caller.get(caller)) |calls| {
                 for (calls.items) |call| {
                     const target = call.resolved_target orelse call.callee_name;
-                    const confidence_str = if (call.resolved_target != null)
-                        try std.fmt.allocPrint(self.allocator, " [{d:.0}%]", .{call.resolution_confidence * 100})
-                    else
-                        try self.allocator.dupe(u8, " [?]");
-                    defer self.allocator.free(confidence_str);
-
-                    const call_msg = try std.fmt.allocPrint(
-                        self.allocator,
-                        "  -> {s}{s} (line {d})\n",
-                        .{ target, confidence_str, call.line },
-                    );
-                    defer self.allocator.free(call_msg);
-                    try file.writeAll(call_msg);
+                    try writer.print("  -> {s}", .{target});
+                    if (call.resolved_target != null) {
+                        try writer.print(" [{d:.0}%]", .{call.resolution_confidence * 100});
+                    } else {
+                        try writer.writeAll(" [?]");
+                    }
+                    try writer.print(" (line {d})\n", .{call.line});
                 }
             }
-            try file.writeAll("\n");
+            try writer.writeAll("\n");
         }
+        try writer.flush();
     }
 };
 
@@ -1382,131 +1375,102 @@ pub const CalledBeforeAnalyzer = struct {
 
     /// Output analysis result as text
     pub fn toText(self: *CalledBeforeAnalyzer, result: CalledBeforeResult, before_fn: []const u8, after_fn: []const u8, file: std.fs.File) !void {
+        _ = self;
+        var buf: [4096]u8 = undefined;
+        var w = file.writer(&buf);
+        const writer = &w.interface;
+
         // Extract short names for display
         const before_short = extractShortName(before_fn);
         const after_short = extractShortName(after_fn);
 
         // Header with box drawing
-        try file.writeAll("\n");
-        try file.writeAll("╔══════════════════════════════════════════════════════════════════════════════╗\n");
-        try file.writeAll("║                         CALLED-BEFORE ANALYSIS                               ║\n");
-        try file.writeAll("╚══════════════════════════════════════════════════════════════════════════════╝\n\n");
+        try writer.writeAll("\n");
+        try writer.writeAll("╔══════════════════════════════════════════════════════════════════════════════╗\n");
+        try writer.writeAll("║                         CALLED-BEFORE ANALYSIS                               ║\n");
+        try writer.writeAll("╚══════════════════════════════════════════════════════════════════════════════╝\n\n");
 
         // Constraint info
-        try file.writeAll("  Constraint:\n");
-        const before_msg = try std.fmt.allocPrint(self.allocator, "    {s}\n", .{before_fn});
-        defer self.allocator.free(before_msg);
-        try file.writeAll(before_msg);
-        try file.writeAll("    must be called before\n");
-        const after_msg = try std.fmt.allocPrint(self.allocator, "    {s}\n\n", .{after_fn});
-        defer self.allocator.free(after_msg);
-        try file.writeAll(after_msg);
+        try writer.writeAll("  Constraint:\n");
+        try writer.print("    {s}\n", .{before_fn});
+        try writer.writeAll("    must be called before\n");
+        try writer.print("    {s}\n\n", .{after_fn});
 
         // Result summary
         if (result.satisfied) {
-            try file.writeAll("  Result: ✓ SATISFIED\n\n");
+            try writer.writeAll("  Result: ✓ SATISFIED\n\n");
         } else {
-            try file.writeAll("  Result: ✗ VIOLATED\n\n");
+            try writer.writeAll("  Result: ✗ VIOLATED\n\n");
         }
 
         // Violations section
         if (result.violations.len > 0) {
-            try file.writeAll("┌──────────────────────────────────────────────────────────────────────────────┐\n");
-            const violations_header = try std.fmt.allocPrint(
-                self.allocator,
-                "│  VIOLATIONS ({d})                                                              │\n",
-                .{result.violations.len},
-            );
-            defer self.allocator.free(violations_header);
-            // Truncate and pad to fit
-            try file.writeAll(try self.formatBoxLine(violations_header));
-            try file.writeAll("└──────────────────────────────────────────────────────────────────────────────┘\n\n");
+            try writer.writeAll("┌──────────────────────────────────────────────────────────────────────────────┐\n");
+            try writer.print("│  VIOLATIONS ({d})                                                              │\n", .{result.violations.len});
+            try writer.writeAll("└──────────────────────────────────────────────────────────────────────────────┘\n\n");
 
             for (result.violations, 0..) |violation, i| {
                 // Violation number
-                const num_msg = try std.fmt.allocPrint(self.allocator, "  [{d}] {s}\n", .{ i + 1, violation.context_function });
-                defer self.allocator.free(num_msg);
-                try file.writeAll(num_msg);
+                try writer.print("  [{d}] {s}\n", .{ i + 1, violation.context_function });
 
                 // File location
-                const loc_msg = try std.fmt.allocPrint(self.allocator, "      File: {s}:{d}\n", .{ violation.file_path, violation.after_line });
-                defer self.allocator.free(loc_msg);
-                try file.writeAll(loc_msg);
+                try writer.print("      File: {s}:{d}\n", .{ violation.file_path, violation.after_line });
 
                 // Issue description
                 switch (violation.kind) {
                     .wrong_order => {
-                        const order_msg = try std.fmt.allocPrint(
-                            self.allocator,
+                        try writer.print(
                             "      Issue: {s}() called at line {d}, but {s}() not called until line {d}\n",
                             .{ after_short, violation.after_line, before_short, violation.before_line orelse 0 },
                         );
-                        defer self.allocator.free(order_msg);
-                        try file.writeAll(order_msg);
                     },
                     .missing_before => {
-                        const missing_msg = try std.fmt.allocPrint(
-                            self.allocator,
+                        try writer.print(
                             "      Issue: {s}() is never called before {s}()\n",
                             .{ before_short, after_short },
                         );
-                        defer self.allocator.free(missing_msg);
-                        try file.writeAll(missing_msg);
                     },
                     .conditional_before => {
-                        try file.writeAll("      Issue: Before call may not execute on all paths\n");
+                        try writer.writeAll("      Issue: Before call may not execute on all paths\n");
                     },
                 }
 
                 // Show call paths missing the before call
                 if (violation.missing_before_paths.len > 0) {
-                    try file.writeAll("\n      Call paths missing the before call:\n");
+                    try writer.writeAll("\n      Call paths missing the before call:\n");
                     for (violation.missing_before_paths) |path| {
-                        const path_msg = try std.fmt.allocPrint(
-                            self.allocator,
+                        try writer.print(
                             "        → {s} (line {d})\n          {s}\n",
                             .{ path.caller, path.call_line, path.file_path },
                         );
-                        defer self.allocator.free(path_msg);
-                        try file.writeAll(path_msg);
                     }
                 }
 
-                try file.writeAll("\n");
+                try writer.writeAll("\n");
             }
         }
 
         // Summary statistics
-        try file.writeAll("┌──────────────────────────────────────────────────────────────────────────────┐\n");
-        try file.writeAll("│  SUMMARY                                                                     │\n");
-        try file.writeAll("└──────────────────────────────────────────────────────────────────────────────┘\n\n");
+        try writer.writeAll("┌──────────────────────────────────────────────────────────────────────────────┐\n");
+        try writer.writeAll("│  SUMMARY                                                                     │\n");
+        try writer.writeAll("└──────────────────────────────────────────────────────────────────────────────┘\n\n");
 
-        const summary_msg = try std.fmt.allocPrint(
-            self.allocator,
+        try writer.print(
             "  Functions satisfying constraint: {d}\n  Total constraint matches: {d}\n  Violations: {d}\n\n",
             .{ result.satisfied_in.len, result.matches.len, result.violations.len },
         );
-        defer self.allocator.free(summary_msg);
-        try file.writeAll(summary_msg);
 
         // Satisfied functions list (collapsed by default - just show count)
         if (result.satisfied_in.len > 0) {
-            try file.writeAll("  Satisfied in:\n");
+            try writer.writeAll("  Satisfied in:\n");
             for (result.satisfied_in) |fn_name| {
-                const msg = try std.fmt.allocPrint(self.allocator, "    ✓ {s}\n", .{fn_name});
-                defer self.allocator.free(msg);
-                try file.writeAll(msg);
+                try writer.print("    ✓ {s}\n", .{fn_name});
             }
-            try file.writeAll("\n");
+            try writer.writeAll("\n");
         }
+        try writer.flush();
     }
 
-    /// Format a line to fit in a box (80 chars wide with borders)
-    fn formatBoxLine(self: *CalledBeforeAnalyzer, line: []const u8) ![]const u8 {
-        _ = self;
-        // For now just return the input - the caller handles formatting
-        return line;
-    }
 };
 
 /// Extract short name from FQCN (e.g., "Namespace\Class::method" -> "method")
