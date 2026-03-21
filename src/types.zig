@@ -244,6 +244,9 @@ pub const ClassSymbol = struct {
     }
 
     pub fn deinit(self: *ClassSymbol) void {
+        if (self.parent_chain.len > 0) {
+            self.allocator.free(self.parent_chain);
+        }
         self.methods.deinit();
         self.properties.deinit();
         self.all_methods.deinit();
