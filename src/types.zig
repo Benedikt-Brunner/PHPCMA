@@ -62,32 +62,32 @@ pub const TypeInfo = struct {
         return switch (self.kind) {
             .nullable => std.fmt.allocPrint(allocator, "?{s}", .{self.base_type}),
             .union_type => blk: {
-                var result = std.ArrayList(u8).init(allocator);
+                var result: std.ArrayListUnmanaged(u8) = .empty;
                 for (self.type_parts, 0..) |part, i| {
-                    if (i > 0) try result.appendSlice("|");
-                    try result.appendSlice(part);
+                    if (i > 0) try result.appendSlice(allocator, "|");
+                    try result.appendSlice(allocator, part);
                 }
-                break :blk try result.toOwnedSlice();
+                break :blk try result.toOwnedSlice(allocator);
             },
             .intersection => blk: {
-                var result = std.ArrayList(u8).init(allocator);
+                var result: std.ArrayListUnmanaged(u8) = .empty;
                 for (self.type_parts, 0..) |part, i| {
-                    if (i > 0) try result.appendSlice("&");
-                    try result.appendSlice(part);
+                    if (i > 0) try result.appendSlice(allocator, "&");
+                    try result.appendSlice(allocator, part);
                 }
-                break :blk try result.toOwnedSlice();
+                break :blk try result.toOwnedSlice(allocator);
             },
             .generic => blk: {
-                var result = std.ArrayList(u8).init(allocator);
-                try result.appendSlice(self.base_type);
-                try result.append('<');
+                var result: std.ArrayListUnmanaged(u8) = .empty;
+                try result.appendSlice(allocator, self.base_type);
+                try result.append(allocator, '<');
                 for (self.type_params, 0..) |param, i| {
-                    if (i > 0) try result.appendSlice(", ");
+                    if (i > 0) try result.appendSlice(allocator, ", ");
                     const param_str = try param.format(allocator);
-                    try result.appendSlice(param_str);
+                    try result.appendSlice(allocator, param_str);
                 }
-                try result.append('>');
-                break :blk try result.toOwnedSlice();
+                try result.append(allocator, '>');
+                break :blk try result.toOwnedSlice(allocator);
             },
             .array_type => std.fmt.allocPrint(allocator, "{s}[]", .{self.base_type}),
             else => allocator.dupe(u8, self.base_type),
