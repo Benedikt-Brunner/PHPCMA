@@ -83,7 +83,7 @@ pub const BoundaryAnalyzer = struct {
     }
 
     /// Determine which project a file belongs to based on its path
-    fn fileToProject(self: *const BoundaryAnalyzer, file_path: []const u8) ?[]const u8 {
+    pub fn fileToProject(self: *const BoundaryAnalyzer, file_path: []const u8) ?[]const u8 {
         var best_match: ?[]const u8 = null;
         var best_len: usize = 0;
 
@@ -289,7 +289,7 @@ pub const BoundaryAnalyzer = struct {
     // ========================================================================
 
     /// Extract a short project name from a root path
-    fn shortProjectName(root_path: []const u8) []const u8 {
+    pub fn shortProjectName(root_path: []const u8) []const u8 {
         // Take last path component as the project name
         var last_sep: ?usize = null;
         var second_last_sep: ?usize = null;
