@@ -1907,6 +1907,258 @@ test "CallAnalyzer: multiple calls in method (all captured with lines)" {
     try std.testing.expectEqualStrings("Svc::run", call_c.caller_fqn);
 }
 
+// ============================================================================
+// CalledBeforeAnalyzer Tests
+// ============================================================================
+
+fn buildCallGraph(allocator: std.mem.Allocator, sym_table: *SymbolTable) !*ProjectCallGraph {
+    const graph = try allocator.create(ProjectCallGraph);
+    graph.* = ProjectCallGraph.init(allocator, sym_table);
+    return graph;
+}
+
+fn addSyntheticCall(
+    graph: *ProjectCallGraph,
+    caller_fqn: []const u8,
+    callee_name: []const u8,
+    resolved_target: ?[]const u8,
+    file_path: []const u8,
+    line: u32,
+) !void {
+    const call = EnhancedFunctionCall{
+        .caller_fqn = caller_fqn,
+        .callee_name = callee_name,
+        .call_type = .method,
+        .line = line,
+        .column = 1,
+        .file_path = file_path,
+        .resolved_target = resolved_target,
+        .resolution_confidence = if (resolved_target != null) 1.0 else 0.0,
+        .resolution_method = if (resolved_target != null) .explicit_type else .unresolved,
+    };
+    try graph.calls.append(graph.allocator, call);
+    graph.total_calls += 1;
+    if (resolved_target != null) {
+        graph.resolved_calls += 1;
+    } else {
+        graph.unresolved_calls += 1;
+    }
+}
+
+test "CalledBeforeAnalyzer: satisfied constraint (correct order)" {
+    // before() is called on line 5, after() on line 10 in the same function => satisfied
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    var sym_table = SymbolTable.init(alloc);
+    const graph = try buildCallGraph(alloc, &sym_table);
+
+    // Controller::handle calls validate() then process()
+    try addSyntheticCall(graph, "Controller::handle", "validate", "Service::validate", "src/Controller.php", 5);
+    try addSyntheticCall(graph, "Controller::handle", "process", "Service::process", "src/Controller.php", 10);
+
+    var analyzer = CalledBeforeAnalyzer.init(alloc, graph);
+    const result = try analyzer.analyze("Service::validate", "Service::process");
+
+    try std.testing.expect(result.satisfied);
+    try std.testing.expect(result.violations.len == 0);
+    try std.testing.expect(result.matches.len == 1);
+    try std.testing.expect(result.satisfied_in.len == 1);
+    try std.testing.expectEqualStrings("Controller::handle", result.satisfied_in[0]);
+}
+
+test "CalledBeforeAnalyzer: violated wrong order" {
+    // after() is called on line 5, before() on line 10 => wrong_order violation
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    var sym_table = SymbolTable.init(alloc);
+    const graph = try buildCallGraph(alloc, &sym_table);
+
+    // Controller::handle calls process() then validate() (wrong order)
+    try addSyntheticCall(graph, "Controller::handle", "process", "Service::process", "src/Controller.php", 5);
+    try addSyntheticCall(graph, "Controller::handle", "validate", "Service::validate", "src/Controller.php", 10);
+
+    var analyzer = CalledBeforeAnalyzer.init(alloc, graph);
+    const result = try analyzer.analyze("Service::validate", "Service::process");
+
+    try std.testing.expect(!result.satisfied);
+    try std.testing.expect(result.violations.len == 1);
+    try std.testing.expect(result.violations[0].kind == .wrong_order);
+    try std.testing.expect(result.violations[0].after_line == 5);
+    try std.testing.expect(result.violations[0].before_line.? == 10);
+}
+
+test "CalledBeforeAnalyzer: violated missing before" {
+    // after() is called but before() is never called => missing_before violation
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    var sym_table = SymbolTable.init(alloc);
+    const graph = try buildCallGraph(alloc, &sym_table);
+
+    // Controller::handle calls process() but never validate()
+    try addSyntheticCall(graph, "Controller::handle", "process", "Service::process", "src/Controller.php", 5);
+
+    var analyzer = CalledBeforeAnalyzer.init(alloc, graph);
+    const result = try analyzer.analyze("Service::validate", "Service::process");
+
+    try std.testing.expect(!result.satisfied);
+    try std.testing.expect(result.violations.len == 1);
+    try std.testing.expect(result.violations[0].kind == .missing_before);
+}
+
+test "CalledBeforeAnalyzer: multiple callers with mixed results" {
+    // Two callers: one satisfies the constraint, one violates it
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    var sym_table = SymbolTable.init(alloc);
+    const graph = try buildCallGraph(alloc, &sym_table);
+
+    // GoodController::handle calls validate() then process() (OK)
+    try addSyntheticCall(graph, "GoodController::handle", "validate", "Service::validate", "src/Good.php", 5);
+    try addSyntheticCall(graph, "GoodController::handle", "process", "Service::process", "src/Good.php", 10);
+
+    // BadController::handle calls process() without validate() (violation)
+    try addSyntheticCall(graph, "BadController::handle", "process", "Service::process", "src/Bad.php", 5);
+
+    var analyzer = CalledBeforeAnalyzer.init(alloc, graph);
+    const result = try analyzer.analyze("Service::validate", "Service::process");
+
+    try std.testing.expect(!result.satisfied);
+    try std.testing.expect(result.violations.len == 1);
+    try std.testing.expect(result.matches.len == 1);
+    try std.testing.expectEqualStrings("GoodController::handle", result.satisfied_in[0]);
+}
+
+test "CalledBeforeAnalyzer: transitive calls (before reached indirectly)" {
+    // Caller A calls validate(), then calls helper(). helper() calls process().
+    // The before call is in A, the after call is in helper(). The interprocedural
+    // analysis should find that A (caller of helper) has validate() before calling helper().
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    var sym_table = SymbolTable.init(alloc);
+    const graph = try buildCallGraph(alloc, &sym_table);
+
+    // Controller::handle calls validate() then calls helper()
+    try addSyntheticCall(graph, "Controller::handle", "validate", "Service::validate", "src/Controller.php", 5);
+    try addSyntheticCall(graph, "Controller::handle", "doWork", "Helper::doWork", "src/Controller.php", 10);
+
+    // Helper::doWork calls process() (after_fn) but not validate() directly
+    try addSyntheticCall(graph, "Helper::doWork", "process", "Service::process", "src/Helper.php", 3);
+
+    var analyzer = CalledBeforeAnalyzer.init(alloc, graph);
+    const result = try analyzer.analyze("Service::validate", "Service::process");
+
+    // Should be satisfied via interprocedural analysis:
+    // Controller::handle calls validate() at line 5, then Helper::doWork at line 10,
+    // and Helper::doWork calls process(). So the constraint is satisfied.
+    try std.testing.expect(result.satisfied);
+    try std.testing.expect(result.violations.len == 0);
+}
+
+test "CalledBeforeAnalyzer: pattern matching short name" {
+    // Use just the method name as pattern (no class qualifier)
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    var sym_table = SymbolTable.init(alloc);
+    const graph = try buildCallGraph(alloc, &sym_table);
+
+    // Controller::handle calls validate then process
+    try addSyntheticCall(graph, "Controller::handle", "validate", "App\\Service::validate", "src/Controller.php", 5);
+    try addSyntheticCall(graph, "Controller::handle", "process", "App\\Service::process", "src/Controller.php", 10);
+
+    var analyzer = CalledBeforeAnalyzer.init(alloc, graph);
+    // Use ::methodName pattern
+    const result = try analyzer.analyze("::validate", "::process");
+
+    try std.testing.expect(result.satisfied);
+    try std.testing.expect(result.violations.len == 0);
+    try std.testing.expect(result.matches.len == 1);
+}
+
+test "CalledBeforeAnalyzer: pattern matching FQCN" {
+    // Use fully qualified class names (with namespace)
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    var sym_table = SymbolTable.init(alloc);
+    const graph = try buildCallGraph(alloc, &sym_table);
+
+    try addSyntheticCall(graph, "Controller::handle", "validate", "App\\Service::validate", "src/Controller.php", 5);
+    try addSyntheticCall(graph, "Controller::handle", "process", "App\\Service::process", "src/Controller.php", 10);
+
+    var analyzer = CalledBeforeAnalyzer.init(alloc, graph);
+    // Use FQCN pattern
+    const result = try analyzer.analyze("App\\Service::validate", "App\\Service::process");
+
+    try std.testing.expect(result.satisfied);
+    try std.testing.expect(result.violations.len == 0);
+    try std.testing.expect(result.matches.len == 1);
+}
+
+test "CalledBeforeAnalyzer: pattern matching suffix" {
+    // Use Class::method suffix pattern to match Namespace\Class::method targets
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    var sym_table = SymbolTable.init(alloc);
+    const graph = try buildCallGraph(alloc, &sym_table);
+
+    try addSyntheticCall(graph, "Controller::handle", "validate", "App\\Domain\\Service::validate", "src/Controller.php", 5);
+    try addSyntheticCall(graph, "Controller::handle", "process", "App\\Domain\\Service::process", "src/Controller.php", 10);
+
+    var analyzer = CalledBeforeAnalyzer.init(alloc, graph);
+    // Use suffix pattern (Service::method matches App\Domain\Service::method)
+    const result = try analyzer.analyze("Service::validate", "Service::process");
+
+    try std.testing.expect(result.satisfied);
+    try std.testing.expect(result.violations.len == 0);
+    try std.testing.expect(result.matches.len == 1);
+}
+
+test "CalledBeforeAnalyzer: no matches for either function" {
+    // Neither before nor after function appear in the call graph => trivially satisfied (no violations)
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    var sym_table = SymbolTable.init(alloc);
+    const graph = try buildCallGraph(alloc, &sym_table);
+
+    // Unrelated calls only
+    try addSyntheticCall(graph, "Controller::handle", "doStuff", "Util::doStuff", "src/Controller.php", 5);
+
+    var analyzer = CalledBeforeAnalyzer.init(alloc, graph);
+    const result = try analyzer.analyze("Service::validate", "Service::process");
+
+    // No function calls after_fn, so the constraint is trivially satisfied
+    try std.testing.expect(result.satisfied);
+    try std.testing.expect(result.violations.len == 0);
+    try std.testing.expect(result.matches.len == 0);
+    try std.testing.expect(result.satisfied_in.len == 0);
+}
+
 test "CallAnalyzer: call in standalone function" {
     const allocator = std.testing.allocator;
     var arena: std.heap.ArenaAllocator = .init(allocator);
