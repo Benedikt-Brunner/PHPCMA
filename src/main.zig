@@ -1291,3 +1291,396 @@ fn analyzeCalledBefore() !void {
         std.process.exit(1);
     }
 }
+
+// ============================================================================
+// Tests - SymbolCollector
+// ============================================================================
+
+fn parsePhp(_: std.mem.Allocator, source: []const u8) struct { *ts.Tree, *const ts.Language } {
+    const parser = ts.Parser.create();
+    const php_lang = tree_sitter_php();
+    parser.setLanguage(php_lang) catch unreachable;
+    const tree = parser.parseString(source, null) orelse unreachable;
+    return .{ tree, php_lang };
+}
+
+fn collectFromSource(allocator: std.mem.Allocator, source: []const u8) !struct { SymbolTable, FileContext } {
+    const result = parsePhp(allocator, source);
+    const tree = result[0];
+    const php_lang = result[1];
+
+    var sym_table = SymbolTable.init(allocator);
+    var file_ctx = FileContext.init(allocator, "test.php");
+
+    var collector = SymbolCollector.init(allocator, &sym_table, &file_ctx, source, php_lang);
+    try collector.collect(tree);
+
+    return .{ sym_table, file_ctx };
+}
+
+test "SymbolCollector: class extraction" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source = "<?php class UserService {}";
+    var result = try collectFromSource(alloc, source);
+    _ = &result;
+
+    const class = result[0].getClass("UserService");
+    try std.testing.expect(class != null);
+    try std.testing.expectEqualStrings("UserService", class.?.name);
+}
+
+test "SymbolCollector: namespaced class" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source = "<?php namespace App\\Service; class UserService {}";
+    var result = try collectFromSource(alloc, source);
+    _ = &result;
+
+    const class = result[0].getClass("App\\Service\\UserService");
+    try std.testing.expect(class != null);
+    try std.testing.expectEqualStrings("UserService", class.?.name);
+}
+
+test "SymbolCollector: extends" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source = "<?php namespace App; class BaseService {} class UserService extends BaseService {}";
+    var result = try collectFromSource(alloc, source);
+    _ = &result;
+
+    const class = result[0].getClass("App\\UserService");
+    try std.testing.expect(class != null);
+    try std.testing.expectEqualStrings("App\\BaseService", class.?.extends.?);
+}
+
+test "SymbolCollector: implements" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source = "<?php namespace App; interface Loggable {} class UserService implements Loggable {}";
+    var result = try collectFromSource(alloc, source);
+    _ = &result;
+
+    const class = result[0].getClass("App\\UserService");
+    try std.testing.expect(class != null);
+    try std.testing.expect(class.?.implements.len == 1);
+    try std.testing.expectEqualStrings("App\\Loggable", class.?.implements[0]);
+}
+
+test "SymbolCollector: method extraction" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source = "<?php class Foo { public function doStuff(): void {} }";
+    var result = try collectFromSource(alloc, source);
+    _ = &result;
+
+    const class = result[0].getClass("Foo");
+    try std.testing.expect(class != null);
+    const method = class.?.methods.get("doStuff");
+    try std.testing.expect(method != null);
+    try std.testing.expectEqualStrings("doStuff", method.?.name);
+}
+
+test "SymbolCollector: method modifiers" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php class Foo {
+        \\    private static function secretStatic(): void {}
+        \\    protected final function protFinal(): void {}
+        \\    abstract public function mustImpl(): void;
+        \\}
+    ;
+    var result = try collectFromSource(alloc, source);
+    _ = &result;
+
+    const class = result[0].getClass("Foo");
+    try std.testing.expect(class != null);
+
+    const m1 = class.?.methods.get("secretStatic");
+    try std.testing.expect(m1 != null);
+    try std.testing.expect(m1.?.visibility == .private);
+    try std.testing.expect(m1.?.is_static == true);
+
+    const m2 = class.?.methods.get("protFinal");
+    try std.testing.expect(m2 != null);
+    try std.testing.expect(m2.?.visibility == .protected);
+    try std.testing.expect(m2.?.is_final == true);
+
+    const m3 = class.?.methods.get("mustImpl");
+    try std.testing.expect(m3 != null);
+    try std.testing.expect(m3.?.is_abstract == true);
+}
+
+test "SymbolCollector: parameter parsing" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source = "<?php class Foo { public function bar(string $name, int $age = 0): void {} }";
+    var result = try collectFromSource(alloc, source);
+    _ = &result;
+
+    const class = result[0].getClass("Foo");
+    try std.testing.expect(class != null);
+    const method = class.?.methods.get("bar");
+    try std.testing.expect(method != null);
+    try std.testing.expect(method.?.parameters.len == 2);
+    try std.testing.expectEqualStrings("name", method.?.parameters[0].name);
+    try std.testing.expectEqualStrings("age", method.?.parameters[1].name);
+    try std.testing.expect(method.?.parameters[1].has_default == true);
+}
+
+test "SymbolCollector: property extraction" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php class Foo {
+        \\    private string $name;
+        \\    protected static int $count;
+        \\    public readonly string $id;
+        \\}
+    ;
+    var result = try collectFromSource(alloc, source);
+    _ = &result;
+
+    const class = result[0].getClass("Foo");
+    try std.testing.expect(class != null);
+
+    const p1 = class.?.properties.get("name");
+    try std.testing.expect(p1 != null);
+    try std.testing.expect(p1.?.visibility == .private);
+
+    const p2 = class.?.properties.get("count");
+    try std.testing.expect(p2 != null);
+    try std.testing.expect(p2.?.is_static == true);
+    try std.testing.expect(p2.?.visibility == .protected);
+
+    const p3 = class.?.properties.get("id");
+    try std.testing.expect(p3 != null);
+    try std.testing.expect(p3.?.is_readonly == true);
+}
+
+test "SymbolCollector: constructor promotion" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php class Dto {
+        \\    public function __construct(
+        \\        private readonly string $name,
+        \\        protected int $age,
+        \\    ) {}
+        \\}
+    ;
+    var result = try collectFromSource(alloc, source);
+    _ = &result;
+
+    const class = result[0].getClass("Dto");
+    try std.testing.expect(class != null);
+    const method = class.?.methods.get("__construct");
+    try std.testing.expect(method != null);
+    try std.testing.expect(method.?.parameters.len == 2);
+    try std.testing.expect(method.?.parameters[0].is_promoted == true);
+    try std.testing.expect(method.?.parameters[1].is_promoted == true);
+}
+
+test "SymbolCollector: interface extraction" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php namespace App\Contract;
+        \\interface UserRepositoryInterface {
+        \\    public function find(int $id): ?object;
+        \\    public function save(object $user): void;
+        \\}
+    ;
+    var result = try collectFromSource(alloc, source);
+    _ = &result;
+
+    const iface = result[0].getInterface("App\\Contract\\UserRepositoryInterface");
+    try std.testing.expect(iface != null);
+    try std.testing.expect(iface.?.methods.count() == 2);
+    try std.testing.expect(iface.?.methods.contains("find"));
+    try std.testing.expect(iface.?.methods.contains("save"));
+}
+
+test "SymbolCollector: trait extraction" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php namespace App\Concern;
+        \\trait Timestampable {
+        \\    private string $createdAt;
+        \\    public function getCreatedAt(): string { return $this->createdAt; }
+        \\}
+    ;
+    var result = try collectFromSource(alloc, source);
+    _ = &result;
+
+    const trait = result[0].getTrait("App\\Concern\\Timestampable");
+    try std.testing.expect(trait != null);
+    try std.testing.expect(trait.?.methods.contains("getCreatedAt"));
+    try std.testing.expect(trait.?.properties.contains("createdAt"));
+}
+
+test "SymbolCollector: trait use" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php namespace App;
+        \\trait Loggable { public function log(): void {} }
+        \\class UserService { use Loggable; }
+    ;
+    var result = try collectFromSource(alloc, source);
+    _ = &result;
+
+    const class = result[0].getClass("App\\UserService");
+    try std.testing.expect(class != null);
+    try std.testing.expect(class.?.uses.len == 1);
+    try std.testing.expectEqualStrings("App\\Loggable", class.?.uses[0]);
+}
+
+test "SymbolCollector: use statements" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php namespace App\Service;
+        \\use App\Repository\UserRepository;
+        \\use App\Entity\User as UserEntity;
+        \\class UserService {}
+    ;
+    var result = try collectFromSource(alloc, source);
+    _ = &result;
+
+    const ctx = &result[1];
+    const repo_use = ctx.use_statements.get("UserRepository");
+    try std.testing.expect(repo_use != null);
+    try std.testing.expectEqualStrings("App\\Repository\\UserRepository", repo_use.?.fqcn);
+
+    // Aliased use statement: "use App\Entity\User as UserEntity"
+    // The key in use_statements is the short name resolved from fqcn
+    const user_use = ctx.use_statements.get("UserEntity");
+    try std.testing.expect(user_use != null);
+    try std.testing.expectEqualStrings("UserEntity", user_use.?.fqcn);
+}
+
+test "SymbolCollector: PHPDoc on method" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php class Foo {
+        \\    /** @return string */
+        \\    public function getName(): string { return ''; }
+        \\}
+    ;
+    var result = try collectFromSource(alloc, source);
+    _ = &result;
+
+    const class = result[0].getClass("Foo");
+    try std.testing.expect(class != null);
+    const method = class.?.methods.get("getName");
+    try std.testing.expect(method != null);
+    // PHPDoc return type should be parsed
+    try std.testing.expect(method.?.phpdoc_return != null);
+    try std.testing.expectEqualStrings("string", method.?.phpdoc_return.?.base_type);
+}
+
+test "SymbolCollector: multiple classes in file" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php namespace App;
+        \\class First { public function a(): void {} }
+        \\class Second { public function b(): void {} }
+        \\class Third {}
+    ;
+    var result = try collectFromSource(alloc, source);
+    _ = &result;
+
+    try std.testing.expect(result[0].getClass("App\\First") != null);
+    try std.testing.expect(result[0].getClass("App\\Second") != null);
+    try std.testing.expect(result[0].getClass("App\\Third") != null);
+    try std.testing.expect(result[0].classes.count() == 3);
+}
+
+test "SymbolCollector: standalone function" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php namespace App\Util;
+        \\function formatDate(string $date): string { return $date; }
+    ;
+    var result = try collectFromSource(alloc, source);
+    _ = &result;
+
+    const func = result[0].getFunction("App\\Util\\formatDate");
+    try std.testing.expect(func != null);
+    try std.testing.expectEqualStrings("formatDate", func.?.name);
+    try std.testing.expect(func.?.parameters.len == 1);
+    try std.testing.expectEqualStrings("date", func.?.parameters[0].name);
+}
+
+test "SymbolCollector: empty class" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source = "<?php class EmptyClass {}";
+    var result = try collectFromSource(alloc, source);
+    _ = &result;
+
+    const class = result[0].getClass("EmptyClass");
+    try std.testing.expect(class != null);
+    try std.testing.expect(class.?.methods.count() == 0);
+    try std.testing.expect(class.?.properties.count() == 0);
+    try std.testing.expect(class.?.extends == null);
+    try std.testing.expect(class.?.implements.len == 0);
+    try std.testing.expect(class.?.uses.len == 0);
+}
