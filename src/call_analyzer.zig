@@ -1524,6 +1524,77 @@ const AfterCallInfo = struct {
 
 extern fn tree_sitter_php() callconv(.c) *ts.Language;
 
+// ============================================================================
+// Test Helpers
+// ============================================================================
+
+const SymbolCollector = @import("main.zig").SymbolCollector;
+
+fn parsePhp(source: []const u8) struct { *ts.Tree, *const ts.Language } {
+    const parser = ts.Parser.create();
+    const php_lang = tree_sitter_php();
+    parser.setLanguage(php_lang) catch unreachable;
+    const tree = parser.parseString(source, null) orelse unreachable;
+    return .{ tree, php_lang };
+}
+
+fn analyzeSource(allocator: std.mem.Allocator, source: []const u8) !struct { *CallAnalyzer, *SymbolTable, *types.FileContext } {
+    const result = parsePhp(source);
+    const tree = result[0];
+    const php_lang = result[1];
+
+    const sym_table = try allocator.create(SymbolTable);
+    sym_table.* = SymbolTable.init(allocator);
+
+    const file_ctx = try allocator.create(types.FileContext);
+    file_ctx.* = types.FileContext.init(allocator, "test.php");
+
+    var collector = SymbolCollector.init(allocator, sym_table, file_ctx, source, php_lang);
+    try collector.collect(tree);
+
+    try sym_table.resolveInheritance();
+
+    const analyzer = try allocator.create(CallAnalyzer);
+    analyzer.* = CallAnalyzer.init(allocator, sym_table, file_ctx, php_lang);
+    try analyzer.analyzeFile(tree, source, "test.php");
+
+    return .{ analyzer, sym_table, file_ctx };
+}
+
+fn findCall(calls: []const EnhancedFunctionCall, callee_name: []const u8) ?EnhancedFunctionCall {
+    for (calls) |call| {
+        if (std.mem.eql(u8, call.callee_name, callee_name)) {
+            return call;
+        }
+    }
+    return null;
+}
+
+fn findCallWithTarget(calls: []const EnhancedFunctionCall, target: []const u8) ?EnhancedFunctionCall {
+    for (calls) |call| {
+        if (call.resolved_target) |t| {
+            if (std.mem.eql(u8, t, target)) {
+                return call;
+            }
+        }
+    }
+    return null;
+}
+
+fn countCallsWithCallee(calls: []const EnhancedFunctionCall, callee_name: []const u8) usize {
+    var count: usize = 0;
+    for (calls) |call| {
+        if (std.mem.eql(u8, call.callee_name, callee_name)) {
+            count += 1;
+        }
+    }
+    return count;
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
 test "CallAnalyzer basic" {
     // Basic structure test - would need tree-sitter integration for full test
     const allocator = std.testing.allocator;
@@ -1538,4 +1609,327 @@ test "CallAnalyzer basic" {
     defer analyzer.deinit();
 
     try std.testing.expect(analyzer.calls.items.len == 0);
+}
+
+test "CallAnalyzer: $this->method() call" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class UserService {
+        \\    public function validate(): void {}
+        \\    public function process(): void {
+        \\        $this->validate();
+        \\    }
+        \\}
+    ;
+
+    const result = try analyzeSource(alloc, source);
+    const calls = result[0].getCalls();
+
+    const call = findCall(calls, "validate");
+    try std.testing.expect(call != null);
+    try std.testing.expect(call.?.call_type == .method);
+    try std.testing.expectEqualStrings("UserService::process", call.?.caller_fqn);
+    try std.testing.expect(call.?.resolution_method == .this_reference);
+}
+
+test "CallAnalyzer: typed parameter call" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Logger {
+        \\    public function log(): void {}
+        \\}
+        \\class App {
+        \\    public function run(Logger $logger): void {
+        \\        $logger->log();
+        \\    }
+        \\}
+    ;
+
+    const result = try analyzeSource(alloc, source);
+    const calls = result[0].getCalls();
+
+    const call = findCall(calls, "log");
+    try std.testing.expect(call != null);
+    try std.testing.expect(call.?.call_type == .method);
+    try std.testing.expectEqualStrings("App::run", call.?.caller_fqn);
+    try std.testing.expect(call.?.resolved_target != null);
+    try std.testing.expectEqualStrings("Logger::log", call.?.resolved_target.?);
+}
+
+test "CallAnalyzer: Foo::staticMethod()" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Foo {
+        \\    public static function create(): void {}
+        \\}
+        \\class Bar {
+        \\    public function build(): void {
+        \\        Foo::create();
+        \\    }
+        \\}
+    ;
+
+    const result = try analyzeSource(alloc, source);
+    const calls = result[0].getCalls();
+
+    const call = findCall(calls, "create");
+    try std.testing.expect(call != null);
+    try std.testing.expect(call.?.call_type == .static_method);
+    try std.testing.expectEqualStrings("Bar::build", call.?.caller_fqn);
+    try std.testing.expect(call.?.resolved_target != null);
+    try std.testing.expectEqualStrings("Foo::create", call.?.resolved_target.?);
+    try std.testing.expect(call.?.resolution_method == .explicit_type);
+}
+
+test "CallAnalyzer: self::method()" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Counter {
+        \\    public static function increment(): void {}
+        \\    public function tick(): void {
+        \\        self::increment();
+        \\    }
+        \\}
+    ;
+
+    const result = try analyzeSource(alloc, source);
+    const calls = result[0].getCalls();
+
+    const call = findCall(calls, "increment");
+    try std.testing.expect(call != null);
+    try std.testing.expect(call.?.call_type == .static_method);
+    try std.testing.expect(call.?.resolution_method == .self_reference);
+    try std.testing.expect(call.?.resolved_target != null);
+    try std.testing.expectEqualStrings("Counter::increment", call.?.resolved_target.?);
+}
+
+test "CallAnalyzer: parent::method()" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Base {
+        \\    public function setup(): void {}
+        \\}
+        \\class Child extends Base {
+        \\    public function setup(): void {
+        \\        parent::setup();
+        \\    }
+        \\}
+    ;
+
+    const result = try analyzeSource(alloc, source);
+    const calls = result[0].getCalls();
+
+    const call = findCall(calls, "setup");
+    try std.testing.expect(call != null);
+    try std.testing.expect(call.?.call_type == .static_method);
+    try std.testing.expect(call.?.resolution_method == .parent_reference);
+    try std.testing.expect(call.?.resolved_target != null);
+    try std.testing.expectEqualStrings("Base::setup", call.?.resolved_target.?);
+}
+
+test "CallAnalyzer: assignment tracking (new Foo(); $x->bar())" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Foo {
+        \\    public function bar(): void {}
+        \\}
+        \\class Runner {
+        \\    public function run(): void {
+        \\        $x = new Foo();
+        \\        $x->bar();
+        \\    }
+        \\}
+    ;
+
+    const result = try analyzeSource(alloc, source);
+    const calls = result[0].getCalls();
+
+    const call = findCall(calls, "bar");
+    try std.testing.expect(call != null);
+    try std.testing.expect(call.?.call_type == .method);
+    try std.testing.expectEqualStrings("Runner::run", call.?.caller_fqn);
+    try std.testing.expect(call.?.resolved_target != null);
+    try std.testing.expectEqualStrings("Foo::bar", call.?.resolved_target.?);
+}
+
+test "CallAnalyzer: unresolved call (null target)" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Service {
+        \\    public function process($unknown): void {
+        \\        $unknown->doSomething();
+        \\    }
+        \\}
+    ;
+
+    const result = try analyzeSource(alloc, source);
+    const calls = result[0].getCalls();
+
+    const call = findCall(calls, "doSomething");
+    try std.testing.expect(call != null);
+    try std.testing.expect(call.?.call_type == .method);
+    try std.testing.expect(call.?.resolved_target == null);
+    try std.testing.expect(call.?.resolution_method == .unresolved);
+}
+
+test "CallAnalyzer: function call with namespace" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\namespace App\Util;
+        \\function helper(): void {}
+        \\function main(): void {
+        \\    helper();
+        \\}
+    ;
+
+    const result = try analyzeSource(alloc, source);
+    const calls = result[0].getCalls();
+
+    const call = findCall(calls, "helper");
+    try std.testing.expect(call != null);
+    try std.testing.expect(call.?.call_type == .function);
+    try std.testing.expectEqualStrings("helper", call.?.caller_fqn);
+}
+
+test "CallAnalyzer: chained call (return type chain)" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Builder {
+        \\    public function build(): Result { return new Result(); }
+        \\}
+        \\class Result {
+        \\    public function get(): void {}
+        \\}
+        \\class App {
+        \\    public function run(Builder $b): void {
+        \\        $b->build()->get();
+        \\    }
+        \\}
+    ;
+
+    const result = try analyzeSource(alloc, source);
+    const calls = result[0].getCalls();
+
+    // The chained call should find both build() and get()
+    const build_call = findCall(calls, "build");
+    try std.testing.expect(build_call != null);
+    try std.testing.expect(build_call.?.call_type == .method);
+
+    const get_call = findCall(calls, "get");
+    try std.testing.expect(get_call != null);
+    try std.testing.expect(get_call.?.call_type == .method);
+}
+
+test "CallAnalyzer: multiple calls in method (all captured with lines)" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Svc {
+        \\    public function a(): void {}
+        \\    public function b(): void {}
+        \\    public function c(): void {}
+        \\    public function run(): void {
+        \\        $this->a();
+        \\        $this->b();
+        \\        $this->c();
+        \\    }
+        \\}
+    ;
+
+    const result = try analyzeSource(alloc, source);
+    const calls = result[0].getCalls();
+
+    // All three calls should be captured
+    try std.testing.expect(findCall(calls, "a") != null);
+    try std.testing.expect(findCall(calls, "b") != null);
+    try std.testing.expect(findCall(calls, "c") != null);
+
+    // Verify lines are ordered
+    const call_a = findCall(calls, "a").?;
+    const call_b = findCall(calls, "b").?;
+    const call_c = findCall(calls, "c").?;
+
+    try std.testing.expect(call_a.line < call_b.line);
+    try std.testing.expect(call_b.line < call_c.line);
+
+    // All should have the same caller
+    try std.testing.expectEqualStrings("Svc::run", call_a.caller_fqn);
+    try std.testing.expectEqualStrings("Svc::run", call_b.caller_fqn);
+    try std.testing.expectEqualStrings("Svc::run", call_c.caller_fqn);
+}
+
+test "CallAnalyzer: call in standalone function" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Printer {
+        \\    public function print(): void {}
+        \\}
+        \\function doPrint(Printer $p): void {
+        \\    $p->print();
+        \\}
+    ;
+
+    const result = try analyzeSource(alloc, source);
+    const calls = result[0].getCalls();
+
+    const call = findCall(calls, "print");
+    try std.testing.expect(call != null);
+    try std.testing.expect(call.?.call_type == .method);
+    try std.testing.expectEqualStrings("doPrint", call.?.caller_fqn);
+    try std.testing.expect(call.?.resolved_target != null);
+    try std.testing.expectEqualStrings("Printer::print", call.?.resolved_target.?);
 }
