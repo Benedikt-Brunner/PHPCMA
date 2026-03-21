@@ -37,7 +37,7 @@ const ProjectCallGraph = call_analyzer.ProjectCallGraph;
 // Symbol Collector - Extracts symbols from PHP files (Pass 2)
 // ============================================================================
 
-const SymbolCollector = struct {
+pub const SymbolCollector = struct {
     allocator: std.mem.Allocator,
     symbol_table: *SymbolTable,
     file_context: *FileContext,

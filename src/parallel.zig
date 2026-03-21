@@ -393,8 +393,8 @@ fn testCollectFn(
 ) error{OutOfMemory}!void {
     _ = file_ctx;
     const root = tree.rootNode();
-    const class_decl_id = language.idForNodeKind("class_declaration", false) orelse return;
-    const name_id = language.idForNodeKind("name", false) orelse return;
+    const class_decl_id = language.idForNodeKind("class_declaration", false);
+    const name_id = language.idForNodeKind("name", false);
     try walkForClasses(allocator, sym_table, root, source, class_decl_id, name_id);
 }
 
