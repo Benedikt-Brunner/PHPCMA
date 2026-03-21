@@ -338,8 +338,14 @@ pub fn parseInlineVar(allocator: std.mem.Allocator, comment: []const u8) !?TypeI
 // Tests
 // ============================================================================
 
+fn testAllocator() std.heap.ArenaAllocator {
+    return std.heap.ArenaAllocator.init(std.testing.allocator);
+}
+
 test "parse simple @param" {
-    const allocator = std.testing.allocator;
+    var arena = testAllocator();
+    defer arena.deinit();
+    const allocator = arena.allocator();
     const doc = try parsePhpDoc(allocator,
         \\/**
         \\ * Some description
@@ -348,7 +354,6 @@ test "parse simple @param" {
         \\ * @return bool
         \\ */
     );
-    defer @constCast(&doc).deinit();
 
     try std.testing.expect(doc.params.contains("name"));
     try std.testing.expect(doc.params.contains("age"));
@@ -357,25 +362,237 @@ test "parse simple @param" {
 }
 
 test "parse nullable type" {
-    const allocator = std.testing.allocator;
-    const type_info = try parseTypeString(allocator, "?string");
+    var arena = testAllocator();
+    defer arena.deinit();
+    const type_info = try parseTypeString(arena.allocator(), "?string");
 
     try std.testing.expect(type_info.kind == .nullable);
     try std.testing.expectEqualStrings("string", type_info.base_type);
 }
 
 test "parse union type" {
-    const allocator = std.testing.allocator;
-    const type_info = try parseTypeString(allocator, "string|int|null");
+    var arena = testAllocator();
+    defer arena.deinit();
+    const type_info = try parseTypeString(arena.allocator(), "string|int|null");
 
     try std.testing.expect(type_info.kind == .union_type);
     try std.testing.expect(type_info.type_parts.len == 3);
 }
 
 test "parse array type" {
-    const allocator = std.testing.allocator;
-    const type_info = try parseTypeString(allocator, "User[]");
+    var arena = testAllocator();
+    defer arena.deinit();
+    const type_info = try parseTypeString(arena.allocator(), "User[]");
 
     try std.testing.expect(type_info.kind == .array_type);
     try std.testing.expectEqualStrings("User", type_info.base_type);
+}
+
+test "parse simple type string" {
+    var arena = testAllocator();
+    defer arena.deinit();
+    const type_info = try parseTypeString(arena.allocator(), "string");
+
+    try std.testing.expect(type_info.kind == .simple);
+    try std.testing.expectEqualStrings("string", type_info.base_type);
+    try std.testing.expect(type_info.is_builtin);
+}
+
+test "parse intersection type" {
+    var arena = testAllocator();
+    defer arena.deinit();
+    const type_info = try parseTypeString(arena.allocator(), "Countable&Traversable");
+
+    try std.testing.expect(type_info.kind == .intersection);
+    try std.testing.expect(type_info.type_parts.len == 2);
+    try std.testing.expectEqualStrings("Countable", type_info.type_parts[0]);
+    try std.testing.expectEqualStrings("Traversable", type_info.type_parts[1]);
+}
+
+test "parse special types: void, never, mixed, self, static, parent" {
+    var arena = testAllocator();
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const void_t = try parseTypeString(allocator, "void");
+    try std.testing.expect(void_t.kind == .void_type);
+    try std.testing.expect(void_t.is_builtin);
+
+    const never_t = try parseTypeString(allocator, "never");
+    try std.testing.expect(never_t.kind == .never);
+    try std.testing.expect(never_t.is_builtin);
+
+    const mixed_t = try parseTypeString(allocator, "mixed");
+    try std.testing.expect(mixed_t.kind == .mixed);
+    try std.testing.expect(mixed_t.is_builtin);
+
+    const self_t = try parseTypeString(allocator, "self");
+    try std.testing.expect(self_t.kind == .self_type);
+    try std.testing.expect(!self_t.is_builtin);
+
+    const static_t = try parseTypeString(allocator, "static");
+    try std.testing.expect(static_t.kind == .static_type);
+    try std.testing.expect(!static_t.is_builtin);
+
+    const parent_t = try parseTypeString(allocator, "parent");
+    try std.testing.expect(parent_t.kind == .parent_type);
+    try std.testing.expect(!parent_t.is_builtin);
+}
+
+test "parse FQCN type" {
+    var arena = testAllocator();
+    defer arena.deinit();
+    const type_info = try parseTypeString(arena.allocator(), "App\\Models\\User");
+
+    try std.testing.expect(type_info.kind == .simple);
+    try std.testing.expectEqualStrings("App\\Models\\User", type_info.base_type);
+    try std.testing.expect(!type_info.is_builtin);
+}
+
+test "parse @param with alias and description" {
+    var arena = testAllocator();
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const doc = try parsePhpDoc(allocator,
+        \\/**
+        \\ * @param string $userName The user's display name
+        \\ * @param int $maxRetries Maximum number of retries allowed
+        \\ */
+    );
+
+    try std.testing.expect(doc.params.contains("userName"));
+    const name_type = doc.params.get("userName").?;
+    try std.testing.expectEqualStrings("string", name_type.base_type);
+
+    try std.testing.expect(doc.params.contains("maxRetries"));
+    const retries_type = doc.params.get("maxRetries").?;
+    try std.testing.expectEqualStrings("int", retries_type.base_type);
+}
+
+test "parse complex generics type" {
+    var arena = testAllocator();
+    defer arena.deinit();
+    const type_info = try parseTypeString(arena.allocator(), "array<string,int>");
+
+    try std.testing.expect(type_info.kind == .array_type);
+    try std.testing.expect(type_info.is_builtin);
+}
+
+test "parse multi-annotation docblock" {
+    var arena = testAllocator();
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const doc = try parsePhpDoc(allocator,
+        \\/**
+        \\ * Process a user request.
+        \\ *
+        \\ * @param string $action The action to perform
+        \\ * @param int $userId The user ID
+        \\ * @return bool Whether the action succeeded
+        \\ * @throws RuntimeException If processing fails
+        \\ * @deprecated
+        \\ */
+    );
+
+    try std.testing.expect(doc.params.contains("action"));
+    try std.testing.expect(doc.params.contains("userId"));
+    try std.testing.expect(doc.return_type != null);
+    try std.testing.expectEqualStrings("bool", doc.return_type.?.base_type);
+    try std.testing.expect(doc.throws.len == 1);
+    try std.testing.expectEqualStrings("RuntimeException", doc.throws[0].base_type);
+    try std.testing.expect(doc.deprecated);
+}
+
+test "parse @inheritdoc" {
+    var arena = testAllocator();
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const doc1 = try parsePhpDoc(allocator,
+        \\/**
+        \\ * @inheritdoc
+        \\ */
+    );
+    try std.testing.expect(doc1.inheritdoc);
+
+    const doc2 = try parsePhpDoc(allocator,
+        \\/**
+        \\ * {@inheritdoc}
+        \\ */
+    );
+    try std.testing.expect(doc2.inheritdoc);
+}
+
+test "parse @deprecated" {
+    var arena = testAllocator();
+    defer arena.deinit();
+    const doc = try parsePhpDoc(arena.allocator(),
+        \\/**
+        \\ * @deprecated Use newMethod() instead
+        \\ */
+    );
+    try std.testing.expect(doc.deprecated);
+}
+
+test "parse inline @var" {
+    var arena = testAllocator();
+    defer arena.deinit();
+    const result = try parseInlineVar(arena.allocator(), "/** @var string */");
+
+    try std.testing.expect(result != null);
+    try std.testing.expect(result.?.kind == .simple);
+    try std.testing.expectEqualStrings("string", result.?.base_type);
+}
+
+test "parse empty docblock" {
+    var arena = testAllocator();
+    defer arena.deinit();
+    const doc = try parsePhpDoc(arena.allocator(),
+        \\/**
+        \\ */
+    );
+
+    try std.testing.expect(!doc.deprecated);
+    try std.testing.expect(!doc.inheritdoc);
+    try std.testing.expect(doc.return_type == null);
+    try std.testing.expect(doc.var_type == null);
+    try std.testing.expect(doc.throws.len == 0);
+    try std.testing.expect(doc.params.count() == 0);
+}
+
+test "parse malformed docblock" {
+    var arena = testAllocator();
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // @param with no variable name
+    const doc1 = try parsePhpDoc(allocator,
+        \\/**
+        \\ * @param string
+        \\ */
+    );
+    try std.testing.expect(doc1.params.count() == 0);
+
+    // @return with no type
+    const doc2 = try parsePhpDoc(allocator,
+        \\/**
+        \\ * @return
+        \\ */
+    );
+    try std.testing.expect(doc2.return_type == null);
+}
+
+test "parse @throws annotation" {
+    var arena = testAllocator();
+    defer arena.deinit();
+    const doc = try parsePhpDoc(arena.allocator(),
+        \\/**
+        \\ * @throws InvalidArgumentException
+        \\ * @throws RuntimeException
+        \\ */
+    );
+
+    try std.testing.expect(doc.throws.len == 2);
+    try std.testing.expectEqualStrings("InvalidArgumentException", doc.throws[0].base_type);
+    try std.testing.expectEqualStrings("RuntimeException", doc.throws[1].base_type);
 }
