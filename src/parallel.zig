@@ -142,8 +142,16 @@ pub fn parallelSymbolCollect(
     var results = try allocator.alloc(SymbolCollectResult, num_threads);
     defer allocator.free(results);
 
-    for (results) |*r| {
-        r.* = SymbolCollectResult.init(allocator);
+    // Each thread gets its own ArenaAllocator to avoid concurrent access
+    // to the shared allocator. Per-thread arenas use page_allocator as backing.
+    // We intentionally do NOT deinit these arenas: merged data (strings, etc.)
+    // is referenced by the caller's global structures after merge.
+    const thread_arenas = try allocator.alloc(std.heap.ArenaAllocator, num_threads);
+    defer allocator.free(thread_arenas);
+
+    for (results, thread_arenas) |*r, *arena| {
+        arena.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        r.* = SymbolCollectResult.init(arena.allocator());
     }
 
     const chunk_size = (files.len + num_threads - 1) / num_threads;
@@ -305,8 +313,12 @@ pub fn parallelCallAnalysis(
     var results = try allocator.alloc(CallAnalysisResult, num_threads);
     defer allocator.free(results);
 
-    for (results) |*r| {
-        r.* = CallAnalysisResult.init(allocator);
+    const thread_arenas = try allocator.alloc(std.heap.ArenaAllocator, num_threads);
+    defer allocator.free(thread_arenas);
+
+    for (results, thread_arenas) |*r, *arena| {
+        arena.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        r.* = CallAnalysisResult.init(arena.allocator());
     }
 
     const chunk_size = (files.len + num_threads - 1) / num_threads;
