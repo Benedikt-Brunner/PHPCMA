@@ -1130,19 +1130,25 @@ pub const CalledBeforeAnalyzer = struct {
         }
         try visited.put(target_fn, {});
 
-        // Find callers by iterating through all keys and matching
-        // because the exact key format might differ (with/without full namespace)
+        // Find callers: try exact lookup first (O(1)), fall back to fuzzy scan only if needed
         var all_callers: std.ArrayListUnmanaged(CallerInfo) = .empty;
         defer all_callers.deinit(self.allocator);
 
-        var callers_it = self.callers_of.iterator();
-        while (callers_it.next()) |entry| {
-            const callee_key = entry.key_ptr.*;
+        if (self.callers_of.get(target_fn)) |exact_callers| {
+            // Exact match found — most resolved calls hit this path
+            for (exact_callers.items) |caller_info| {
+                try all_callers.append(self.allocator, caller_info);
+            }
+        } else {
+            // No exact match — fall back to fuzzy scan for partial/namespace matches
+            var callers_it = self.callers_of.iterator();
+            while (callers_it.next()) |entry| {
+                const callee_key = entry.key_ptr.*;
 
-            // Check if this callee matches the target function
-            if (self.calleeMatchesTarget(callee_key, target_fn)) {
-                for (entry.value_ptr.items) |caller_info| {
-                    try all_callers.append(self.allocator, caller_info);
+                if (self.calleeMatchesTarget(callee_key, target_fn)) {
+                    for (entry.value_ptr.items) |caller_info| {
+                        try all_callers.append(self.allocator, caller_info);
+                    }
                 }
             }
         }
