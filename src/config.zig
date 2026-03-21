@@ -216,3 +216,57 @@ pub fn printConfig(phpcma_config: *const PhpcmaConfig, file: std.fs.File) !void 
 
     try writer.flush();
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn writeFile(dir: std.fs.Dir, sub_path: []const u8, content: []const u8) !void {
+    if (std.fs.path.dirname(sub_path)) |parent| {
+        dir.makePath(parent) catch |err| {
+            if (err != error.PathAlreadyExists) return err;
+        };
+    }
+    const f = try dir.createFile(sub_path, .{});
+    defer f.close();
+    try f.writeAll(content);
+}
+
+test ".phpcma.json parsing with scan_paths" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Create .phpcma.json with scan_paths
+    try writeFile(tmp.dir, ".phpcma.json",
+        \\{"scan_paths":["plugins","bundles"]}
+    );
+
+    // Create plugin and bundle subdirs with composer.json
+    try writeFile(tmp.dir, "plugins/plugin-a/composer.json",
+        \\{"autoload":{"psr-4":{"PluginA\\":"src/"}}}
+    );
+    try writeFile(tmp.dir, "bundles/bundle-b/composer.json",
+        \\{"autoload":{"psr-4":{"BundleB\\":"src/"}}}
+    );
+
+    // A dir without composer.json should be ignored
+    try tmp.dir.makePath("plugins/no-composer");
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const config_path = try tmp.dir.realpath(".phpcma.json", &buf);
+    const config_path_owned = try allocator.dupe(u8, config_path);
+    defer allocator.free(config_path_owned);
+
+    var phpcma_config = try parseConfigFile(allocator, config_path_owned);
+    defer phpcma_config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), phpcma_config.scan_paths.len);
+    try std.testing.expectEqual(@as(usize, 2), phpcma_config.discovered_projects.len);
+
+    // Verify discovered projects end with composer.json
+    for (phpcma_config.discovered_projects) |p| {
+        try std.testing.expect(std.mem.endsWith(u8, p, "composer.json"));
+    }
+}
