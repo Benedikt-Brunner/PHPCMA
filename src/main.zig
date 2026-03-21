@@ -10,6 +10,7 @@ const config_parser = @import("config.zig");
 const phpdoc = @import("phpdoc.zig");
 const type_resolver = @import("type_resolver.zig");
 const call_analyzer = @import("call_analyzer.zig");
+const boundary_analyzer = @import("boundary_analyzer.zig");
 const NodeKindIds = @import("node_kind_ids.zig").NodeKindIds;
 const parallel = @import("parallel.zig");
 
@@ -755,6 +756,13 @@ var called_before_config = struct {
     verbose: bool = false,
 }{};
 
+var check_boundaries_config = struct {
+    config: []const u8 = "", // Path to .phpcma.json (required for monorepo mode)
+    output: []const u8 = "",
+    format: []const u8 = "text",
+    verbose: bool = false,
+}{};
+
 pub fn main() !void {
     var r = try cli.AppRunner.init(std.heap.page_allocator);
 
@@ -875,6 +883,39 @@ pub fn main() !void {
                         }),
                         .target = cli.CommandTarget{
                             .action = cli.CommandAction{ .exec = analyzeCalledBefore },
+                        },
+                    },
+                    .{
+                        .name = "check-boundaries",
+                        .description = .{ .one_line = "Detect cross-project boundary calls in a monorepo" },
+                        .options = try r.allocOptions(&.{
+                            .{
+                                .long_name = "config",
+                                .short_alias = 'g',
+                                .help = "Path to .phpcma.json",
+                                .value_ref = r.mkRef(&check_boundaries_config.config),
+                                .required = true,
+                            },
+                            .{
+                                .long_name = "output",
+                                .short_alias = 'o',
+                                .help = "Output file (default: stdout)",
+                                .value_ref = r.mkRef(&check_boundaries_config.output),
+                            },
+                            .{
+                                .long_name = "format",
+                                .help = "Output format: text, json, or dot (default: text)",
+                                .value_ref = r.mkRef(&check_boundaries_config.format),
+                            },
+                            .{
+                                .long_name = "verbose",
+                                .short_alias = 'v',
+                                .help = "Verbose output",
+                                .value_ref = r.mkRef(&check_boundaries_config.verbose),
+                            },
+                        }),
+                        .target = cli.CommandTarget{
+                            .action = cli.CommandAction{ .exec = analyzeCheckBoundaries },
                         },
                     },
                 }),
@@ -1289,6 +1330,142 @@ fn analyzeCalledBefore() !void {
     // Exit with error code if constraint is violated
     if (!result.satisfied) {
         std.process.exit(1);
+    }
+}
+
+fn analyzeCheckBoundaries() !void {
+    var arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
+    defer _ = arena.deinit();
+    const allocator = arena.allocator();
+
+    const stdout: std.fs.File = .{ .handle = std.posix.STDOUT_FILENO };
+
+    // Pass 1: Parse .phpcma.json and discover files
+    if (check_boundaries_config.verbose) {
+        try stdout.writeAll("Pass 1: Discovering files from .phpcma.json (monorepo mode)...\n");
+    }
+
+    var phpcma_config = config_parser.parseConfigFile(allocator, check_boundaries_config.config) catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "Error parsing .phpcma.json: {}\n", .{err});
+        try stdout.writeAll(msg);
+        return;
+    };
+
+    if (check_boundaries_config.verbose) {
+        try config_parser.printConfig(&phpcma_config, stdout);
+        try stdout.writeAll("\n");
+    }
+
+    const project_configs = config_parser.parseDiscoveredProjects(allocator, &phpcma_config) catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "Error parsing projects: {}\n", .{err});
+        try stdout.writeAll(msg);
+        return;
+    };
+
+    const files = config_parser.discoverFilesFromConfigs(allocator, project_configs) catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "Error discovering files: {}\n", .{err});
+        try stdout.writeAll(msg);
+        return;
+    };
+
+    if (check_boundaries_config.verbose) {
+        const msg = try std.fmt.allocPrint(allocator, "Discovered {d} PHP files from {d} projects\n\n", .{ files.len, project_configs.len });
+        try stdout.writeAll(msg);
+    }
+
+    // Pass 2: Collect symbols (parallel)
+    if (check_boundaries_config.verbose) {
+        const thread_count = parallel.getThreadCount(files.len);
+        const msg = try std.fmt.allocPrint(allocator, "Pass 2: Collecting symbols ({d} threads)...\n", .{thread_count});
+        try stdout.writeAll(msg);
+    }
+
+    var sym_table = SymbolTable.init(allocator);
+    defer sym_table.deinit();
+
+    var file_contexts = std.StringHashMap(FileContext).init(allocator);
+    defer {
+        var it = file_contexts.valueIterator();
+        while (it.next()) |ctx| {
+            ctx.deinit();
+        }
+        file_contexts.deinit();
+    }
+
+    var file_sources = std.StringHashMap([]const u8).init(allocator);
+    defer file_sources.deinit();
+
+    try parallel.parallelSymbolCollect(
+        allocator,
+        files,
+        project_configs,
+        &sym_table,
+        &file_contexts,
+        &file_sources,
+        &collectSymbolsFromSource,
+    );
+
+    if (check_boundaries_config.verbose) {
+        try sym_table.printStats(stdout);
+        try stdout.writeAll("\n");
+    }
+
+    // Pass 3: Resolve inheritance
+    if (check_boundaries_config.verbose) {
+        try stdout.writeAll("Pass 3: Resolving inheritance...\n");
+    }
+
+    try sym_table.resolveInheritance();
+
+    // Pass 4: Analyze calls (parallel)
+    if (check_boundaries_config.verbose) {
+        const thread_count = parallel.getThreadCount(files.len);
+        const msg = try std.fmt.allocPrint(allocator, "Pass 4: Analyzing calls ({d} threads)...\n", .{thread_count});
+        try stdout.writeAll(msg);
+    }
+
+    var call_graph = ProjectCallGraph.init(allocator, &sym_table);
+    defer call_graph.deinit();
+
+    try parallel.parallelCallAnalysis(
+        allocator,
+        files,
+        &file_sources,
+        &file_contexts,
+        &sym_table,
+        &call_graph,
+    );
+
+    // Pass 5: Boundary analysis
+    if (check_boundaries_config.verbose) {
+        try stdout.writeAll("Pass 5: Analyzing cross-project boundaries...\n\n");
+    }
+
+    var ba = boundary_analyzer.BoundaryAnalyzer.init(allocator, &call_graph, project_configs, &sym_table);
+    const result = try ba.analyze();
+
+    // Output results
+    if (check_boundaries_config.output.len > 0) {
+        const out_file = try std.fs.cwd().createFile(check_boundaries_config.output, .{});
+        defer out_file.close();
+
+        if (std.mem.eql(u8, check_boundaries_config.format, "json")) {
+            try ba.toJson(&result, out_file);
+        } else if (std.mem.eql(u8, check_boundaries_config.format, "dot")) {
+            try ba.toDot(&result, out_file);
+        } else {
+            try ba.toText(&result, out_file);
+        }
+        const msg = try std.fmt.allocPrint(allocator, "Output written to: {s}\n", .{check_boundaries_config.output});
+        try stdout.writeAll(msg);
+    } else {
+        if (std.mem.eql(u8, check_boundaries_config.format, "json")) {
+            try ba.toJson(&result, stdout);
+        } else if (std.mem.eql(u8, check_boundaries_config.format, "dot")) {
+            try ba.toDot(&result, stdout);
+        } else {
+            try ba.toText(&result, stdout);
+        }
     }
 }
 
