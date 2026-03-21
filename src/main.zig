@@ -11,6 +11,7 @@ const phpdoc = @import("phpdoc.zig");
 const type_resolver = @import("type_resolver.zig");
 const call_analyzer = @import("call_analyzer.zig");
 const NodeKindIds = @import("node_kind_ids.zig").NodeKindIds;
+const parallel = @import("parallel.zig");
 
 // Plugin imports
 const plugin_interface = @import("plugins/plugin_interface.zig");
@@ -698,6 +699,23 @@ const SymbolCollector = struct {
 };
 
 // ============================================================================
+// Public API for parallel processing
+// ============================================================================
+
+/// Wrapper for SymbolCollector that can be called from parallel.zig.
+pub fn collectSymbolsFromSource(
+    allocator: std.mem.Allocator,
+    sym_table: *SymbolTable,
+    file_ctx: *FileContext,
+    source: []const u8,
+    language: *const ts.Language,
+    tree: *ts.Tree,
+) error{OutOfMemory}!void {
+    var collector = SymbolCollector.init(allocator, sym_table, file_ctx, source, language);
+    try collector.collect(tree);
+}
+
+// ============================================================================
 // Helper Functions
 // ============================================================================
 
@@ -960,16 +978,11 @@ fn analyzeProject() !void {
         try stdout.writeAll(msg);
     }
 
-    // Initialize parser
-    const parser = ts.Parser.create();
-    defer parser.destroy();
-
-    const php_lang = tree_sitter_php();
-    try parser.setLanguage(php_lang);
-
-    // Pass 2: Collect symbols from all files
+    // Pass 2: Collect symbols from all files (parallel)
     if (project_config.verbose) {
-        try stdout.writeAll("Pass 2: Collecting symbols...\n");
+        const thread_count = parallel.getThreadCount(files.len);
+        const msg = try std.fmt.allocPrint(allocator, "Pass 2: Collecting symbols ({d} threads)...\n", .{thread_count});
+        try stdout.writeAll(msg);
     }
 
     var sym_table = SymbolTable.init(allocator);
@@ -984,27 +997,22 @@ fn analyzeProject() !void {
         file_contexts.deinit();
     }
 
-    // Cache file sources from Pass 2 to avoid re-reading in Pass 4
     var file_sources = std.StringHashMap([]const u8).init(allocator);
     defer file_sources.deinit();
 
-    for (files) |file_path| {
-        const file = std.fs.openFileAbsolute(file_path, .{}) catch continue;
-        defer file.close();
+    // Wrap config in a single-element slice for parallelSymbolCollect
+    var configs_array = try allocator.alloc(ProjectConfig, 1);
+    configs_array[0] = config;
 
-        const source = file.readToEndAlloc(allocator, max_file_size) catch continue;
-        const tree = parser.parseString(source, null) orelse continue;
-        defer tree.destroy();
-
-        var file_ctx = FileContext.init(allocator, file_path);
-        file_ctx.project_config = &config;
-
-        var collector = SymbolCollector.init(allocator, &sym_table, &file_ctx, source, php_lang);
-        collector.collect(tree) catch continue;
-
-        try file_contexts.put(file_path, file_ctx);
-        try file_sources.put(file_path, source);
-    }
+    try parallel.parallelSymbolCollect(
+        allocator,
+        files,
+        configs_array,
+        &sym_table,
+        &file_contexts,
+        &file_sources,
+        &collectSymbolsFromSource,
+    );
 
     if (project_config.verbose) {
         try sym_table.printStats(stdout);
@@ -1018,27 +1026,24 @@ fn analyzeProject() !void {
 
     try sym_table.resolveInheritance();
 
-    // Pass 4: Analyze calls (reusing cached sources from Pass 2)
+    // Pass 4: Analyze calls (parallel, reusing cached sources)
     if (project_config.verbose) {
-        try stdout.writeAll("Pass 4: Analyzing calls...\n");
+        const thread_count = parallel.getThreadCount(files.len);
+        const msg = try std.fmt.allocPrint(allocator, "Pass 4: Analyzing calls ({d} threads)...\n", .{thread_count});
+        try stdout.writeAll(msg);
     }
 
     var call_graph = ProjectCallGraph.init(allocator, &sym_table);
     defer call_graph.deinit();
 
-    for (files) |file_path| {
-        const source = file_sources.get(file_path) orelse continue;
-        const tree = parser.parseString(source, null) orelse continue;
-        defer tree.destroy();
-
-        const file_ctx_ptr = file_contexts.getPtr(file_path) orelse continue;
-
-        var analyzer = CallAnalyzer.init(allocator, &sym_table, file_ctx_ptr, php_lang);
-        defer analyzer.deinit();
-
-        analyzer.analyzeFile(tree, source, file_path) catch continue;
-        try call_graph.addCalls(&analyzer);
-    }
+    try parallel.parallelCallAnalysis(
+        allocator,
+        files,
+        &file_sources,
+        &file_contexts,
+        &sym_table,
+        &call_graph,
+    );
 
     // Output results
     if (project_config.verbose) {
@@ -1145,16 +1150,11 @@ fn analyzeCalledBefore() !void {
         try stdout.writeAll(msg);
     }
 
-    // Initialize parser
-    const parser = ts.Parser.create();
-    defer parser.destroy();
-
-    const php_lang = tree_sitter_php();
-    try parser.setLanguage(php_lang);
-
-    // Pass 2: Collect symbols from all files
+    // Pass 2: Collect symbols from all files (parallel)
     if (called_before_config.verbose) {
-        try stdout.writeAll("Pass 2: Collecting symbols...\n");
+        const thread_count = parallel.getThreadCount(files.len);
+        const msg2 = try std.fmt.allocPrint(allocator, "Pass 2: Collecting symbols ({d} threads)...\n", .{thread_count});
+        try stdout.writeAll(msg2);
     }
 
     var sym_table = SymbolTable.init(allocator);
@@ -1169,34 +1169,18 @@ fn analyzeCalledBefore() !void {
         file_contexts.deinit();
     }
 
-    // Store file sources for plugins that need to re-parse
     var file_sources = std.StringHashMap([]const u8).init(allocator);
     defer file_sources.deinit();
 
-    for (files) |file_path| {
-        const file = std.fs.openFileAbsolute(file_path, .{}) catch continue;
-        defer file.close();
-
-        const source = file.readToEndAlloc(allocator, max_file_size) catch continue;
-        const tree = parser.parseString(source, null) orelse continue;
-        defer tree.destroy();
-
-        var file_ctx = FileContext.init(allocator, file_path);
-
-        // Find the matching project config for this file
-        for (project_configs) |*cfg| {
-            if (std.mem.startsWith(u8, file_path, cfg.root_path)) {
-                file_ctx.project_config = cfg;
-                break;
-            }
-        }
-
-        var collector = SymbolCollector.init(allocator, &sym_table, &file_ctx, source, php_lang);
-        collector.collect(tree) catch continue;
-
-        try file_contexts.put(file_path, file_ctx);
-        try file_sources.put(file_path, source);
-    }
+    try parallel.parallelSymbolCollect(
+        allocator,
+        files,
+        project_configs,
+        &sym_table,
+        &file_contexts,
+        &file_sources,
+        &collectSymbolsFromSource,
+    );
 
     // Pass 3: Resolve inheritance
     if (called_before_config.verbose) {
@@ -1205,27 +1189,24 @@ fn analyzeCalledBefore() !void {
 
     try sym_table.resolveInheritance();
 
-    // Pass 4: Analyze calls
+    // Pass 4: Analyze calls (parallel)
     if (called_before_config.verbose) {
-        try stdout.writeAll("Pass 4: Analyzing calls...\n");
+        const thread_count = parallel.getThreadCount(files.len);
+        const msg2 = try std.fmt.allocPrint(allocator, "Pass 4: Analyzing calls ({d} threads)...\n", .{thread_count});
+        try stdout.writeAll(msg2);
     }
 
     var call_graph = ProjectCallGraph.init(allocator, &sym_table);
     defer call_graph.deinit();
 
-    for (files) |file_path| {
-        const source = file_sources.get(file_path) orelse continue;
-        const tree = parser.parseString(source, null) orelse continue;
-        defer tree.destroy();
-
-        const file_ctx_ptr = file_contexts.getPtr(file_path) orelse continue;
-
-        var analyzer = CallAnalyzer.init(allocator, &sym_table, file_ctx_ptr, php_lang);
-        defer analyzer.deinit();
-
-        analyzer.analyzeFile(tree, source, file_path) catch continue;
-        try call_graph.addCalls(&analyzer);
-    }
+    try parallel.parallelCallAnalysis(
+        allocator,
+        files,
+        &file_sources,
+        &file_contexts,
+        &sym_table,
+        &call_graph,
+    );
 
     // Pass 5: Plugin execution (synthetic edges)
     if (called_before_config.plugins.len > 0) {
