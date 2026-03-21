@@ -893,11 +893,10 @@ pub const CalledBeforeAnalyzer = struct {
         self.after_match_set.deinit();
     }
 
-    /// Build indexes for efficient lookup
+    /// Build forward index (calls_by_caller) for efficient lookup
     fn buildIndexes(self: *CalledBeforeAnalyzer) !void {
-        // Build calls_by_caller index and reverse call graph
+        // Build calls_by_caller index only (forward graph)
         for (self.call_graph.calls.items) |call| {
-            // Add to calls_by_caller
             const result = try self.calls_by_caller.getOrPut(call.caller_fqn);
             if (!result.found_existing) {
                 result.value_ptr.* = .empty;
@@ -907,18 +906,76 @@ pub const CalledBeforeAnalyzer = struct {
                 .line = call.line,
                 .file_path = call.file_path,
             });
+        }
+    }
 
-            // Build reverse call graph (callers_of)
-            const callee = call.resolved_target orelse call.callee_name;
-            const reverse_result = try self.callers_of.getOrPut(callee);
-            if (!reverse_result.found_existing) {
-                reverse_result.value_ptr.* = .empty;
+    /// Build lazy reverse graph (callers_of) only for functions that are
+    /// transitively reachable from after_fn callers. This avoids indexing
+    /// the full 20K+ edges when only a small subset is needed.
+    fn buildReverseIndex(self: *CalledBeforeAnalyzer) !void {
+        // Phase 1: Build a temporary full reverse map (callee -> callers) in one pass.
+        // This is O(E) where E = number of call edges.
+        var full_reverse = std.StringHashMap(std.ArrayListUnmanaged(CallerInfo)).init(self.allocator);
+        defer {
+            var it = full_reverse.valueIterator();
+            while (it.next()) |list| {
+                list.deinit(self.allocator);
             }
-            try reverse_result.value_ptr.append(self.allocator, .{
-                .caller = call.caller_fqn,
-                .line = call.line,
-                .file_path = call.file_path,
-            });
+            full_reverse.deinit();
+        }
+
+        var fwd_it = self.calls_by_caller.iterator();
+        while (fwd_it.next()) |entry| {
+            const caller_fqn = entry.key_ptr.*;
+            for (entry.value_ptr.items) |call| {
+                const result = try full_reverse.getOrPut(call.callee);
+                if (!result.found_existing) {
+                    result.value_ptr.* = .empty;
+                }
+                try result.value_ptr.append(self.allocator, .{
+                    .caller = caller_fqn,
+                    .line = call.line,
+                    .file_path = call.file_path,
+                });
+            }
+        }
+
+        // Phase 2: BFS from after_fn match set to discover all transitively
+        // needed reverse edges. Only these get copied into self.callers_of.
+        var visited = std.StringHashMap(void).init(self.allocator);
+        defer visited.deinit();
+
+        var worklist: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer worklist.deinit(self.allocator);
+
+        // Seed with all callee strings matching after_fn
+        var after_it = self.after_match_set.iterator();
+        while (after_it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            if (!visited.contains(key)) {
+                try visited.put(key, {});
+                try worklist.append(self.allocator, key);
+            }
+        }
+
+        while (worklist.items.len > 0) {
+            const target = worklist.pop().?;
+
+            // Copy reverse edges for this target into self.callers_of
+            if (full_reverse.get(target)) |callers| {
+                const result = try self.callers_of.getOrPut(target);
+                if (!result.found_existing) {
+                    result.value_ptr.* = .empty;
+                }
+                for (callers.items) |caller_info| {
+                    try result.value_ptr.append(self.allocator, caller_info);
+                    // Each caller may also need reverse edges for recursive walk
+                    if (!visited.contains(caller_info.caller)) {
+                        try visited.put(caller_info.caller, {});
+                        try worklist.append(self.allocator, caller_info.caller);
+                    }
+                }
+            }
         }
     }
 
@@ -957,11 +1014,14 @@ pub const CalledBeforeAnalyzer = struct {
         before_fn: []const u8,
         after_fn: []const u8,
     ) !CalledBeforeResult {
-        // Build indexes for efficient lookup
+        // Build forward index (calls_by_caller)
         try self.buildIndexes();
 
         // Pre-compute match sets for O(1) lookups in inner loops
         try self.buildMatchSets(before_fn, after_fn);
+
+        // Build lazy reverse graph only for after_fn targets and transitive callers
+        try self.buildReverseIndex();
 
         var violations: std.ArrayListUnmanaged(CalledBeforeResult.Violation) = .empty;
         var matches: std.ArrayListUnmanaged(CalledBeforeResult.Match) = .empty;
