@@ -142,14 +142,19 @@ pub fn parallelSymbolCollect(
     var results = try allocator.alloc(SymbolCollectResult, num_threads);
     defer allocator.free(results);
 
-    // Use a ThreadSafeAllocator wrapping the caller's allocator so all
-    // threads allocate from the same arena.  The caller's arena outlives
-    // the entire analysis, so merged data (strings, HashMap entries) stays
-    // valid — no use-after-free, no leaked per-thread arenas.
-    var ts_alloc = std.heap.ThreadSafeAllocator{ .child_allocator = allocator };
+    // Each thread gets its own ArenaAllocator backed by c_allocator.
+    // These arenas are intentionally NEVER freed — the merged data (strings,
+    // HashMap entries, ClassSymbol fields, etc.) is referenced by the caller's
+    // global structures for the rest of the program. The parent arena in main
+    // does not own this memory; the per-thread arenas do, and they live until
+    // process exit. This avoids both mutex contention (ThreadSafeAllocator)
+    // and use-after-free (freeing per-thread arenas after merge).
+    const thread_arenas = try allocator.alloc(std.heap.ArenaAllocator, num_threads);
+    // NOT deferred — intentionally leaked
 
-    for (results) |*r| {
-        r.* = SymbolCollectResult.init(ts_alloc.allocator());
+    for (results, thread_arenas) |*r, *arena| {
+        arena.* = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        r.* = SymbolCollectResult.init(arena.allocator());
     }
 
     const chunk_size = (files.len + num_threads - 1) / num_threads;
@@ -311,10 +316,13 @@ pub fn parallelCallAnalysis(
     var results = try allocator.alloc(CallAnalysisResult, num_threads);
     defer allocator.free(results);
 
-    var ts_alloc = std.heap.ThreadSafeAllocator{ .child_allocator = allocator };
+    // Per-thread arenas for call analysis — intentionally never freed (same
+    // rationale as parallelSymbolCollect above).
+    const thread_arenas = try allocator.alloc(std.heap.ArenaAllocator, num_threads);
 
-    for (results) |*r| {
-        r.* = CallAnalysisResult.init(ts_alloc.allocator());
+    for (results, thread_arenas) |*r, *arena| {
+        arena.* = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        r.* = CallAnalysisResult.init(arena.allocator());
     }
 
     const chunk_size = (files.len + num_threads - 1) / num_threads;
