@@ -4,6 +4,7 @@ const types = @import("types.zig");
 const symbol_table = @import("symbol_table.zig");
 const type_resolver = @import("type_resolver.zig");
 const phpdoc = @import("phpdoc.zig");
+const NodeKindIds = @import("node_kind_ids.zig").NodeKindIds;
 
 const TypeInfo = types.TypeInfo;
 const ClassSymbol = types.ClassSymbol;
@@ -22,6 +23,7 @@ pub const CallAnalyzer = struct {
     allocator: std.mem.Allocator,
     symbol_table: *SymbolTable,
     type_resolver: TypeResolver,
+    ids: NodeKindIds,
 
     // Collected calls
     calls: std.ArrayListUnmanaged(EnhancedFunctionCall),
@@ -35,11 +37,13 @@ pub const CallAnalyzer = struct {
         allocator: std.mem.Allocator,
         sym_table: *SymbolTable,
         file_ctx: *FileContext,
+        language: *const ts.Language,
     ) CallAnalyzer {
         return .{
             .allocator = allocator,
             .symbol_table = sym_table,
             .type_resolver = TypeResolver.init(allocator, sym_table, file_ctx),
+            .ids = NodeKindIds.init(language),
             .calls = .empty,
             .current_file = "",
             .current_class = null,
@@ -73,37 +77,37 @@ pub const CallAnalyzer = struct {
 
     /// Traverse AST and analyze nodes
     fn traverseNode(self: *CallAnalyzer, node: ts.Node, source: []const u8) error{OutOfMemory}!void {
-        const kind = node.kind();
+        const kind_id = node.kindId();
 
         // Track class context
-        if (std.mem.eql(u8, kind, "class_declaration")) {
+        if (kind_id == self.ids.class_declaration) {
             try self.enterClass(node, source);
             return;
         }
 
         // Track method context
-        if (std.mem.eql(u8, kind, "method_declaration")) {
+        if (kind_id == self.ids.method_declaration) {
             try self.enterMethod(node, source);
             return;
         }
 
         // Track function context
-        if (std.mem.eql(u8, kind, "function_definition")) {
+        if (kind_id == self.ids.function_definition) {
             try self.enterFunction(node, source);
             return;
         }
 
         // Analyze calls
-        if (std.mem.eql(u8, kind, "member_call_expression")) {
+        if (kind_id == self.ids.member_call_expression) {
             try self.analyzeMemberCall(node, source);
-        } else if (std.mem.eql(u8, kind, "scoped_call_expression")) {
+        } else if (kind_id == self.ids.scoped_call_expression) {
             try self.analyzeStaticCall(node, source);
-        } else if (std.mem.eql(u8, kind, "function_call_expression")) {
+        } else if (kind_id == self.ids.function_call_expression) {
             try self.analyzeFunctionCall(node, source);
         }
 
         // Track assignments for type inference
-        if (std.mem.eql(u8, kind, "assignment_expression")) {
+        if (kind_id == self.ids.assignment_expression) {
             try self.type_resolver.trackAssignment(node, source);
         }
 
@@ -323,8 +327,8 @@ pub const CallAnalyzer = struct {
     fn analyzeFunctionCall(self: *CallAnalyzer, node: ts.Node, source: []const u8) !void {
         const func_node = node.childByFieldName("function") orelse return;
 
-        const func_kind = func_node.kind();
-        if (!std.mem.eql(u8, func_kind, "name") and !std.mem.eql(u8, func_kind, "qualified_name")) {
+        const func_kind_id = func_node.kindId();
+        if (func_kind_id != self.ids.name and func_kind_id != self.ids.qualified_name) {
             return;
         }
 
@@ -1518,6 +1522,8 @@ const AfterCallInfo = struct {
 // Tests
 // ============================================================================
 
+extern fn tree_sitter_php() callconv(.c) *ts.Language;
+
 test "CallAnalyzer basic" {
     // Basic structure test - would need tree-sitter integration for full test
     const allocator = std.testing.allocator;
@@ -1527,7 +1533,8 @@ test "CallAnalyzer basic" {
     var file_ctx = types.FileContext.init(allocator, "test.php");
     defer file_ctx.deinit();
 
-    var analyzer = CallAnalyzer.init(allocator, &sym_table, &file_ctx);
+    const php_lang = tree_sitter_php();
+    var analyzer = CallAnalyzer.init(allocator, &sym_table, &file_ctx, php_lang);
     defer analyzer.deinit();
 
     try std.testing.expect(analyzer.calls.items.len == 0);
