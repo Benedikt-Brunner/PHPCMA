@@ -605,3 +605,83 @@ pub const ProjectConfig = struct {
         self.autoload_psr0.deinit();
     }
 };
+
+// ============================================================================
+// Tests: FileContext.resolveFQCN
+// ============================================================================
+
+test "resolveFQCN: already qualified strips leading backslash" {
+    const allocator = std.testing.allocator;
+    var ctx = FileContext.init(allocator, "test.php");
+    defer ctx.deinit();
+
+    const result = try ctx.resolveFQCN("\\App\\Models\\User");
+    try std.testing.expectEqualStrings("App\\Models\\User", result);
+}
+
+test "resolveFQCN: builtin types unchanged" {
+    const allocator = std.testing.allocator;
+    var ctx = FileContext.init(allocator, "test.php");
+    defer ctx.deinit();
+    ctx.namespace = "App";
+
+    const result = try ctx.resolveFQCN("string");
+    try std.testing.expectEqualStrings("string", result);
+}
+
+test "resolveFQCN: use statement exact match" {
+    const allocator = std.testing.allocator;
+    var ctx = FileContext.init(allocator, "test.php");
+    defer ctx.deinit();
+    ctx.namespace = "App";
+
+    try ctx.addUseStatement(.{ .fqcn = "Vendor\\Lib\\Logger", .alias = null, .kind = .class });
+
+    const result = try ctx.resolveFQCN("Logger");
+    try std.testing.expectEqualStrings("Vendor\\Lib\\Logger", result);
+}
+
+test "resolveFQCN: use statement with alias" {
+    const allocator = std.testing.allocator;
+    var ctx = FileContext.init(allocator, "test.php");
+    defer ctx.deinit();
+    ctx.namespace = "App";
+
+    try ctx.addUseStatement(.{ .fqcn = "Vendor\\Lib\\Logger", .alias = "Log", .kind = .class });
+
+    const result = try ctx.resolveFQCN("Log");
+    try std.testing.expectEqualStrings("Vendor\\Lib\\Logger", result);
+}
+
+test "resolveFQCN: qualified name with imported prefix" {
+    const allocator = std.testing.allocator;
+    var ctx = FileContext.init(allocator, "test.php");
+    defer ctx.deinit();
+    ctx.namespace = "App";
+
+    try ctx.addUseStatement(.{ .fqcn = "Vendor\\Foo", .alias = null, .kind = .class });
+
+    const result = try ctx.resolveFQCN("Foo\\Bar");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Vendor\\Foo\\Bar", result);
+}
+
+test "resolveFQCN: namespace prepend when no use match" {
+    const allocator = std.testing.allocator;
+    var ctx = FileContext.init(allocator, "test.php");
+    defer ctx.deinit();
+    ctx.namespace = "App\\Services";
+
+    const result = try ctx.resolveFQCN("UserService");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("App\\Services\\UserService", result);
+}
+
+test "resolveFQCN: no namespace no use returns unchanged" {
+    const allocator = std.testing.allocator;
+    var ctx = FileContext.init(allocator, "test.php");
+    defer ctx.deinit();
+
+    const result = try ctx.resolveFQCN("SomeClass");
+    try std.testing.expectEqualStrings("SomeClass", result);
+}
