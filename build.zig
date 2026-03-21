@@ -195,6 +195,29 @@ pub fn build(b: *std.Build) void {
     const run_cfg_tests = b.addRunArtifact(cfg_tests);
     test_step.dependOn(&run_cfg_tests.step);
 
+    const null_safety_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/null_safety.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    null_safety_tests.root_module.addImport("tree-sitter", ts_dep.module("tree_sitter"));
+    null_safety_tests.root_module.addImport("cli", cli_dep.module("cli"));
+    null_safety_tests.addIncludePath(php_src_root);
+    null_safety_tests.addCSourceFile(.{
+        .file = php_src_root.path(b, "parser.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    null_safety_tests.addCSourceFile(.{
+        .file = php_src_root.path(b, "scanner.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    null_safety_tests.linkLibC();
+
+    const run_null_safety_tests = b.addRunArtifact(null_safety_tests);
+    test_step.dependOn(&run_null_safety_tests.step);
+
     const generics_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/generics.zig"),
