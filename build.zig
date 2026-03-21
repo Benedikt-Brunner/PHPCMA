@@ -172,4 +172,44 @@ pub fn build(b: *std.Build) void {
 
     const run_phpdoc_tests = b.addRunArtifact(phpdoc_tests);
     test_step.dependOn(&run_phpdoc_tests.step);
+
+    // ----------------------------------------------------------------
+    // Benchmarks (ReleaseFast)
+    // ----------------------------------------------------------------
+    const bench_step = b.step("bench", "Run performance benchmarks");
+
+    // Build tree-sitter dep with ReleaseFast to avoid UBSan link errors
+    const ts_dep_fast = b.dependency("tree_sitter", .{
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+
+    const bench_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+
+    // Add tree-sitter module (ReleaseFast build)
+    bench_tests.root_module.addImport("tree-sitter", ts_dep_fast.module("tree_sitter"));
+
+    // Add CLI module
+    bench_tests.root_module.addImport("cli", cli_dep.module("cli"));
+
+    // Add PHP grammar C sources
+    bench_tests.addIncludePath(php_src_root);
+    bench_tests.addCSourceFile(.{
+        .file = php_src_root.path(b, "parser.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    bench_tests.addCSourceFile(.{
+        .file = php_src_root.path(b, "scanner.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    bench_tests.linkLibC();
+
+    const run_bench_tests = b.addRunArtifact(bench_tests);
+    bench_step.dependOn(&run_bench_tests.step);
 }
