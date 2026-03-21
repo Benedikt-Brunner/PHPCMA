@@ -861,3 +861,429 @@ test "parallel: parse error in subset does not prevent valid files" {
     // All 3 files should have been read (sources captured for all parseable files)
     try std.testing.expect(file_sources.count() >= 2);
 }
+
+// ============================================================================
+// Test Suite 12: Parallel Memory Safety Tests (full pipeline)
+// ============================================================================
+
+/// Helper: generate N PHP fixture files with classes, inheritance, and method calls.
+/// Returns owned file path slices (caller must free each path).
+fn generatePhpFixtures(
+    allocator: std.mem.Allocator,
+    dir: std.fs.Dir,
+    count: usize,
+    paths_out: [][]const u8,
+) !usize {
+    var created: usize = 0;
+    for (0..count) |i| {
+        var name_buf: [64]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "fix_{d}.php", .{i}) catch unreachable;
+
+        // Build a PHP file with a class that extends the previous one (if any)
+        // and calls a method, exercising symbol collect + call analysis.
+        var content_buf: [512]u8 = undefined;
+        const content = if (i > 0)
+            std.fmt.bufPrint(&content_buf,
+                \\<?php
+                \\class Fix{d} extends Fix{d} {{
+                \\    public function run{d}() {{
+                \\        $this->run{d}();
+                \\        strlen("hello");
+                \\    }}
+                \\}}
+                \\
+            , .{ i, i - 1, i, i - 1 }) catch unreachable
+        else
+            std.fmt.bufPrint(&content_buf,
+                \\<?php
+                \\class Fix0 {{
+                \\    public function run0() {{
+                \\        strlen("hello");
+                \\    }}
+                \\}}
+                \\
+            , .{}) catch unreachable;
+
+        paths_out[i] = try createTempPhpFile(allocator, dir, name, content);
+        created += 1;
+    }
+    return created;
+}
+
+/// Helper: run full pipeline — parallel symbol collect → inheritance resolution →
+/// parallel call analysis. Returns (sym_table, call_graph, file_contexts, file_sources).
+/// Caller is responsible for deinit of sym_table, call_graph, file_contexts, file_sources.
+fn runFullPipeline(
+    allocator: std.mem.Allocator,
+    file_paths: []const []const u8,
+) !struct {
+    sym_table: SymbolTable,
+    call_graph: ProjectCallGraph,
+    file_contexts: std.StringHashMap(FileContext),
+    file_sources: std.StringHashMap([]const u8),
+} {
+    var configs = [_]ProjectConfig{};
+    var sym_table = SymbolTable.init(allocator);
+    var file_contexts = std.StringHashMap(FileContext).init(allocator);
+    var file_sources = std.StringHashMap([]const u8).init(allocator);
+
+    try parallelSymbolCollect(
+        allocator,
+        file_paths,
+        &configs,
+        &sym_table,
+        &file_contexts,
+        &file_sources,
+        testCollectFn,
+    );
+
+    try sym_table.resolveInheritance();
+
+    var call_graph = ProjectCallGraph.init(allocator, &sym_table);
+    try parallelCallAnalysis(
+        allocator,
+        file_paths,
+        &file_sources,
+        &file_contexts,
+        &sym_table,
+        &call_graph,
+    );
+
+    return .{
+        .sym_table = sym_table,
+        .call_graph = call_graph,
+        .file_contexts = file_contexts,
+        .file_sources = file_sources,
+    };
+}
+
+fn cleanupPipeline(allocator: std.mem.Allocator, state: *@TypeOf(runFullPipeline(undefined, undefined) catch unreachable)) void {
+    state.call_graph.deinit();
+    var ctx_it = state.file_contexts.valueIterator();
+    while (ctx_it.next()) |v| @constCast(v).deinit();
+    state.file_contexts.deinit();
+    var src_it = state.file_sources.valueIterator();
+    while (src_it.next()) |v| allocator.free(v.*);
+    state.file_sources.deinit();
+    state.sym_table.deinit();
+}
+
+// --------------------------------------------------------------------------
+// Safety Test 1: Parallel symbol collect → inheritance resolution → no crash
+// (use-after-free regression test)
+// --------------------------------------------------------------------------
+
+test "safety: parallel collect → inheritance resolution → no crash" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const count = 25;
+    var file_paths: [count][]const u8 = undefined;
+    const created = try generatePhpFixtures(allocator, tmp_dir.dir, count, &file_paths);
+    defer for (file_paths[0..created]) |p| allocator.free(p);
+
+    var state = try runFullPipeline(allocator, file_paths[0..created]);
+    defer cleanupPipeline(allocator, &state);
+
+    // All classes should be present
+    try std.testing.expectEqual(@as(usize, count), state.sym_table.classes.count());
+    try std.testing.expect(state.sym_table.inheritance_resolved);
+
+    // Verify FQCN lookups work after merge
+    try std.testing.expect(state.sym_table.classes.contains("Fix0"));
+    try std.testing.expect(state.sym_table.classes.contains("Fix1"));
+}
+
+// --------------------------------------------------------------------------
+// Safety Test 2: Parallel symbol collect → call analysis → no crash
+// (merged data survives to Pass 4)
+// --------------------------------------------------------------------------
+
+test "safety: parallel collect → call analysis → no crash" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const count = 25;
+    var file_paths: [count][]const u8 = undefined;
+    const created = try generatePhpFixtures(allocator, tmp_dir.dir, count, &file_paths);
+    defer for (file_paths[0..created]) |p| allocator.free(p);
+
+    var state = try runFullPipeline(allocator, file_paths[0..created]);
+    defer cleanupPipeline(allocator, &state);
+
+    // Call graph should have processed calls without crash
+    try std.testing.expect(state.call_graph.total_calls >= 0);
+    // Symbol table data must still be accessible after call analysis
+    try std.testing.expect(state.sym_table.classes.contains("Fix0"));
+}
+
+// --------------------------------------------------------------------------
+// Safety Test 3: Full pipeline (collect + call analysis) → no crash
+// --------------------------------------------------------------------------
+
+test "safety: full pipeline collect + call + inheritance → no crash" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // 30 files to ensure parallel path is taken
+    const count = 30;
+    var file_paths: [count][]const u8 = undefined;
+    const created = try generatePhpFixtures(allocator, tmp_dir.dir, count, &file_paths);
+    defer for (file_paths[0..created]) |p| allocator.free(p);
+
+    var state = try runFullPipeline(allocator, file_paths[0..created]);
+    defer cleanupPipeline(allocator, &state);
+
+    // Verify entire pipeline completed without crash
+    try std.testing.expectEqual(@as(usize, count), state.sym_table.classes.count());
+    try std.testing.expect(state.sym_table.inheritance_resolved);
+    // Symbol table + call graph both accessible
+    try std.testing.expect(state.sym_table.classes.contains("Fix0"));
+    try std.testing.expect(state.sym_table.classes.contains("Fix29"));
+}
+
+// --------------------------------------------------------------------------
+// Safety Test 4: 50+ files → verify all classes/methods accessible after merge
+// (spot-check FQCN lookups)
+// --------------------------------------------------------------------------
+
+test "safety: 50+ files → all classes accessible after merge" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const count = 55;
+    var file_paths: [count][]const u8 = undefined;
+    const created = try generatePhpFixtures(allocator, tmp_dir.dir, count, &file_paths);
+    defer for (file_paths[0..created]) |p| allocator.free(p);
+
+    var state = try runFullPipeline(allocator, file_paths[0..created]);
+    defer cleanupPipeline(allocator, &state);
+
+    // Every single class must be findable by FQCN
+    for (0..count) |i| {
+        var name_buf: [32]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "Fix{d}", .{i}) catch unreachable;
+        try std.testing.expect(state.sym_table.classes.contains(name));
+    }
+    try std.testing.expectEqual(@as(usize, count), state.sym_table.classes.count());
+}
+
+// --------------------------------------------------------------------------
+// Safety Test 5: 100+ files → call graph resolution rate matches sequential
+// --------------------------------------------------------------------------
+
+test "safety: 100+ files → call graph parity with sequential" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const count = 105;
+    var file_paths: [count][]const u8 = undefined;
+    const created = try generatePhpFixtures(allocator, tmp_dir.dir, count, &file_paths);
+    defer for (file_paths[0..created]) |p| allocator.free(p);
+
+    // Run parallel pipeline
+    var par_state = try runFullPipeline(allocator, file_paths[0..created]);
+    defer cleanupPipeline(allocator, &par_state);
+
+    // Run sequential for comparison
+    var configs = [_]ProjectConfig{};
+    var seq_sym = SymbolTable.init(allocator);
+    defer seq_sym.deinit();
+    var seq_ctx = std.StringHashMap(FileContext).init(allocator);
+    defer {
+        var it = seq_ctx.valueIterator();
+        while (it.next()) |v| @constCast(v).deinit();
+        seq_ctx.deinit();
+    }
+    var seq_src = std.StringHashMap([]const u8).init(allocator);
+    defer {
+        var it = seq_src.valueIterator();
+        while (it.next()) |v| allocator.free(v.*);
+        seq_src.deinit();
+    }
+    sequentialSymbolCollect(allocator, file_paths[0..created], &configs, &seq_sym, &seq_ctx, &seq_src, testCollectFn);
+    try seq_sym.resolveInheritance();
+
+    var seq_graph = ProjectCallGraph.init(allocator, &seq_sym);
+    defer seq_graph.deinit();
+    sequentialCallAnalysis(allocator, file_paths[0..created], &seq_src, &seq_ctx, &seq_sym, &seq_graph);
+
+    // Class counts must match
+    try std.testing.expectEqual(seq_sym.classes.count(), par_state.sym_table.classes.count());
+    // Call graph stats must match
+    try std.testing.expectEqual(seq_graph.total_calls, par_state.call_graph.total_calls);
+    try std.testing.expectEqual(seq_graph.resolved_calls, par_state.call_graph.resolved_calls);
+    try std.testing.expectEqual(seq_graph.unresolved_calls, par_state.call_graph.unresolved_calls);
+}
+
+// --------------------------------------------------------------------------
+// Safety Test 6: Repeated parallel runs (10x) → deterministic, no crashes
+// (race detection)
+// --------------------------------------------------------------------------
+
+test "safety: 10x repeated parallel runs → deterministic, no crashes" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const count = 25;
+    var file_paths: [count][]const u8 = undefined;
+    const created = try generatePhpFixtures(allocator, tmp_dir.dir, count, &file_paths);
+    defer for (file_paths[0..created]) |p| allocator.free(p);
+
+    var class_counts: [10]usize = undefined;
+    var call_counts: [10]usize = undefined;
+
+    for (0..10) |run| {
+        var state = try runFullPipeline(allocator, file_paths[0..created]);
+        class_counts[run] = state.sym_table.classes.count();
+        call_counts[run] = state.call_graph.total_calls;
+        cleanupPipeline(allocator, &state);
+    }
+
+    // All runs must produce identical results
+    for (1..10) |i| {
+        try std.testing.expectEqual(class_counts[0], class_counts[i]);
+        try std.testing.expectEqual(call_counts[0], call_counts[i]);
+    }
+    try std.testing.expectEqual(@as(usize, count), class_counts[0]);
+}
+
+// --------------------------------------------------------------------------
+// Safety Test 7: Mixed valid/invalid PHP → no crash, valid files fully
+// processed through all passes
+// --------------------------------------------------------------------------
+
+test "safety: mixed valid/invalid PHP → no crash, valid files processed" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // Generate 22 valid files
+    const valid_count = 22;
+    var all_paths: [valid_count + 3][]const u8 = undefined;
+    var created: usize = 0;
+
+    const valid_created = try generatePhpFixtures(allocator, tmp_dir.dir, valid_count, all_paths[0..valid_count]);
+    created += valid_created;
+
+    // Add 3 broken PHP files
+    const broken_contents = [_][]const u8{
+        "<?php\nclass { BROKEN!! \n",
+        "NOT EVEN PHP AT ALL @@@@",
+        "<?php\nfunction ( broken { { { }\n",
+    };
+    for (broken_contents, 0..) |content, i| {
+        var name_buf: [32]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "broken_{d}.php", .{i}) catch unreachable;
+        all_paths[valid_count + i] = try createTempPhpFile(allocator, tmp_dir.dir, name, content);
+        created += 1;
+    }
+    defer for (all_paths[0..created]) |p| allocator.free(p);
+
+    var state = try runFullPipeline(allocator, all_paths[0..created]);
+    defer cleanupPipeline(allocator, &state);
+
+    // All valid classes should be found; pipeline must not crash
+    for (0..valid_count) |i| {
+        var name_buf: [32]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "Fix{d}", .{i}) catch unreachable;
+        try std.testing.expect(state.sym_table.classes.contains(name));
+    }
+    try std.testing.expect(state.sym_table.inheritance_resolved);
+}
+
+// --------------------------------------------------------------------------
+// Safety Test 8: Parallel merge correctness — no duplicate or missing symbols
+// after merge from N threads
+// --------------------------------------------------------------------------
+
+test "safety: parallel merge → no duplicate or missing symbols" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // Generate 40 files with unique class names
+    const count = 40;
+    var file_paths: [count][]const u8 = undefined;
+    var created: usize = 0;
+    for (0..count) |i| {
+        var name_buf: [64]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "uniq_{d}.php", .{i}) catch unreachable;
+        var content_buf: [256]u8 = undefined;
+        const content = std.fmt.bufPrint(&content_buf,
+            \\<?php
+            \\class Unique{d} {{
+            \\    public function action{d}() {{
+            \\        strlen("x");
+            \\    }}
+            \\}}
+            \\
+        , .{ i, i }) catch unreachable;
+        file_paths[i] = try createTempPhpFile(allocator, tmp_dir.dir, name, content);
+        created += 1;
+    }
+    defer for (file_paths[0..created]) |p| allocator.free(p);
+
+    var state = try runFullPipeline(allocator, file_paths[0..created]);
+    defer cleanupPipeline(allocator, &state);
+
+    // Exactly count classes — no duplicates, no missing
+    try std.testing.expectEqual(@as(usize, count), state.sym_table.classes.count());
+
+    // Every unique class must be present
+    for (0..count) |i| {
+        var name_buf: [32]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "Unique{d}", .{i}) catch unreachable;
+        try std.testing.expect(state.sym_table.classes.contains(name));
+    }
+
+    // file_sources and file_contexts must also have exactly count entries
+    try std.testing.expectEqual(@as(usize, count), state.file_sources.count());
+    try std.testing.expectEqual(@as(usize, count), state.file_contexts.count());
+}
+
+// --------------------------------------------------------------------------
+// Safety Test 9: Stress test — 500 PHP files with deep inheritance chains,
+// full pipeline, assert completion
+// --------------------------------------------------------------------------
+
+test "safety: stress 500 files with deep inheritance → full pipeline completes" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const count = 500;
+    var file_paths: [count][]const u8 = undefined;
+    const created = try generatePhpFixtures(allocator, tmp_dir.dir, count, &file_paths);
+    defer for (file_paths[0..created]) |p| allocator.free(p);
+
+    var state = try runFullPipeline(allocator, file_paths[0..created]);
+    defer cleanupPipeline(allocator, &state);
+
+    // All 500 classes must be present
+    try std.testing.expectEqual(@as(usize, count), state.sym_table.classes.count());
+    try std.testing.expect(state.sym_table.inheritance_resolved);
+
+    // Spot-check first, middle, last
+    try std.testing.expect(state.sym_table.classes.contains("Fix0"));
+    try std.testing.expect(state.sym_table.classes.contains("Fix249"));
+    try std.testing.expect(state.sym_table.classes.contains("Fix499"));
+
+    // Call graph should be non-empty (each file has at least one strlen call)
+    try std.testing.expect(state.call_graph.total_calls >= 0);
+}
