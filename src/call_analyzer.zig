@@ -1105,8 +1105,10 @@ pub const CalledBeforeAnalyzer = struct {
     ) !CheckResult {
         var visited = std.StringHashMap(void).init(self.allocator);
         defer visited.deinit();
+        var memo = std.StringHashMap(CheckResult).init(self.allocator);
+        defer memo.deinit();
 
-        return self.checkCallersRecursive(target_fn, before_fn, 0, &visited);
+        return self.checkCallersRecursive(target_fn, before_fn, 0, &visited, &memo);
     }
 
     /// Recursive implementation of caller checking
@@ -1117,6 +1119,7 @@ pub const CalledBeforeAnalyzer = struct {
         before_fn: []const u8,
         depth: u32,
         visited: *std.StringHashMap(void),
+        memo: *std.StringHashMap(CheckResult),
     ) !CheckResult {
         // Prevent infinite recursion
         if (depth >= MAX_RECURSION_DEPTH) {
@@ -1128,6 +1131,12 @@ pub const CalledBeforeAnalyzer = struct {
             // Already visited this function - consider it satisfied to break the cycle
             return CheckResult{ .satisfied = true, .satisfying_caller = null, .missing_paths = &.{} };
         }
+
+        // Return memoized result if available (avoids redundant subtree exploration)
+        if (memo.get(target_fn)) |cached| {
+            return cached;
+        }
+
         try visited.put(target_fn, {});
 
         // Find callers: try exact lookup first (O(1)), fall back to fuzzy scan only if needed
@@ -1171,7 +1180,7 @@ pub const CalledBeforeAnalyzer = struct {
             // Get calls made by this caller
             const caller_calls = self.calls_by_caller.get(caller) orelse {
                 // No calls found for this caller - check its callers recursively
-                const recursive_result = try self.checkCallersRecursive(caller, before_fn, depth + 1, visited);
+                const recursive_result = try self.checkCallersRecursive(caller, before_fn, depth + 1, visited, memo);
                 if (!recursive_result.satisfied) {
                     all_satisfied = false;
                     try missing_paths.append(self.allocator, .{
@@ -1212,7 +1221,7 @@ pub const CalledBeforeAnalyzer = struct {
             } else {
                 // This caller doesn't have before_fn before calling target_fn
                 // Check if this caller's callers have before_fn called
-                const recursive_result = try self.checkCallersRecursive(caller, before_fn, depth + 1, visited);
+                const recursive_result = try self.checkCallersRecursive(caller, before_fn, depth + 1, visited, memo);
                 if (!recursive_result.satisfied) {
                     all_satisfied = false;
                     try missing_paths.append(self.allocator, .{
@@ -1226,11 +1235,13 @@ pub const CalledBeforeAnalyzer = struct {
             }
         }
 
-        return CheckResult{
+        const result = CheckResult{
             .satisfied = all_satisfied,
             .satisfying_caller = any_satisfying_caller,
             .missing_paths = try missing_paths.toOwnedSlice(self.allocator),
         };
+        try memo.put(target_fn, result);
+        return result;
     }
 
     /// Check if a callee matches a target function for interprocedural lookup
