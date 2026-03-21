@@ -981,6 +981,10 @@ fn analyzeProject() !void {
         file_contexts.deinit();
     }
 
+    // Cache file sources from Pass 2 to avoid re-reading in Pass 4
+    var file_sources = std.StringHashMap([]const u8).init(allocator);
+    defer file_sources.deinit();
+
     for (files) |file_path| {
         const file = std.fs.openFileAbsolute(file_path, .{}) catch continue;
         defer file.close();
@@ -996,6 +1000,7 @@ fn analyzeProject() !void {
         collector.collect(tree) catch continue;
 
         try file_contexts.put(file_path, file_ctx);
+        try file_sources.put(file_path, source);
     }
 
     if (project_config.verbose) {
@@ -1010,7 +1015,7 @@ fn analyzeProject() !void {
 
     try sym_table.resolveInheritance();
 
-    // Pass 4: Analyze calls
+    // Pass 4: Analyze calls (reusing cached sources from Pass 2)
     if (project_config.verbose) {
         try stdout.writeAll("Pass 4: Analyzing calls...\n");
     }
@@ -1019,10 +1024,7 @@ fn analyzeProject() !void {
     defer call_graph.deinit();
 
     for (files) |file_path| {
-        const file = std.fs.openFileAbsolute(file_path, .{}) catch continue;
-        defer file.close();
-
-        const source = file.readToEndAlloc(allocator, max_file_size) catch continue;
+        const source = file_sources.get(file_path) orelse continue;
         const tree = parser.parseString(source, null) orelse continue;
         defer tree.destroy();
 
@@ -1209,10 +1211,7 @@ fn analyzeCalledBefore() !void {
     defer call_graph.deinit();
 
     for (files) |file_path| {
-        const file = std.fs.openFileAbsolute(file_path, .{}) catch continue;
-        defer file.close();
-
-        const source = file.readToEndAlloc(allocator, max_file_size) catch continue;
+        const source = file_sources.get(file_path) orelse continue;
         const tree = parser.parseString(source, null) orelse continue;
         defer tree.destroy();
 
