@@ -864,7 +864,7 @@ pub fn main() !void {
 }
 
 fn analyzeFile() !void {
-    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    var arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
     defer _ = arena.deinit();
     const allocator = arena.allocator();
 
@@ -929,7 +929,7 @@ fn analyzeFile() !void {
 }
 
 fn analyzeProject() !void {
-    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    var arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
     defer _ = arena.deinit();
     const allocator = arena.allocator();
 
@@ -1063,7 +1063,7 @@ fn analyzeProject() !void {
 }
 
 fn analyzeCalledBefore() !void {
-    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    var arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
     defer _ = arena.deinit();
     const allocator = arena.allocator();
 
