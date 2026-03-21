@@ -162,6 +162,28 @@ pub fn build(b: *std.Build) void {
     const run_main_tests = b.addRunArtifact(main_tests);
     test_step.dependOn(&run_main_tests.step);
 
+    const report_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/report.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    report_tests.root_module.addImport("tree-sitter", ts_dep.module("tree_sitter"));
+    report_tests.root_module.addImport("cli", cli_dep.module("cli"));
+    report_tests.addIncludePath(php_src_root);
+    report_tests.addCSourceFile(.{
+        .file = php_src_root.path(b, "parser.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    report_tests.addCSourceFile(.{
+        .file = php_src_root.path(b, "scanner.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    report_tests.linkLibC();
+    const run_report_tests = b.addRunArtifact(report_tests);
+    test_step.dependOn(&run_report_tests.step);
+
     const phpdoc_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/phpdoc.zig"),
