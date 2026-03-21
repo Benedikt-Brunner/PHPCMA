@@ -127,4 +127,38 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
+
+    // ----------------------------------------------------------------
+    // Tests
+    // ----------------------------------------------------------------
+    const test_step = b.step("test", "Run unit tests");
+
+    const main_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    // Add tree-sitter module
+    main_tests.root_module.addImport("tree-sitter", ts_dep.module("tree_sitter"));
+
+    // Add CLI module
+    main_tests.root_module.addImport("cli", cli_dep.module("cli"));
+
+    // Add PHP grammar C sources
+    main_tests.addIncludePath(php_src_root);
+    main_tests.addCSourceFile(.{
+        .file = php_src_root.path(b, "parser.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    main_tests.addCSourceFile(.{
+        .file = php_src_root.path(b, "scanner.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    main_tests.linkLibC();
+
+    const run_main_tests = b.addRunArtifact(main_tests);
+    test_step.dependOn(&run_main_tests.step);
 }
