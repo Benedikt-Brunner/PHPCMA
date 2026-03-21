@@ -173,6 +173,28 @@ pub fn build(b: *std.Build) void {
     const run_phpdoc_tests = b.addRunArtifact(phpdoc_tests);
     test_step.dependOn(&run_phpdoc_tests.step);
 
+    const cfg_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cfg.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    cfg_tests.root_module.addImport("tree-sitter", ts_dep.module("tree_sitter"));
+    cfg_tests.addIncludePath(php_src_root);
+    cfg_tests.addCSourceFile(.{
+        .file = php_src_root.path(b, "parser.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    cfg_tests.addCSourceFile(.{
+        .file = php_src_root.path(b, "scanner.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    cfg_tests.linkLibC();
+
+    const run_cfg_tests = b.addRunArtifact(cfg_tests);
+    test_step.dependOn(&run_cfg_tests.step);
+
     // ----------------------------------------------------------------
     // Benchmarks (ReleaseFast)
     // ----------------------------------------------------------------
