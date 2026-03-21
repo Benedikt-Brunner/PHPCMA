@@ -124,7 +124,7 @@ pub const CallAnalyzer = struct {
         // Get class name
         if (node.childByFieldName("name")) |name_node| {
             const class_name = getNodeText(source, name_node);
-            const fqcn = self.type_resolver.file_context.resolveFQCN(class_name);
+            const fqcn = try self.type_resolver.file_context.resolveFQCN(class_name);
             self.current_class = fqcn;
 
             // Set in type resolver
@@ -284,7 +284,7 @@ pub const CallAnalyzer = struct {
                 return;
             }
         } else {
-            fqcn = self.type_resolver.file_context.resolveFQCN(class_name);
+            fqcn = try self.type_resolver.file_context.resolveFQCN(class_name);
         }
 
         var call = EnhancedFunctionCall{

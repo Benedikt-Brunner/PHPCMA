@@ -444,7 +444,7 @@ pub const FileContext = struct {
     }
 
     /// Resolve a type name to FQCN using this file's namespace and use statements
-    pub fn resolveFQCN(self: *const FileContext, type_name: []const u8) []const u8 {
+    pub fn resolveFQCN(self: *const FileContext, type_name: []const u8) error{OutOfMemory}![]const u8 {
         // Already fully qualified
         if (type_name.len > 0 and type_name[0] == '\\') {
             return type_name[1..]; // Remove leading backslash
@@ -465,17 +465,14 @@ pub const FileContext = struct {
         if (std.mem.indexOf(u8, type_name, "\\")) |sep| {
             const first_part = type_name[0..sep];
             if (self.use_statements.get(first_part)) |use_stmt| {
-                // Combine imported namespace with rest of path
-                // TODO: allocate and combine
-                _ = use_stmt;
+                const rest = type_name[sep..];
+                return try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ use_stmt.fqcn, rest });
             }
         }
 
         // Default: prepend current namespace
         if (self.namespace) |ns| {
-            // Would need allocation to combine
-            // For now, just return as-is (caller should handle)
-            _ = ns;
+            return try std.fmt.allocPrint(self.allocator, "{s}\\{s}", .{ ns, type_name });
         }
 
         return type_name;

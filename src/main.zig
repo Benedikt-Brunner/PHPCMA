@@ -230,7 +230,7 @@ const SymbolCollector = struct {
                 const child_kind = child.kind();
                 if (std.mem.eql(u8, child_kind, "name") or std.mem.eql(u8, child_kind, "qualified_name")) {
                     const parent_name = getNodeText(self.source, child);
-                    class.extends = try self.allocator.dupe(u8, self.file_context.resolveFQCN(parent_name));
+                    class.extends = try self.allocator.dupe(u8, try self.file_context.resolveFQCN(parent_name));
                     break;
                 }
             }
@@ -245,7 +245,7 @@ const SymbolCollector = struct {
                 const child_kind = child.kind();
                 if (std.mem.eql(u8, child_kind, "name") or std.mem.eql(u8, child_kind, "qualified_name")) {
                     const iface_name = getNodeText(self.source, child);
-                    const fqcn = self.file_context.resolveFQCN(iface_name);
+                    const fqcn = try self.file_context.resolveFQCN(iface_name);
                     try implements_list.append(self.allocator, try self.allocator.dupe(u8, fqcn));
                 }
             }
@@ -473,7 +473,7 @@ const SymbolCollector = struct {
                 const child_kind = child.kind();
                 if (std.mem.eql(u8, child_kind, "name") or std.mem.eql(u8, child_kind, "qualified_name")) {
                     const trait_name = getNodeText(self.source, child);
-                    const fqcn = self.file_context.resolveFQCN(trait_name);
+                    const fqcn = try self.file_context.resolveFQCN(trait_name);
                     try traits.append(self.allocator, try self.allocator.dupe(u8, fqcn));
                 }
             }
