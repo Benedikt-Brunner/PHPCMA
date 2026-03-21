@@ -199,17 +199,46 @@ pub fn discoverFiles(allocator: std.mem.Allocator, config: *const ProjectConfig)
         }
     }
 
-    // Discover from vendor folder
-    const vendor_path = try std.fs.path.join(allocator, &.{ config.root_path, "vendor" });
-    defer allocator.free(vendor_path);
-    try walkDirectory(allocator, vendor_path, &files);
+    // NOTE: Vendor directory is no longer indexed.
+    // Use .phpcma.json with scan_paths to explicitly include monorepo projects.
 
     return files.toOwnedSlice(allocator);
 }
 
 /// Recursively walk a directory and collect all .php files
 /// Skips test files ending in .unit.php or .integration.php
+/// Follows symlinks to directories (with cycle detection)
 fn walkDirectory(allocator: std.mem.Allocator, dir_path: []const u8, files: *std.ArrayListUnmanaged([]const u8)) !void {
+    var visited = std.StringHashMap(void).init(allocator);
+    defer {
+        // Free visited keys
+        var it = visited.keyIterator();
+        while (it.next()) |key| {
+            allocator.free(key.*);
+        }
+        visited.deinit();
+    }
+    try walkDirectoryInternal(allocator, dir_path, files, &visited, 0);
+}
+
+fn walkDirectoryInternal(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    files: *std.ArrayListUnmanaged([]const u8),
+    visited: *std.StringHashMap(void),
+    depth: u32,
+) !void {
+    // Limit recursion depth to prevent runaway traversal
+    if (depth > 50) return;
+
+    // Get real path to handle symlinks properly and detect cycles
+    var real_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_path = std.fs.cwd().realpath(dir_path, &real_path_buf) catch dir_path;
+
+    // Check if we've already visited this directory (cycle detection)
+    if (visited.contains(real_path)) return;
+    try visited.put(try allocator.dupe(u8, real_path), {});
+
     var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| {
         // Directory might not exist, skip it
         if (err == error.FileNotFound) return;
@@ -217,19 +246,42 @@ fn walkDirectory(allocator: std.mem.Allocator, dir_path: []const u8, files: *std
     };
     defer dir.close();
 
-    var walker = try dir.walk(allocator);
-    defer walker.deinit();
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        const full_path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+        defer allocator.free(full_path);
 
-    while (try walker.next()) |entry| {
-        if (entry.kind == .file and std.mem.endsWith(u8, entry.basename, ".php")) {
-            // Skip test files
-            if (std.mem.endsWith(u8, entry.basename, ".unit.php") or
-                std.mem.endsWith(u8, entry.basename, ".integration.php"))
-            {
-                continue;
-            }
-            const full_path = try std.fs.path.join(allocator, &.{ dir_path, entry.path });
-            try files.append(allocator, full_path);
+        switch (entry.kind) {
+            .file => {
+                if (std.mem.endsWith(u8, entry.name, ".php")) {
+                    // Skip test files
+                    if (std.mem.endsWith(u8, entry.name, ".unit.php") or
+                        std.mem.endsWith(u8, entry.name, ".integration.php"))
+                    {
+                        continue;
+                    }
+                    try files.append(allocator, try allocator.dupe(u8, full_path));
+                }
+            },
+            .directory => {
+                try walkDirectoryInternal(allocator, full_path, files, visited, depth + 1);
+            },
+            .sym_link => {
+                // Follow symlink and check if it's a directory
+                const stat = std.fs.cwd().statFile(full_path) catch continue;
+                if (stat.kind == .directory) {
+                    try walkDirectoryInternal(allocator, full_path, files, visited, depth + 1);
+                } else if (stat.kind == .file and std.mem.endsWith(u8, entry.name, ".php")) {
+                    // Skip test files
+                    if (std.mem.endsWith(u8, entry.name, ".unit.php") or
+                        std.mem.endsWith(u8, entry.name, ".integration.php"))
+                    {
+                        continue;
+                    }
+                    try files.append(allocator, try allocator.dupe(u8, full_path));
+                }
+            },
+            else => {},
         }
     }
 }
