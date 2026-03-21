@@ -195,6 +195,17 @@ pub fn build(b: *std.Build) void {
     const run_cfg_tests = b.addRunArtifact(cfg_tests);
     test_step.dependOn(&run_cfg_tests.step);
 
+    const generics_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/generics.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const run_generics_tests = b.addRunArtifact(generics_tests);
+    test_step.dependOn(&run_generics_tests.step);
+
     // ----------------------------------------------------------------
     // Benchmarks (ReleaseFast)
     // ----------------------------------------------------------------

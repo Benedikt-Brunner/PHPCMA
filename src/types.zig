@@ -9,6 +9,7 @@ pub const TypeInfo = struct {
     kind: Kind,
     base_type: []const u8, // For simple/nullable: the type name (FQCN or builtin)
     type_parts: []const []const u8, // For union/intersection types
+    type_params: []const TypeInfo = &.{}, // For generic types: Collection<User> -> [User]
     is_builtin: bool,
 
     pub const Kind = enum {
@@ -17,6 +18,7 @@ pub const TypeInfo = struct {
         union_type, // Foo|Bar
         intersection, // Foo&Bar
         array_type, // array, int[], Foo[]
+        generic, // Collection<User>, Repository<Product>
         mixed,
         void_type,
         never,
@@ -73,6 +75,18 @@ pub const TypeInfo = struct {
                     if (i > 0) try result.appendSlice("&");
                     try result.appendSlice(part);
                 }
+                break :blk try result.toOwnedSlice();
+            },
+            .generic => blk: {
+                var result = std.ArrayList(u8).init(allocator);
+                try result.appendSlice(self.base_type);
+                try result.append('<');
+                for (self.type_params, 0..) |param, i| {
+                    if (i > 0) try result.appendSlice(", ");
+                    const param_str = try param.format(allocator);
+                    try result.appendSlice(param_str);
+                }
+                try result.append('>');
                 break :blk try result.toOwnedSlice();
             },
             .array_type => std.fmt.allocPrint(allocator, "{s}[]", .{self.base_type}),
@@ -147,6 +161,9 @@ pub const MethodSymbol = struct {
     return_type: ?TypeInfo, // Native PHP return type
     phpdoc_return: ?TypeInfo, // From @return annotation
 
+    // Generic type parameters (@template T, @template V of SomeClass)
+    template_params: []const TemplateParam = &.{},
+
     // Location
     start_line: u32,
     end_line: u32,
@@ -182,6 +199,12 @@ pub const MethodSymbol = struct {
 // Class Symbol
 // ============================================================================
 
+/// Represents a @template parameter declaration
+pub const TemplateParam = struct {
+    name: []const u8, // e.g., "T", "V"
+    bound: ?[]const u8, // e.g., "SomeClass" for @template T of SomeClass
+};
+
 pub const ClassSymbol = struct {
     fqcn: []const u8, // Fully qualified class name
     name: []const u8, // Short name
@@ -199,6 +222,13 @@ pub const ClassSymbol = struct {
     extends: ?[]const u8, // Parent class FQCN
     implements: []const []const u8, // Interface FQCNs
     uses: []const []const u8, // Trait FQCNs
+
+    // Generic type parameters (@template T, @template V of SomeClass)
+    template_params: []const TemplateParam = &.{},
+    // Generic extends: @extends Collection<User>
+    generic_extends: ?TypeInfo = null,
+    // Generic implements: @implements Repository<User>
+    generic_implements: []const TypeInfo = &.{},
 
     // Members (directly declared)
     methods: std.StringHashMap(MethodSymbol),

@@ -9,6 +9,7 @@ const composer = @import("composer.zig");
 const config_parser = @import("config.zig");
 const phpdoc = @import("phpdoc.zig");
 const type_resolver = @import("type_resolver.zig");
+const generics = @import("generics.zig");
 const call_analyzer = @import("call_analyzer.zig");
 const boundary_analyzer = @import("boundary_analyzer.zig");
 const NodeKindIds = @import("node_kind_ids.zig").NodeKindIds;
