@@ -351,6 +351,71 @@ pub const UnifiedReport = struct {
         try writer.writeAll("}\n");
         try writer.flush();
     }
+
+    // ========================================================================
+    // Checkstyle XML Output
+    // ========================================================================
+
+    pub fn toCheckstyle(self: *const UnifiedReport, file: std.fs.File) !void {
+        var buf: [4096]u8 = undefined;
+        var w = file.writer(&buf);
+        const writer = &w.interface;
+
+        try writer.writeAll("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        try writer.writeAll("<checkstyle version=\"4.3\">\n");
+
+        if (self.violations.items.len == 0) {
+            try writer.writeAll("</checkstyle>\n");
+            try writer.flush();
+            return;
+        }
+
+        // Group violations by file — emit each unique file once
+        // Track which files have been emitted
+        var emitted: usize = 0;
+        while (emitted < self.violations.items.len) {
+            const current_file = self.violations.items[emitted].file_path;
+
+            // Check if we already emitted this file (scan earlier items)
+            var already_done = false;
+            for (self.violations.items[0..emitted]) |prev| {
+                if (std.mem.eql(u8, prev.file_path, current_file)) {
+                    already_done = true;
+                    break;
+                }
+            }
+            if (already_done) {
+                emitted += 1;
+                continue;
+            }
+
+            try writer.print("  <file name=\"{s}\">\n", .{current_file});
+
+            // Output all violations for this file
+            for (self.violations.items) |v| {
+                if (!std.mem.eql(u8, v.file_path, current_file)) continue;
+
+                const severity = switch (v.severity) {
+                    .err => "error",
+                    .warning => "warning",
+                    .note => "info",
+                };
+
+                try writer.print("    <error line=\"{d}\" column=\"1\" severity=\"{s}\" message=\"{s}\" source=\"phpcma.{s}\"/>\n", .{
+                    v.line,
+                    severity,
+                    v.message,
+                    v.category,
+                });
+            }
+
+            try writer.writeAll("  </file>\n");
+            emitted += 1;
+        }
+
+        try writer.writeAll("</checkstyle>\n");
+        try writer.flush();
+    }
 };
 
 // ============================================================================
@@ -676,4 +741,228 @@ test "UnifiedReport: report with no violations" {
     try report.toText(dev_null);
     try report.toJson(dev_null);
     try report.toSarif(dev_null);
+    try report.toCheckstyle(dev_null);
+}
+
+// ============================================================================
+// Checkstyle Output Tests
+// ============================================================================
+
+test "UnifiedReport: Checkstyle valid XML structure" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Svc {
+        \\    public function run(): void {}
+        \\}
+    ;
+
+    const result = try buildTestGraph(alloc, source);
+
+    var unified_report = UnifiedReport.init(alloc);
+    defer unified_report.deinit();
+    unified_report.populate(result[0], result[1]);
+
+    try unified_report.addViolation(.{
+        .severity = .err,
+        .category = "type-check.argument",
+        .file_path = "src/Service/Foo.php",
+        .line = 42,
+        .message = "Argument 1 expects string, int given",
+    });
+
+    // Write to a pipe to capture output
+    const pipe = try std.posix.pipe();
+    const write_file = std.fs.File{ .handle = pipe[1] };
+    const read_file = std.fs.File{ .handle = pipe[0] };
+    defer read_file.close();
+
+    try unified_report.toCheckstyle(write_file);
+    write_file.close();
+
+    // Read the output
+    var output_buf: [4096]u8 = undefined;
+    const n = try read_file.readAll(&output_buf);
+    const output = output_buf[0..n];
+
+    // Verify XML structure
+    try std.testing.expect(std.mem.startsWith(u8, output, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"));
+    try std.testing.expect(std.mem.indexOf(u8, output, "<checkstyle version=\"4.3\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "</checkstyle>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "<file name=\"src/Service/Foo.php\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "severity=\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "source=\"phpcma.type-check.argument\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "line=\"42\"") != null);
+}
+
+test "UnifiedReport: Checkstyle severity mapping" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Svc {
+        \\    public function run(): void {}
+        \\}
+    ;
+
+    const result = try buildTestGraph(alloc, source);
+
+    var unified_report = UnifiedReport.init(alloc);
+    defer unified_report.deinit();
+    unified_report.populate(result[0], result[1]);
+
+    try unified_report.addViolation(.{
+        .severity = .err,
+        .category = "type-check.argument",
+        .file_path = "src/A.php",
+        .line = 10,
+        .message = "error message",
+    });
+    try unified_report.addViolation(.{
+        .severity = .warning,
+        .category = "called-before.wrong-order",
+        .file_path = "src/A.php",
+        .line = 20,
+        .message = "warning message",
+    });
+    try unified_report.addViolation(.{
+        .severity = .note,
+        .category = "interface.missing-method",
+        .file_path = "src/A.php",
+        .line = 30,
+        .message = "note message",
+    });
+
+    const pipe = try std.posix.pipe();
+    const write_file = std.fs.File{ .handle = pipe[1] };
+    const read_file = std.fs.File{ .handle = pipe[0] };
+    defer read_file.close();
+
+    try unified_report.toCheckstyle(write_file);
+    write_file.close();
+
+    var output_buf: [4096]u8 = undefined;
+    const n = try read_file.readAll(&output_buf);
+    const output = output_buf[0..n];
+
+    // Verify severity mapping: err->error, warning->warning, note->info
+    try std.testing.expect(std.mem.indexOf(u8, output, "severity=\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "severity=\"warning\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "severity=\"info\"") != null);
+}
+
+test "UnifiedReport: Checkstyle file grouping" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Svc {
+        \\    public function run(): void {}
+        \\}
+    ;
+
+    const result = try buildTestGraph(alloc, source);
+
+    var unified_report = UnifiedReport.init(alloc);
+    defer unified_report.deinit();
+    unified_report.populate(result[0], result[1]);
+
+    // Add violations across two files
+    try unified_report.addViolation(.{
+        .severity = .err,
+        .category = "type-check.argument",
+        .file_path = "src/Service/Foo.php",
+        .line = 10,
+        .message = "error in Foo",
+    });
+    try unified_report.addViolation(.{
+        .severity = .warning,
+        .category = "called-before.missing",
+        .file_path = "src/Service/Bar.php",
+        .line = 20,
+        .message = "warning in Bar",
+    });
+    try unified_report.addViolation(.{
+        .severity = .err,
+        .category = "type-check.return",
+        .file_path = "src/Service/Foo.php",
+        .line = 15,
+        .message = "another error in Foo",
+    });
+
+    const pipe = try std.posix.pipe();
+    const write_file = std.fs.File{ .handle = pipe[1] };
+    const read_file = std.fs.File{ .handle = pipe[0] };
+    defer read_file.close();
+
+    try unified_report.toCheckstyle(write_file);
+    write_file.close();
+
+    var output_buf: [8192]u8 = undefined;
+    const n = try read_file.readAll(&output_buf);
+    const output = output_buf[0..n];
+
+    // Count <file> elements — should be exactly 2
+    var file_count: usize = 0;
+    var search_pos: usize = 0;
+    while (std.mem.indexOfPos(u8, output, search_pos, "<file name=")) |pos| {
+        file_count += 1;
+        search_pos = pos + 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), file_count);
+
+    // Verify both files are present
+    try std.testing.expect(std.mem.indexOf(u8, output, "<file name=\"src/Service/Foo.php\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "<file name=\"src/Service/Bar.php\">") != null);
+}
+
+test "UnifiedReport: Checkstyle empty results" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Clean {
+        \\    public function doWork(): void {}
+        \\}
+    ;
+
+    const result = try buildTestGraph(alloc, source);
+
+    var unified_report = UnifiedReport.init(alloc);
+    defer unified_report.deinit();
+    unified_report.populate(result[0], result[1]);
+
+    // No violations added
+
+    const pipe = try std.posix.pipe();
+    const write_file = std.fs.File{ .handle = pipe[1] };
+    const read_file = std.fs.File{ .handle = pipe[0] };
+    defer read_file.close();
+
+    try unified_report.toCheckstyle(write_file);
+    write_file.close();
+
+    var output_buf: [4096]u8 = undefined;
+    const n = try read_file.readAll(&output_buf);
+    const output = output_buf[0..n];
+
+    // Should have valid XML with no file elements
+    try std.testing.expect(std.mem.startsWith(u8, output, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"));
+    try std.testing.expect(std.mem.indexOf(u8, output, "<checkstyle version=\"4.3\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "</checkstyle>") != null);
+    // No <file> elements
+    try std.testing.expect(std.mem.indexOf(u8, output, "<file") == null);
 }
