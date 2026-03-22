@@ -991,7 +991,7 @@ pub fn main() !void {
                     },
                     .{
                         .name = "report",
-                        .description = .{ .one_line = "Generate a unified analysis report (text, JSON, or SARIF)" },
+                        .description = .{ .one_line = "Generate a unified analysis report (text, JSON, SARIF, or Checkstyle)" },
                         .options = try r.allocOptions(&.{
                             .{
                                 .long_name = "composer",
@@ -1014,7 +1014,7 @@ pub fn main() !void {
                             .{
                                 .long_name = "format",
                                 .short_alias = 'f',
-                                .help = "Output format: text, json, or sarif (default: text)",
+                                .help = "Output format: text, json, sarif, or checkstyle (default: text)",
                                 .value_ref = r.mkRef(&report_config.format),
                             },
                             .{
@@ -1895,6 +1895,8 @@ fn analyzeReport() !void {
         try unified_report.toJson(out_file);
     } else if (std.mem.eql(u8, report_config.format, "sarif")) {
         try unified_report.toSarif(out_file);
+    } else if (std.mem.eql(u8, report_config.format, "checkstyle")) {
+        try unified_report.toCheckstyle(out_file);
     } else {
         try unified_report.toText(out_file);
     }
