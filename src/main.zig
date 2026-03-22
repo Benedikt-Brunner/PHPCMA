@@ -782,6 +782,8 @@ var check_types_config = struct {
     output: []const u8 = "",
     format: []const u8 = "text",
     verbose: bool = false,
+    strict: bool = false,
+    min_confidence: f64 = 0.0,
 }{};
 
 pub fn main() !void {
@@ -971,6 +973,16 @@ pub fn main() !void {
                                 .short_alias = 'v',
                                 .help = "Verbose output",
                                 .value_ref = r.mkRef(&check_types_config.verbose),
+                            },
+                            .{
+                                .long_name = "strict",
+                                .help = "Strict mode: treat warnings as errors",
+                                .value_ref = r.mkRef(&check_types_config.strict),
+                            },
+                            .{
+                                .long_name = "min-confidence",
+                                .help = "Minimum resolution confidence to report (0.0-1.0)",
+                                .value_ref = r.mkRef(&check_types_config.min_confidence),
                             },
                         }),
                         .target = cli.CommandTarget{
@@ -1693,6 +1705,8 @@ fn analyzeCheckTypes() !void {
     }
 
     var tva = type_violation_analyzer.TypeViolationAnalyzer.init(allocator, &call_graph, project_configs, &sym_table);
+    tva.min_confidence = @floatCast(check_types_config.min_confidence);
+    tva.strict = check_types_config.strict;
     const result = try tva.analyze();
 
     // Output results
@@ -1715,8 +1729,11 @@ fn analyzeCheckTypes() !void {
         }
     }
 
-    // Exit with error code if there are errors
+    // Exit with error code if there are errors (or warnings in strict mode)
     if (result.error_count > 0) {
+        std.process.exit(1);
+    }
+    if (check_types_config.strict and result.warning_count > 0) {
         std.process.exit(1);
     }
 }
