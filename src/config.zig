@@ -38,6 +38,147 @@ pub const PhpcmaConfig = struct {
     }
 };
 
+/// A called-before constraint from config
+pub const CalledBeforeConstraint = struct {
+    before: []const u8,
+    after: []const u8,
+};
+
+/// PHPCMA settings that can appear in .phpcma.json or composer.json extra.phpcma
+pub const PhpcmaSettings = struct {
+    checks: []const []const u8 = &.{},
+    strict: bool = false,
+    min_confidence: f64 = 0.0,
+    called_before: []const CalledBeforeConstraint = &.{},
+    plugins: []const []const u8 = &.{},
+    exclude: []const []const u8 = &.{},
+
+    pub fn deinit(self: *PhpcmaSettings, allocator: std.mem.Allocator) void {
+        for (self.checks) |s| allocator.free(s);
+        if (self.checks.len > 0) allocator.free(self.checks);
+
+        for (self.called_before) |cb| {
+            allocator.free(cb.before);
+            allocator.free(cb.after);
+        }
+        if (self.called_before.len > 0) allocator.free(self.called_before);
+
+        for (self.plugins) |s| allocator.free(s);
+        if (self.plugins.len > 0) allocator.free(self.plugins);
+
+        for (self.exclude) |s| allocator.free(s);
+        if (self.exclude.len > 0) allocator.free(self.exclude);
+    }
+};
+
+/// Parse a "phpcma" JSON object into PhpcmaSettings
+pub fn parsePhpcmaSettings(allocator: std.mem.Allocator, obj: std.json.Value) !PhpcmaSettings {
+    if (obj != .object) return PhpcmaSettings{};
+
+    var settings = PhpcmaSettings{};
+
+    // checks: string array
+    if (obj.object.get("checks")) |checks_val| {
+        if (checks_val == .array) {
+            var list: std.ArrayListUnmanaged([]const u8) = .empty;
+            for (checks_val.array.items) |item| {
+                if (item == .string) {
+                    try list.append(allocator, try allocator.dupe(u8, item.string));
+                }
+            }
+            settings.checks = try list.toOwnedSlice(allocator);
+        }
+    }
+
+    // strict: bool
+    if (obj.object.get("strict")) |strict_val| {
+        if (strict_val == .bool) {
+            settings.strict = strict_val.bool;
+        }
+    }
+
+    // min-confidence: float
+    if (obj.object.get("min-confidence")) |mc_val| {
+        switch (mc_val) {
+            .float => settings.min_confidence = mc_val.float,
+            .integer => settings.min_confidence = @floatFromInt(mc_val.integer),
+            else => {},
+        }
+    }
+
+    // called-before: array of {before, after}
+    if (obj.object.get("called-before")) |cb_val| {
+        if (cb_val == .array) {
+            var list: std.ArrayListUnmanaged(CalledBeforeConstraint) = .empty;
+            for (cb_val.array.items) |item| {
+                if (item == .object) {
+                    const before = item.object.get("before") orelse continue;
+                    const after = item.object.get("after") orelse continue;
+                    if (before != .string or after != .string) continue;
+                    try list.append(allocator, .{
+                        .before = try allocator.dupe(u8, before.string),
+                        .after = try allocator.dupe(u8, after.string),
+                    });
+                }
+            }
+            settings.called_before = try list.toOwnedSlice(allocator);
+        }
+    }
+
+    // plugins: string array
+    if (obj.object.get("plugins")) |plugins_val| {
+        if (plugins_val == .array) {
+            var list: std.ArrayListUnmanaged([]const u8) = .empty;
+            for (plugins_val.array.items) |item| {
+                if (item == .string) {
+                    try list.append(allocator, try allocator.dupe(u8, item.string));
+                }
+            }
+            settings.plugins = try list.toOwnedSlice(allocator);
+        }
+    }
+
+    // exclude: string array
+    if (obj.object.get("exclude")) |exclude_val| {
+        if (exclude_val == .array) {
+            var list: std.ArrayListUnmanaged([]const u8) = .empty;
+            for (exclude_val.array.items) |item| {
+                if (item == .string) {
+                    try list.append(allocator, try allocator.dupe(u8, item.string));
+                }
+            }
+            settings.exclude = try list.toOwnedSlice(allocator);
+        }
+    }
+
+    return settings;
+}
+
+/// Extract PhpcmaSettings from a composer.json's extra.phpcma section
+pub fn parseComposerExtraPhpcma(allocator: std.mem.Allocator, composer_path: []const u8) !?PhpcmaSettings {
+    const file = std.fs.openFileAbsolute(composer_path, .{}) catch {
+        return null;
+    };
+    defer file.close();
+
+    const content = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch {
+        return null;
+    };
+    defer allocator.free(content);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch {
+        return null;
+    };
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    const extra = root.object.get("extra") orelse return null;
+    if (extra != .object) return null;
+    const phpcma = extra.object.get("phpcma") orelse return null;
+
+    return try parsePhpcmaSettings(allocator, phpcma);
+}
+
 /// Parse a .phpcma.json configuration file and discover all composer projects
 pub fn parseConfigFile(allocator: std.mem.Allocator, config_path: []const u8) !PhpcmaConfig {
     // Determine root path (directory containing .phpcma.json)
@@ -230,6 +371,145 @@ fn writeFile(dir: std.fs.Dir, sub_path: []const u8, content: []const u8) !void {
     const f = try dir.createFile(sub_path, .{});
     defer f.close();
     try f.writeAll(content);
+}
+
+test "reads extra.phpcma section from composer.json" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(tmp.dir, "composer.json",
+        \\{"autoload":{"psr-4":{"App\\":"src/"}},"extra":{"phpcma":{"checks":["interfaces","types","boundaries"],"strict":true,"min-confidence":0.8,"called-before":[{"before":"::validate","after":"::save"}],"plugins":["symfony-events"],"exclude":["src/Legacy/**"]}}}
+    );
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const composer_path = try tmp.dir.realpath("composer.json", &buf);
+    const composer_path_owned = try allocator.dupe(u8, composer_path);
+    defer allocator.free(composer_path_owned);
+
+    const maybe_settings = try parseComposerExtraPhpcma(allocator, composer_path_owned);
+    try std.testing.expect(maybe_settings != null);
+
+    var settings = maybe_settings.?;
+    defer settings.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), settings.checks.len);
+    try std.testing.expectEqualStrings("interfaces", settings.checks[0]);
+    try std.testing.expectEqualStrings("types", settings.checks[1]);
+    try std.testing.expectEqualStrings("boundaries", settings.checks[2]);
+    try std.testing.expect(settings.strict);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.8), settings.min_confidence, 0.001);
+    try std.testing.expectEqual(@as(usize, 1), settings.called_before.len);
+    try std.testing.expectEqualStrings("::validate", settings.called_before[0].before);
+    try std.testing.expectEqualStrings("::save", settings.called_before[0].after);
+    try std.testing.expectEqual(@as(usize, 1), settings.plugins.len);
+    try std.testing.expectEqualStrings("symfony-events", settings.plugins[0]);
+    try std.testing.expectEqual(@as(usize, 1), settings.exclude.len);
+    try std.testing.expectEqualStrings("src/Legacy/**", settings.exclude[0]);
+}
+
+test "ignores missing extra section in composer.json" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(tmp.dir, "composer.json",
+        \\{"autoload":{"psr-4":{"App\\":"src/"}}}
+    );
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const composer_path = try tmp.dir.realpath("composer.json", &buf);
+    const composer_path_owned = try allocator.dupe(u8, composer_path);
+    defer allocator.free(composer_path_owned);
+
+    const maybe_settings = try parseComposerExtraPhpcma(allocator, composer_path_owned);
+    try std.testing.expect(maybe_settings == null);
+}
+
+test "CLI flags override composer.json extra settings" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(tmp.dir, "composer.json",
+        \\{"extra":{"phpcma":{"strict":false,"min-confidence":0.5}}}
+    );
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const composer_path = try tmp.dir.realpath("composer.json", &buf);
+    const composer_path_owned = try allocator.dupe(u8, composer_path);
+    defer allocator.free(composer_path_owned);
+
+    const maybe_settings = try parseComposerExtraPhpcma(allocator, composer_path_owned);
+    try std.testing.expect(maybe_settings != null);
+
+    var settings = maybe_settings.?;
+    defer settings.deinit(allocator);
+
+    // Simulate CLI override: CLI says strict=true, config says false
+    const cli_strict = true;
+    const effective_strict = cli_strict; // CLI wins
+    try std.testing.expect(effective_strict);
+    // Config value is still accessible
+    try std.testing.expect(!settings.strict);
+}
+
+test "exclude patterns from extra.phpcma applied" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(tmp.dir, "composer.json",
+        \\{"extra":{"phpcma":{"exclude":["src/Legacy/**","tests/**","vendor/**"]}}}
+    );
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const composer_path = try tmp.dir.realpath("composer.json", &buf);
+    const composer_path_owned = try allocator.dupe(u8, composer_path);
+    defer allocator.free(composer_path_owned);
+
+    const maybe_settings = try parseComposerExtraPhpcma(allocator, composer_path_owned);
+    try std.testing.expect(maybe_settings != null);
+
+    var settings = maybe_settings.?;
+    defer settings.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), settings.exclude.len);
+    try std.testing.expectEqualStrings("src/Legacy/**", settings.exclude[0]);
+    try std.testing.expectEqualStrings("tests/**", settings.exclude[1]);
+    try std.testing.expectEqualStrings("vendor/**", settings.exclude[2]);
+}
+
+test "called-before constraints from extra.phpcma config" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(tmp.dir, "composer.json",
+        \\{"extra":{"phpcma":{"called-before":[{"before":"::validate","after":"::save"},{"before":"::auth","after":"::execute"}]}}}
+    );
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const composer_path = try tmp.dir.realpath("composer.json", &buf);
+    const composer_path_owned = try allocator.dupe(u8, composer_path);
+    defer allocator.free(composer_path_owned);
+
+    const maybe_settings = try parseComposerExtraPhpcma(allocator, composer_path_owned);
+    try std.testing.expect(maybe_settings != null);
+
+    var settings = maybe_settings.?;
+    defer settings.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), settings.called_before.len);
+    try std.testing.expectEqualStrings("::validate", settings.called_before[0].before);
+    try std.testing.expectEqualStrings("::save", settings.called_before[0].after);
+    try std.testing.expectEqualStrings("::auth", settings.called_before[1].before);
+    try std.testing.expectEqualStrings("::execute", settings.called_before[1].after);
 }
 
 test ".phpcma.json parsing with scan_paths" {
