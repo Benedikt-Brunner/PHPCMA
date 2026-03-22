@@ -310,7 +310,39 @@ pub const UnifiedReport = struct {
         try writer.writeAll("      \"driver\": {\n");
         try writer.writeAll("        \"name\": \"phpcma\",\n");
         try writer.writeAll("        \"version\": \"0.4.0\",\n");
-        try writer.writeAll("        \"informationUri\": \"https://github.com/benedikt-brunner/phpcma\"\n");
+        try writer.writeAll("        \"informationUri\": \"https://github.com/benedikt-brunner/phpcma\",\n");
+
+        // Collect unique rule IDs from violations
+        try writer.writeAll("        \"rules\": [");
+        var rule_count: usize = 0;
+        for (self.violations.items, 0..) |v, vi| {
+            // Check if this category was already emitted
+            var duplicate = false;
+            for (self.violations.items[0..vi]) |prev| {
+                if (std.mem.eql(u8, prev.category, v.category)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+
+            if (rule_count > 0) try writer.writeAll(",");
+            try writer.writeAll("\n          {\n");
+            try writer.print("            \"id\": \"phpcma/{s}\",\n", .{v.category});
+            try writer.writeAll("            \"shortDescription\": {\n");
+            try writer.print("              \"text\": \"{s}\"\n", .{v.category});
+            try writer.writeAll("            },\n");
+            try writer.writeAll("            \"defaultConfiguration\": {\n");
+            try writer.print("              \"level\": \"{s}\"\n", .{sarifLevel(v.severity)});
+            try writer.writeAll("            }\n");
+            try writer.writeAll("          }");
+            rule_count += 1;
+        }
+        if (rule_count > 0) {
+            try writer.writeAll("\n        ");
+        }
+        try writer.writeAll("]\n");
+
         try writer.writeAll("      }\n");
         try writer.writeAll("    },\n");
 
@@ -320,13 +352,7 @@ pub const UnifiedReport = struct {
             if (i > 0) try writer.writeAll(",");
             try writer.writeAll("\n      {\n");
             try writer.print("        \"ruleId\": \"phpcma/{s}\",\n", .{v.category});
-            try writer.writeAll("        \"level\": ");
-            switch (v.severity) {
-                .err => try writer.writeAll("\"error\""),
-                .warning => try writer.writeAll("\"warning\""),
-                .note => try writer.writeAll("\"note\""),
-            }
-            try writer.writeAll(",\n");
+            try writer.print("        \"level\": \"{s}\",\n", .{sarifLevel(v.severity)});
             try writer.writeAll("        \"message\": {\n");
             try writer.print("          \"text\": \"{s}\"\n", .{v.message});
             try writer.writeAll("        },\n");
@@ -415,6 +441,14 @@ pub const UnifiedReport = struct {
 
         try writer.writeAll("</checkstyle>\n");
         try writer.flush();
+    }
+
+    fn sarifLevel(severity: Violation.Severity) []const u8 {
+        return switch (severity) {
+            .err => "error",
+            .warning => "warning",
+            .note => "note",
+        };
     }
 };
 
@@ -667,7 +701,7 @@ test "UnifiedReport: JSON output schema" {
     try std.testing.expect(report.coverage.resolution_rate > 0.0);
 }
 
-test "UnifiedReport: SARIF output format" {
+test "UnifiedReport: SARIF valid JSON with schema and version" {
     const allocator = std.testing.allocator;
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer _ = arena.deinit();
@@ -682,26 +716,253 @@ test "UnifiedReport: SARIF output format" {
 
     const result = try buildTestGraph(alloc, source);
 
-    var report = UnifiedReport.init(alloc);
-    defer report.deinit();
-    report.populate(result[0], result[1]);
+    var unified_report = UnifiedReport.init(alloc);
+    defer unified_report.deinit();
+    unified_report.populate(result[0], result[1]);
 
-    // Add a violation to test SARIF output
-    try report.addViolation(.{
+    try unified_report.addViolation(.{
         .severity = .warning,
-        .category = "type-check",
+        .category = "type-mismatch",
         .file_path = "src/Svc.php",
         .line = 3,
         .message = "Unresolved method call",
     });
 
-    const dev_null = std.fs.openFileAbsolute("/dev/null", .{ .mode = .write_only }) catch return;
-    defer dev_null.close();
-    try report.toSarif(dev_null);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    // Verify violation stored
-    try std.testing.expect(report.violations.items.len == 1);
-    try std.testing.expectEqualStrings("WARN", report.violations.items[0].severityLabel());
+    const out_file = try tmp.dir.createFile("sarif.json", .{});
+    try unified_report.toSarif(out_file);
+    out_file.close();
+
+    const sarif_content = try tmp.dir.readFileAlloc(alloc, "sarif.json", 64 * 1024);
+
+    // Validate it's parseable JSON
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, sarif_content, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    try std.testing.expect(root == .object);
+
+    // Check schema and version
+    const schema = root.object.get("$schema").?;
+    try std.testing.expect(schema == .string);
+    try std.testing.expect(std.mem.indexOf(u8, schema.string, "sarif-schema-2.1.0") != null);
+
+    const version = root.object.get("version").?;
+    try std.testing.expectEqualStrings("2.1.0", version.string);
+
+    // Check runs array
+    const runs = root.object.get("runs").?;
+    try std.testing.expect(runs == .array);
+    try std.testing.expect(runs.array.items.len == 1);
+
+    const run = runs.array.items[0];
+
+    // Check tool.driver with rules
+    const tool = run.object.get("tool").?;
+    const driver = tool.object.get("driver").?;
+    try std.testing.expectEqualStrings("phpcma", driver.object.get("name").?.string);
+    try std.testing.expect(driver.object.get("version") != null);
+    try std.testing.expect(driver.object.get("rules") != null);
+
+    const rules = driver.object.get("rules").?;
+    try std.testing.expect(rules == .array);
+    try std.testing.expect(rules.array.items.len == 1);
+    try std.testing.expectEqualStrings("phpcma/type-mismatch", rules.array.items[0].object.get("id").?.string);
+
+    // Check results
+    const results = run.object.get("results").?;
+    try std.testing.expect(results == .array);
+    try std.testing.expect(results.array.items.len == 1);
+
+    const r = results.array.items[0];
+    try std.testing.expectEqualStrings("phpcma/type-mismatch", r.object.get("ruleId").?.string);
+    try std.testing.expectEqualStrings("warning", r.object.get("level").?.string);
+}
+
+test "UnifiedReport: SARIF rule definitions present and deduplicated" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Svc {
+        \\    public function run(): void {}
+        \\}
+    ;
+
+    const result = try buildTestGraph(alloc, source);
+
+    var unified_report = UnifiedReport.init(alloc);
+    defer unified_report.deinit();
+    unified_report.populate(result[0], result[1]);
+
+    // Add two violations with the same category and one different
+    try unified_report.addViolation(.{ .severity = .err, .category = "type-mismatch", .file_path = "a.php", .line = 1, .message = "msg1" });
+    try unified_report.addViolation(.{ .severity = .warning, .category = "type-mismatch", .file_path = "b.php", .line = 2, .message = "msg2" });
+    try unified_report.addViolation(.{ .severity = .note, .category = "interface-mismatch", .file_path = "c.php", .line = 3, .message = "msg3" });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out_file = try tmp.dir.createFile("sarif.json", .{});
+    try unified_report.toSarif(out_file);
+    out_file.close();
+
+    const sarif_content = try tmp.dir.readFileAlloc(alloc, "sarif.json", 64 * 1024);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, sarif_content, .{});
+    defer parsed.deinit();
+
+    const run = parsed.value.object.get("runs").?.array.items[0];
+    const rules = run.object.get("tool").?.object.get("driver").?.object.get("rules").?.array;
+
+    // Only 2 unique rules despite 3 violations
+    try std.testing.expect(rules.items.len == 2);
+    try std.testing.expectEqualStrings("phpcma/type-mismatch", rules.items[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("phpcma/interface-mismatch", rules.items[1].object.get("id").?.string);
+
+    // First rule's default level should be "error" (from first violation with that category)
+    const first_rule_level = rules.items[0].object.get("defaultConfiguration").?.object.get("level").?.string;
+    try std.testing.expectEqualStrings("error", first_rule_level);
+
+    // Results should have all 3 violations
+    const results = run.object.get("results").?.array;
+    try std.testing.expect(results.items.len == 3);
+}
+
+test "UnifiedReport: SARIF confidence-to-level mapping" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Svc {
+        \\    public function run(): void {}
+        \\}
+    ;
+
+    const result = try buildTestGraph(alloc, source);
+
+    var unified_report = UnifiedReport.init(alloc);
+    defer unified_report.deinit();
+    unified_report.populate(result[0], result[1]);
+
+    // exact confidence -> error
+    try unified_report.addViolation(.{ .severity = .err, .category = "called-before-violation", .file_path = "a.php", .line = 1, .message = "exact" });
+    // likely confidence -> warning
+    try unified_report.addViolation(.{ .severity = .warning, .category = "type-mismatch", .file_path = "b.php", .line = 2, .message = "likely" });
+    // possible confidence -> note
+    try unified_report.addViolation(.{ .severity = .note, .category = "interface-mismatch", .file_path = "c.php", .line = 3, .message = "possible" });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out_file = try tmp.dir.createFile("sarif.json", .{});
+    try unified_report.toSarif(out_file);
+    out_file.close();
+
+    const sarif_content = try tmp.dir.readFileAlloc(alloc, "sarif.json", 64 * 1024);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, sarif_content, .{});
+    defer parsed.deinit();
+
+    const results = parsed.value.object.get("runs").?.array.items[0].object.get("results").?.array;
+    try std.testing.expectEqualStrings("error", results.items[0].object.get("level").?.string);
+    try std.testing.expectEqualStrings("warning", results.items[1].object.get("level").?.string);
+    try std.testing.expectEqualStrings("note", results.items[2].object.get("level").?.string);
+}
+
+test "UnifiedReport: SARIF location accuracy" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Svc {
+        \\    public function run(): void {}
+        \\}
+    ;
+
+    const result = try buildTestGraph(alloc, source);
+
+    var unified_report = UnifiedReport.init(alloc);
+    defer unified_report.deinit();
+    unified_report.populate(result[0], result[1]);
+
+    try unified_report.addViolation(.{ .severity = .err, .category = "type-mismatch", .file_path = "src/Service/UserService.php", .line = 42, .message = "Type error" });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out_file = try tmp.dir.createFile("sarif.json", .{});
+    try unified_report.toSarif(out_file);
+    out_file.close();
+
+    const sarif_content = try tmp.dir.readFileAlloc(alloc, "sarif.json", 64 * 1024);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, sarif_content, .{});
+    defer parsed.deinit();
+
+    const r = parsed.value.object.get("runs").?.array.items[0].object.get("results").?.array.items[0];
+    const loc = r.object.get("locations").?.array.items[0];
+    const phys = loc.object.get("physicalLocation").?;
+    const uri = phys.object.get("artifactLocation").?.object.get("uri").?.string;
+    try std.testing.expectEqualStrings("src/Service/UserService.php", uri);
+
+    const start_line = phys.object.get("region").?.object.get("startLine").?.integer;
+    try std.testing.expect(start_line == 42);
+}
+
+test "UnifiedReport: SARIF empty results produces valid JSON" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Clean {
+        \\    public function doWork(): void {}
+        \\}
+    ;
+
+    const result = try buildTestGraph(alloc, source);
+
+    var unified_report = UnifiedReport.init(alloc);
+    defer unified_report.deinit();
+    unified_report.populate(result[0], result[1]);
+
+    // No violations added
+    try std.testing.expect(unified_report.violations.items.len == 0);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out_file = try tmp.dir.createFile("sarif.json", .{});
+    try unified_report.toSarif(out_file);
+    out_file.close();
+
+    const sarif_content = try tmp.dir.readFileAlloc(alloc, "sarif.json", 64 * 1024);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, sarif_content, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    try std.testing.expect(root == .object);
+
+    // Valid SARIF structure
+    try std.testing.expectEqualStrings("2.1.0", root.object.get("version").?.string);
+
+    const run = root.object.get("runs").?.array.items[0];
+    const rules = run.object.get("tool").?.object.get("driver").?.object.get("rules").?.array;
+    try std.testing.expect(rules.items.len == 0);
+
+    const results = run.object.get("results").?.array;
+    try std.testing.expect(results.items.len == 0);
 }
 
 test "UnifiedReport: report with no violations" {
@@ -735,7 +996,7 @@ test "UnifiedReport: report with no violations" {
     try std.testing.expect(report.confidence.exact_pct == 0.0);
     try std.testing.expect(report.confidence.unresolved_pct == 0.0);
 
-    // Text output should not include violations section
+    // Text and JSON output should not crash
     const dev_null = std.fs.openFileAbsolute("/dev/null", .{ .mode = .write_only }) catch return;
     defer dev_null.close();
     try report.toText(dev_null);
