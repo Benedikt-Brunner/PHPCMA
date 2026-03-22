@@ -701,6 +701,56 @@ pub const ProjectCallGraph = struct {
         }
         try writer.flush();
     }
+
+    /// Output as JSON format
+    pub fn toJson(self: *const ProjectCallGraph, file: std.fs.File) !void {
+        var buf: [4096]u8 = undefined;
+        var w = file.writer(&buf);
+        const writer = &w.interface;
+
+        try writer.writeAll("{\n");
+        try writer.print("  \"version\": \"0.4.0\",\n", .{});
+        try writer.print("  \"total_calls\": {d},\n", .{self.total_calls});
+        try writer.print("  \"resolved_calls\": {d},\n", .{self.resolved_calls});
+        try writer.print("  \"unresolved_calls\": {d},\n", .{self.unresolved_calls});
+        try writer.print("  \"resolution_rate\": {d:.1},\n", .{self.getResolutionRate()});
+
+        // Symbols from the symbol table
+        const stats = self.symbol_table.getStats();
+        try writer.writeAll("  \"symbols\": {\n");
+        try writer.print("    \"classes\": {d},\n", .{stats.class_count});
+        try writer.print("    \"interfaces\": {d},\n", .{stats.interface_count});
+        try writer.print("    \"traits\": {d},\n", .{stats.trait_count});
+        try writer.print("    \"functions\": {d},\n", .{stats.function_count});
+        try writer.print("    \"methods\": {d},\n", .{stats.method_count});
+        try writer.print("    \"properties\": {d}\n", .{stats.property_count});
+        try writer.writeAll("  },\n");
+
+        // Call graph entries
+        try writer.writeAll("  \"call_graph\": [");
+        for (self.calls.items, 0..) |call, i| {
+            if (i > 0) try writer.writeAll(",");
+            try writer.writeAll("\n    {\n");
+            try writer.print("      \"caller\": \"{s}\",\n", .{call.caller_fqn});
+            try writer.print("      \"callee\": \"{s}\",\n", .{call.callee_name});
+            if (call.resolved_target) |target| {
+                try writer.print("      \"resolved_target\": \"{s}\",\n", .{target});
+            } else {
+                try writer.writeAll("      \"resolved_target\": null,\n");
+            }
+            try writer.print("      \"confidence\": {d:.2},\n", .{call.resolution_confidence});
+            try writer.print("      \"line\": {d},\n", .{call.line});
+            try writer.print("      \"file\": \"{s}\"\n", .{call.file_path});
+            try writer.writeAll("    }");
+        }
+        if (self.calls.items.len > 0) {
+            try writer.writeAll("\n  ");
+        }
+        try writer.writeAll("]\n");
+
+        try writer.writeAll("}\n");
+        try writer.flush();
+    }
 };
 
 // ============================================================================
@@ -1593,6 +1643,75 @@ pub const CalledBeforeAnalyzer = struct {
             }
             try writer.writeAll("\n");
         }
+        try writer.flush();
+    }
+
+    /// Output analysis result as JSON
+    pub fn toJson(self: *CalledBeforeAnalyzer, result: CalledBeforeResult, before_fn: []const u8, after_fn: []const u8, file: std.fs.File) !void {
+        _ = self;
+        var buf: [4096]u8 = undefined;
+        var w = file.writer(&buf);
+        const writer = &w.interface;
+
+        try writer.writeAll("{\n");
+        try writer.writeAll("  \"constraint\": {\n");
+        try writer.print("    \"before\": \"{s}\",\n", .{before_fn});
+        try writer.print("    \"after\": \"{s}\"\n", .{after_fn});
+        try writer.writeAll("  },\n");
+        try writer.print("  \"satisfied\": {s},\n", .{if (result.satisfied) "true" else "false"});
+
+        // Violations
+        try writer.writeAll("  \"violations\": [");
+        for (result.violations, 0..) |violation, i| {
+            if (i > 0) try writer.writeAll(",");
+            try writer.writeAll("\n    {\n");
+            try writer.print("      \"context_function\": \"{s}\",\n", .{violation.context_function});
+            try writer.print("      \"file\": \"{s}\",\n", .{violation.file_path});
+            try writer.print("      \"after_line\": {d},\n", .{violation.after_line});
+            if (violation.before_line) |bl| {
+                try writer.print("      \"before_line\": {d},\n", .{bl});
+            } else {
+                try writer.writeAll("      \"before_line\": null,\n");
+            }
+            const kind_str = switch (violation.kind) {
+                .wrong_order => "wrong_order",
+                .missing_before => "missing_before",
+                .conditional_before => "conditional_before",
+            };
+            try writer.print("      \"kind\": \"{s}\"\n", .{kind_str});
+            try writer.writeAll("    }");
+        }
+        if (result.violations.len > 0) {
+            try writer.writeAll("\n  ");
+        }
+        try writer.writeAll("],\n");
+
+        // Matches
+        try writer.writeAll("  \"matches\": [");
+        for (result.matches, 0..) |match, i| {
+            if (i > 0) try writer.writeAll(",");
+            try writer.writeAll("\n    {\n");
+            try writer.print("      \"context_function\": \"{s}\",\n", .{match.context_function});
+            try writer.print("      \"file\": \"{s}\",\n", .{match.file_path});
+            try writer.print("      \"after_line\": {d},\n", .{match.after_line});
+            try writer.print("      \"after_callee\": \"{s}\",\n", .{match.after_callee});
+            try writer.print("      \"before_line\": {d},\n", .{match.before_line});
+            try writer.print("      \"before_callee\": \"{s}\"\n", .{match.before_callee});
+            try writer.writeAll("    }");
+        }
+        if (result.matches.len > 0) {
+            try writer.writeAll("\n  ");
+        }
+        try writer.writeAll("],\n");
+
+        // Summary
+        try writer.writeAll("  \"summary\": {\n");
+        try writer.print("    \"satisfied_count\": {d},\n", .{result.satisfied_in.len});
+        try writer.print("    \"violation_count\": {d},\n", .{result.violations.len});
+        try writer.print("    \"match_count\": {d}\n", .{result.matches.len});
+        try writer.writeAll("  }\n");
+
+        try writer.writeAll("}\n");
         try writer.flush();
     }
 
