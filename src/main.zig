@@ -766,6 +766,7 @@ var called_before_config = struct {
     after: []const u8 = "",
     plugins: []const u8 = "",
     output: []const u8 = "",
+    format: []const u8 = "text",
     verbose: bool = false,
 }{};
 
@@ -811,7 +812,7 @@ pub fn main() !void {
                             },
                             .{
                                 .long_name = "format",
-                                .help = "Output format: text or dot (default: text)",
+                                .help = "Output format: text, json, or dot (default: text)",
                                 .value_ref = r.mkRef(&file_config.format),
                             },
                         }),
@@ -838,7 +839,7 @@ pub fn main() !void {
                             },
                             .{
                                 .long_name = "format",
-                                .help = "Output format: text or dot (default: text)",
+                                .help = "Output format: text, json, or dot (default: text)",
                                 .value_ref = r.mkRef(&project_config.format),
                             },
                             .{
@@ -887,6 +888,11 @@ pub fn main() !void {
                                 .short_alias = 'o',
                                 .help = "Output file (default: stdout)",
                                 .value_ref = r.mkRef(&called_before_config.output),
+                            },
+                            .{
+                                .long_name = "format",
+                                .help = "Output format: text or json (default: text)",
+                                .value_ref = r.mkRef(&called_before_config.format),
                             },
                             .{
                                 .long_name = "verbose",
@@ -1066,7 +1072,9 @@ fn analyzeFile() !void {
         const out_file = try std.fs.cwd().createFile(file_config.output, .{});
         defer out_file.close();
 
-        if (std.mem.eql(u8, file_config.format, "dot")) {
+        if (std.mem.eql(u8, file_config.format, "json")) {
+            try call_graph.toJson(out_file);
+        } else if (std.mem.eql(u8, file_config.format, "dot")) {
             try call_graph.toDot(out_file);
         } else {
             try call_graph.toText(out_file);
@@ -1074,7 +1082,9 @@ fn analyzeFile() !void {
         const msg = try std.fmt.allocPrint(allocator, "Output written to: {s}\n", .{file_config.output});
         try stdout.writeAll(msg);
     } else {
-        if (std.mem.eql(u8, file_config.format, "dot")) {
+        if (std.mem.eql(u8, file_config.format, "json")) {
+            try call_graph.toJson(stdout);
+        } else if (std.mem.eql(u8, file_config.format, "dot")) {
             try call_graph.toDot(stdout);
         } else {
             try call_graph.toText(stdout);
@@ -1187,7 +1197,9 @@ fn analyzeProject() !void {
         const out_file = try std.fs.cwd().createFile(project_config.output, .{});
         defer out_file.close();
 
-        if (std.mem.eql(u8, project_config.format, "dot")) {
+        if (std.mem.eql(u8, project_config.format, "json")) {
+            try call_graph.toJson(out_file);
+        } else if (std.mem.eql(u8, project_config.format, "dot")) {
             try call_graph.toDot(out_file);
         } else {
             try call_graph.toText(out_file);
@@ -1195,7 +1207,9 @@ fn analyzeProject() !void {
         const msg = try std.fmt.allocPrint(allocator, "Output written to: {s}\n", .{project_config.output});
         try stdout.writeAll(msg);
     } else {
-        if (std.mem.eql(u8, project_config.format, "dot")) {
+        if (std.mem.eql(u8, project_config.format, "json")) {
+            try call_graph.toJson(stdout);
+        } else if (std.mem.eql(u8, project_config.format, "dot")) {
             try call_graph.toDot(stdout);
         } else {
             try call_graph.toText(stdout);
@@ -1412,11 +1426,20 @@ fn analyzeCalledBefore() !void {
     if (called_before_config.output.len > 0) {
         const out_file = try std.fs.cwd().createFile(called_before_config.output, .{});
         defer out_file.close();
-        try cb_analyzer.toText(result, called_before_config.before, called_before_config.after, out_file);
+
+        if (std.mem.eql(u8, called_before_config.format, "json")) {
+            try cb_analyzer.toJson(result, called_before_config.before, called_before_config.after, out_file);
+        } else {
+            try cb_analyzer.toText(result, called_before_config.before, called_before_config.after, out_file);
+        }
         const msg = try std.fmt.allocPrint(allocator, "Output written to: {s}\n", .{called_before_config.output});
         try stdout.writeAll(msg);
     } else {
-        try cb_analyzer.toText(result, called_before_config.before, called_before_config.after, stdout);
+        if (std.mem.eql(u8, called_before_config.format, "json")) {
+            try cb_analyzer.toJson(result, called_before_config.before, called_before_config.after, stdout);
+        } else {
+            try cb_analyzer.toText(result, called_before_config.before, called_before_config.after, stdout);
+        }
     }
 
     // Exit with error code if constraint is violated
