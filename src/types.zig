@@ -594,6 +594,10 @@ pub const EnhancedFunctionCall = struct {
     resolution_confidence: f32,
     resolution_method: ResolutionMethod,
 
+    // Argument types resolved at call site (Phase 2b)
+    argument_types: []const ?TypeInfo = &.{},
+    argument_count: u32 = 0,
+
     pub const CallType = enum {
         function,
         method,

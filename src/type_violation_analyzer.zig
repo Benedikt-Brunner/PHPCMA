@@ -109,6 +109,10 @@ pub const TypeViolationAnalyzer = struct {
     boundary_analyzer_inst: BoundaryAnalyzer,
     /// Optional: previous signatures for breaking change detection
     previous_signatures: ?[]const MethodSignature,
+    /// Minimum resolution confidence to check (0.0-1.0)
+    min_confidence: f32 = 0.0,
+    /// Strict mode: treat warnings as errors
+    strict: bool = false,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -237,7 +241,6 @@ pub const TypeViolationAnalyzer = struct {
         error_count: *usize,
         warning_count: *usize,
     ) !void {
-        _ = error_count;
         // Find the actual call in the call graph to get argument info
         for (self.call_graph.calls.items) |call| {
             if (call.resolved_target == null) continue;
@@ -245,19 +248,12 @@ pub const TypeViolationAnalyzer = struct {
             if (!std.mem.eql(u8, call.file_path, bc.file_path)) continue;
             if (call.line != bc.line) continue;
 
-            // Found the matching call - check the caller's context
-            const caller_fqn = call.caller_fqn;
-            const caller_sep = std.mem.indexOf(u8, caller_fqn, "::") orelse continue;
-            const caller_class = caller_fqn[0..caller_sep];
-            const caller_method_name = caller_fqn[caller_sep + 2 ..];
+            // Skip calls below minimum confidence threshold
+            if (call.resolution_confidence < self.min_confidence) continue;
 
-            const caller_method = self.sym_table.resolveMethod(caller_class, caller_method_name) orelse continue;
-
-            // Check return type usage: if the callee returns a type that the caller
-            // expects to be compatible (via the call graph resolution)
+            // Check return type usage: if the callee returns a type from a third project
             const callee_return = callee_method.effectiveReturnType();
             if (callee_return) |ret_type| {
-                // Check if return type is from a different project (potential coupling)
                 if (!ret_type.is_builtin and ret_type.kind == .simple) {
                     if (self.sym_table.getClass(ret_type.base_type)) |ret_class| {
                         const ret_project = self.boundary_analyzer_inst.fileToProject(ret_class.file_path);
@@ -267,7 +263,7 @@ pub const TypeViolationAnalyzer = struct {
                             {
                                 try violations.append(self.allocator, .{
                                     .kind = .wrong_return_type,
-                                    .severity = .info,
+                                    .severity = .warning,
                                     .caller_fqn = bc.caller_fqn,
                                     .callee_fqn = bc.callee_fqn,
                                     .caller_project = bc.caller_project,
@@ -282,46 +278,6 @@ pub const TypeViolationAnalyzer = struct {
                                     .expected_type = null,
                                     .actual_type = ret_type.base_type,
                                 });
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Check parameter types: compare caller's argument types against callee's parameter types
-            for (callee_method.parameters) |param| {
-                const param_type = param.type_info orelse param.phpdoc_type orelse continue;
-                if (param_type.is_builtin) continue;
-
-                // For non-builtin parameter types, check if caller has compatible types
-                // Look up the expected type in the symbol table
-                if (param_type.kind == .simple) {
-                    // Check if the expected class exists and if caller's project has access
-                    if (self.sym_table.getClass(param_type.base_type)) |expected_class| {
-                        const expected_project = self.boundary_analyzer_inst.fileToProject(expected_class.file_path);
-
-                        // Check if there's a potential interface mismatch
-                        if (expected_project) |ep| {
-                            if (!std.mem.eql(u8, ep, bc.callee_project) and
-                                !std.mem.eql(u8, ep, bc.caller_project))
-                            {
-                                try violations.append(self.allocator, .{
-                                    .kind = .wrong_argument_type,
-                                    .severity = .warning,
-                                    .caller_fqn = bc.caller_fqn,
-                                    .callee_fqn = bc.callee_fqn,
-                                    .caller_project = bc.caller_project,
-                                    .callee_project = bc.callee_project,
-                                    .file_path = bc.file_path,
-                                    .line = bc.line,
-                                    .message = try std.fmt.allocPrint(
-                                        self.allocator,
-                                        "Parameter '{s}' requires type {s} from a third project",
-                                        .{ param.name, param_type.base_type },
-                                    ),
-                                    .expected_type = param_type.base_type,
-                                    .actual_type = null,
-                                });
                                 warning_count.* += 1;
                             }
                         }
@@ -329,21 +285,207 @@ pub const TypeViolationAnalyzer = struct {
                 }
             }
 
-            // Check if caller is passing the right number of required args
+            // Count required and max parameters
             var required_params: usize = 0;
+            var has_variadic = false;
             for (callee_method.parameters) |param| {
                 if (!param.has_default and !param.is_variadic) {
                     required_params += 1;
                 }
+                if (param.is_variadic) {
+                    has_variadic = true;
+                }
+            }
+            const max_params: usize = if (has_variadic) std.math.maxInt(usize) else callee_method.parameters.len;
+            const arg_count: usize = call.argument_count;
+
+            // Check: too few arguments
+            if (arg_count < required_params) {
+                try violations.append(self.allocator, .{
+                    .kind = .wrong_argument_count,
+                    .severity = .error_level,
+                    .caller_fqn = bc.caller_fqn,
+                    .callee_fqn = bc.callee_fqn,
+                    .caller_project = bc.caller_project,
+                    .callee_project = bc.callee_project,
+                    .file_path = bc.file_path,
+                    .line = bc.line,
+                    .message = try std.fmt.allocPrint(
+                        self.allocator,
+                        "Too few arguments: {d} passed, {d} required by {s}",
+                        .{ arg_count, required_params, bc.callee_fqn },
+                    ),
+                    .expected_type = null,
+                    .actual_type = null,
+                });
+                error_count.* += 1;
             }
 
-            // We can't check actual arg count from the call graph alone,
-            // but we can flag methods where the caller has fewer params than required
-            // by checking the caller method's own parameter count
-            _ = caller_method;
+            // Check: too many arguments (only if no variadic param)
+            if (arg_count > max_params) {
+                try violations.append(self.allocator, .{
+                    .kind = .wrong_argument_count,
+                    .severity = .error_level,
+                    .caller_fqn = bc.caller_fqn,
+                    .callee_fqn = bc.callee_fqn,
+                    .caller_project = bc.caller_project,
+                    .callee_project = bc.callee_project,
+                    .file_path = bc.file_path,
+                    .line = bc.line,
+                    .message = try std.fmt.allocPrint(
+                        self.allocator,
+                        "Too many arguments: {d} passed, {d} expected by {s}",
+                        .{ arg_count, callee_method.parameters.len, bc.callee_fqn },
+                    ),
+                    .expected_type = null,
+                    .actual_type = null,
+                });
+                error_count.* += 1;
+            }
+
+            // Check per-argument type compatibility
+            const check_count = @min(arg_count, callee_method.parameters.len);
+            for (0..check_count) |i| {
+                const param = callee_method.parameters[i];
+                const param_type = param.type_info orelse param.phpdoc_type orelse continue;
+
+                // Skip untyped parameters
+                if (param_type.kind == .mixed) continue;
+
+                // Get argument type
+                if (i >= call.argument_types.len) continue;
+                const arg_type_opt = call.argument_types[i];
+                const arg_type = arg_type_opt orelse continue; // Unresolved arg: skip
+
+                // Check null to non-nullable
+                if (std.mem.eql(u8, arg_type.base_type, "null")) {
+                    if (param_type.kind != .nullable and
+                        !std.mem.eql(u8, param_type.base_type, "null") and
+                        param_type.kind != .mixed)
+                    {
+                        // Check if it's a union that includes null
+                        var has_null_in_union = false;
+                        if (param_type.kind == .union_type) {
+                            for (param_type.type_parts) |part| {
+                                if (std.mem.eql(u8, part, "null")) {
+                                    has_null_in_union = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!has_null_in_union) {
+                            try violations.append(self.allocator, .{
+                                .kind = .wrong_argument_type,
+                                .severity = .error_level,
+                                .caller_fqn = bc.caller_fqn,
+                                .callee_fqn = bc.callee_fqn,
+                                .caller_project = bc.caller_project,
+                                .callee_project = bc.callee_project,
+                                .file_path = bc.file_path,
+                                .line = bc.line,
+                                .message = try std.fmt.allocPrint(
+                                    self.allocator,
+                                    "Argument {d} ('{s}'): null passed to non-nullable parameter of type {s}",
+                                    .{ i + 1, param.name, param_type.base_type },
+                                ),
+                                .expected_type = param_type.base_type,
+                                .actual_type = "null",
+                            });
+                            error_count.* += 1;
+                            continue;
+                        }
+                    }
+                    continue; // null to nullable is fine
+                }
+
+                // Check type compatibility
+                if (!self.isTypeCompatible(&arg_type, &param_type)) {
+                    try violations.append(self.allocator, .{
+                        .kind = .wrong_argument_type,
+                        .severity = .error_level,
+                        .caller_fqn = bc.caller_fqn,
+                        .callee_fqn = bc.callee_fqn,
+                        .caller_project = bc.caller_project,
+                        .callee_project = bc.callee_project,
+                        .file_path = bc.file_path,
+                        .line = bc.line,
+                        .message = try std.fmt.allocPrint(
+                            self.allocator,
+                            "Argument {d} ('{s}'): type {s} incompatible with parameter type {s}",
+                            .{ i + 1, param.name, arg_type.base_type, param_type.base_type },
+                        ),
+                        .expected_type = param_type.base_type,
+                        .actual_type = arg_type.base_type,
+                    });
+                    error_count.* += 1;
+                }
+            }
 
             break;
         }
+    }
+
+    /// Check if an argument type is compatible with a parameter type
+    fn isTypeCompatible(self: *const TypeViolationAnalyzer, arg_type: *const TypeInfo, param_type: *const TypeInfo) bool {
+        // mixed accepts anything
+        if (param_type.kind == .mixed or std.mem.eql(u8, param_type.base_type, "mixed")) return true;
+
+        // Same base type
+        if (std.mem.eql(u8, arg_type.base_type, param_type.base_type)) return true;
+
+        // Nullable: check the inner type
+        if (param_type.kind == .nullable) {
+            if (std.mem.eql(u8, arg_type.base_type, param_type.base_type)) return true;
+        }
+
+        // Union type: check if arg matches any part
+        if (param_type.kind == .union_type) {
+            for (param_type.type_parts) |part| {
+                if (std.mem.eql(u8, arg_type.base_type, part)) return true;
+            }
+        }
+
+        // Scalar widening: int -> float
+        if (std.mem.eql(u8, arg_type.base_type, "int") and std.mem.eql(u8, param_type.base_type, "float")) return true;
+        if (std.mem.eql(u8, arg_type.base_type, "integer") and std.mem.eql(u8, param_type.base_type, "float")) return true;
+
+        // Synonyms
+        if (std.mem.eql(u8, arg_type.base_type, "int") and std.mem.eql(u8, param_type.base_type, "integer")) return true;
+        if (std.mem.eql(u8, arg_type.base_type, "integer") and std.mem.eql(u8, param_type.base_type, "int")) return true;
+        if (std.mem.eql(u8, arg_type.base_type, "bool") and std.mem.eql(u8, param_type.base_type, "boolean")) return true;
+        if (std.mem.eql(u8, arg_type.base_type, "boolean") and std.mem.eql(u8, param_type.base_type, "bool")) return true;
+        if (std.mem.eql(u8, arg_type.base_type, "float") and std.mem.eql(u8, param_type.base_type, "double")) return true;
+        if (std.mem.eql(u8, arg_type.base_type, "double") and std.mem.eql(u8, param_type.base_type, "float")) return true;
+
+        // Builtin types: if both are builtins and don't match, they're incompatible
+        if (arg_type.is_builtin and param_type.is_builtin) return false;
+
+        // Class inheritance compatibility
+        if (!arg_type.is_builtin and !param_type.is_builtin) {
+            return self.isClassCompatible(arg_type.base_type, param_type.base_type);
+        }
+
+        // Scalar vs class: incompatible
+        return false;
+    }
+
+    /// Check if arg_class is a subtype of param_class (inheritance/interface)
+    fn isClassCompatible(self: *const TypeViolationAnalyzer, arg_class: []const u8, param_class: []const u8) bool {
+        if (std.mem.eql(u8, arg_class, param_class)) return true;
+
+        // Check if arg_class extends param_class
+        if (self.sym_table.getClass(arg_class)) |class| {
+            // Check parent chain
+            for (class.parent_chain) |ancestor| {
+                if (std.mem.eql(u8, ancestor, param_class)) return true;
+            }
+            // Check implements
+            for (class.implements) |iface| {
+                if (std.mem.eql(u8, iface, param_class)) return true;
+            }
+        }
+
+        return false;
     }
 
     /// Check interface compliance for cross-project calls
@@ -1558,4 +1700,625 @@ test "boundary violation severity" {
     }
     try std.testing.expect(has_error);
     try std.testing.expect(has_warning);
+}
+
+// ============================================================================
+// Phase 2b: Call-Site Argument Type Checking Tests
+// ============================================================================
+
+fn makeCallWithArgs(alloc: std.mem.Allocator, caller_fqn: []const u8, callee_name: []const u8, file: []const u8, resolved: []const u8, line: u32, arg_types: []const ?TypeInfo, arg_count: u32) EnhancedFunctionCall {
+    _ = alloc;
+    return .{
+        .caller_fqn = caller_fqn,
+        .callee_name = callee_name,
+        .call_type = .method,
+        .line = line,
+        .column = 1,
+        .file_path = file,
+        .resolved_target = resolved,
+        .resolution_confidence = 1.0,
+        .resolution_method = .native_type,
+        .argument_types = arg_types,
+        .argument_count = arg_count,
+    };
+}
+
+test "ph2b: correct types pass" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    var sym_table = SymbolTable.init(alloc);
+    var bundle_class = ClassSymbol.init(alloc, "B\\Svc");
+    bundle_class.file_path = "/m/b/src/Svc.php";
+    try bundle_class.addMethod(makeTestMethod(alloc, "run", "B\\Svc", "/m/b/src/Svc.php", .public, &.{
+        .{ .name = "name", .type_info = try TypeInfo.simple(alloc, "string"), .has_default = false, .is_variadic = false, .is_by_reference = false, .is_promoted = false, .phpdoc_type = null },
+    }, null));
+    try sym_table.addClass(bundle_class);
+
+    var plugin_class = ClassSymbol.init(alloc, "P\\Client");
+    plugin_class.file_path = "/m/p/src/Client.php";
+    try sym_table.addClass(plugin_class);
+
+    var call_graph = ProjectCallGraph.init(alloc, &sym_table);
+    const str_type = try TypeInfo.simple(alloc, "string");
+    const arg_types = try alloc.alloc(?TypeInfo, 1);
+    arg_types[0] = str_type;
+    try call_graph.calls.append(alloc, makeCallWithArgs(alloc, "P\\Client::go", "run", "/m/p/src/Client.php", "B\\Svc::run", 5, arg_types, 1));
+
+    var configs = try alloc.alloc(ProjectConfig, 2);
+    configs[0] = ProjectConfig.init(alloc, "/m/b");
+    configs[1] = ProjectConfig.init(alloc, "/m/p");
+
+    var tva = TypeViolationAnalyzer.init(alloc, &call_graph, configs, &sym_table);
+    const result = try tva.analyze();
+    try std.testing.expectEqual(@as(usize, 0), result.error_count);
+}
+
+test "ph2b: wrong scalar type" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    var sym_table = SymbolTable.init(alloc);
+    var bundle_class = ClassSymbol.init(alloc, "B\\Svc");
+    bundle_class.file_path = "/m/b/src/Svc.php";
+    try bundle_class.addMethod(makeTestMethod(alloc, "run", "B\\Svc", "/m/b/src/Svc.php", .public, &.{
+        .{ .name = "count", .type_info = try TypeInfo.simple(alloc, "int"), .has_default = false, .is_variadic = false, .is_by_reference = false, .is_promoted = false, .phpdoc_type = null },
+    }, null));
+    try sym_table.addClass(bundle_class);
+
+    var plugin_class = ClassSymbol.init(alloc, "P\\Client");
+    plugin_class.file_path = "/m/p/src/Client.php";
+    try sym_table.addClass(plugin_class);
+
+    var call_graph = ProjectCallGraph.init(alloc, &sym_table);
+    const arg_types = try alloc.alloc(?TypeInfo, 1);
+    arg_types[0] = try TypeInfo.simple(alloc, "string");
+    try call_graph.calls.append(alloc, makeCallWithArgs(alloc, "P\\Client::go", "run", "/m/p/src/Client.php", "B\\Svc::run", 5, arg_types, 1));
+
+    var configs = try alloc.alloc(ProjectConfig, 2);
+    configs[0] = ProjectConfig.init(alloc, "/m/b");
+    configs[1] = ProjectConfig.init(alloc, "/m/p");
+
+    var tva = TypeViolationAnalyzer.init(alloc, &call_graph, configs, &sym_table);
+    const result = try tva.analyze();
+    try std.testing.expect(result.error_count > 0);
+    try std.testing.expectEqual(ViolationKind.wrong_argument_type, result.violations[0].kind);
+}
+
+test "ph2b: null to non-nullable" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    var sym_table = SymbolTable.init(alloc);
+    var bundle_class = ClassSymbol.init(alloc, "B\\Svc");
+    bundle_class.file_path = "/m/b/src/Svc.php";
+    try bundle_class.addMethod(makeTestMethod(alloc, "run", "B\\Svc", "/m/b/src/Svc.php", .public, &.{
+        .{ .name = "name", .type_info = try TypeInfo.simple(alloc, "string"), .has_default = false, .is_variadic = false, .is_by_reference = false, .is_promoted = false, .phpdoc_type = null },
+    }, null));
+    try sym_table.addClass(bundle_class);
+
+    var plugin_class = ClassSymbol.init(alloc, "P\\Client");
+    plugin_class.file_path = "/m/p/src/Client.php";
+    try sym_table.addClass(plugin_class);
+
+    var call_graph = ProjectCallGraph.init(alloc, &sym_table);
+    const arg_types = try alloc.alloc(?TypeInfo, 1);
+    arg_types[0] = try TypeInfo.simple(alloc, "null");
+    try call_graph.calls.append(alloc, makeCallWithArgs(alloc, "P\\Client::go", "run", "/m/p/src/Client.php", "B\\Svc::run", 5, arg_types, 1));
+
+    var configs = try alloc.alloc(ProjectConfig, 2);
+    configs[0] = ProjectConfig.init(alloc, "/m/b");
+    configs[1] = ProjectConfig.init(alloc, "/m/p");
+
+    var tva = TypeViolationAnalyzer.init(alloc, &call_graph, configs, &sym_table);
+    const result = try tva.analyze();
+    try std.testing.expect(result.error_count > 0);
+    try std.testing.expectEqual(ViolationKind.wrong_argument_type, result.violations[0].kind);
+}
+
+test "ph2b: null to nullable passes" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    var sym_table = SymbolTable.init(alloc);
+    var bundle_class = ClassSymbol.init(alloc, "B\\Svc");
+    bundle_class.file_path = "/m/b/src/Svc.php";
+    try bundle_class.addMethod(makeTestMethod(alloc, "run", "B\\Svc", "/m/b/src/Svc.php", .public, &.{
+        .{ .name = "name", .type_info = try TypeInfo.nullable(alloc, "string"), .has_default = false, .is_variadic = false, .is_by_reference = false, .is_promoted = false, .phpdoc_type = null },
+    }, null));
+    try sym_table.addClass(bundle_class);
+
+    var plugin_class = ClassSymbol.init(alloc, "P\\Client");
+    plugin_class.file_path = "/m/p/src/Client.php";
+    try sym_table.addClass(plugin_class);
+
+    var call_graph = ProjectCallGraph.init(alloc, &sym_table);
+    const arg_types = try alloc.alloc(?TypeInfo, 1);
+    arg_types[0] = try TypeInfo.simple(alloc, "null");
+    try call_graph.calls.append(alloc, makeCallWithArgs(alloc, "P\\Client::go", "run", "/m/p/src/Client.php", "B\\Svc::run", 5, arg_types, 1));
+
+    var configs = try alloc.alloc(ProjectConfig, 2);
+    configs[0] = ProjectConfig.init(alloc, "/m/b");
+    configs[1] = ProjectConfig.init(alloc, "/m/p");
+
+    var tva = TypeViolationAnalyzer.init(alloc, &call_graph, configs, &sym_table);
+    const result = try tva.analyze();
+    try std.testing.expectEqual(@as(usize, 0), result.error_count);
+}
+
+test "ph2b: compatible class hierarchy" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    var sym_table = SymbolTable.init(alloc);
+
+    // Base class
+    var base_class = ClassSymbol.init(alloc, "B\\Base");
+    base_class.file_path = "/m/b/src/Base.php";
+    try sym_table.addClass(base_class);
+
+    // Child class extends Base
+    var child_class = ClassSymbol.init(alloc, "B\\Child");
+    child_class.file_path = "/m/b/src/Child.php";
+    child_class.extends = "B\\Base";
+    try sym_table.addClass(child_class);
+
+    // Method expecting Base
+    var svc_class = ClassSymbol.init(alloc, "B\\Svc");
+    svc_class.file_path = "/m/b/src/Svc.php";
+    try svc_class.addMethod(makeTestMethod(alloc, "process", "B\\Svc", "/m/b/src/Svc.php", .public, &.{
+        .{ .name = "obj", .type_info = TypeInfo{ .kind = .simple, .base_type = "B\\Base", .type_parts = &.{}, .is_builtin = false }, .has_default = false, .is_variadic = false, .is_by_reference = false, .is_promoted = false, .phpdoc_type = null },
+    }, null));
+    try sym_table.addClass(svc_class);
+
+    try sym_table.resolveInheritance();
+
+    var plugin_class = ClassSymbol.init(alloc, "P\\Client");
+    plugin_class.file_path = "/m/p/src/Client.php";
+    try sym_table.addClass(plugin_class);
+
+    var call_graph = ProjectCallGraph.init(alloc, &sym_table);
+    const arg_types = try alloc.alloc(?TypeInfo, 1);
+    arg_types[0] = TypeInfo{ .kind = .simple, .base_type = "B\\Child", .type_parts = &.{}, .is_builtin = false };
+    try call_graph.calls.append(alloc, makeCallWithArgs(alloc, "P\\Client::go", "process", "/m/p/src/Client.php", "B\\Svc::process", 5, arg_types, 1));
+
+    var configs = try alloc.alloc(ProjectConfig, 2);
+    configs[0] = ProjectConfig.init(alloc, "/m/b");
+    configs[1] = ProjectConfig.init(alloc, "/m/p");
+
+    var tva = TypeViolationAnalyzer.init(alloc, &call_graph, configs, &sym_table);
+    const result = try tva.analyze();
+    try std.testing.expectEqual(@as(usize, 0), result.error_count);
+}
+
+test "ph2b: incompatible class" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    var sym_table = SymbolTable.init(alloc);
+
+    var expected_class = ClassSymbol.init(alloc, "B\\Expected");
+    expected_class.file_path = "/m/b/src/Expected.php";
+    try sym_table.addClass(expected_class);
+
+    var wrong_class = ClassSymbol.init(alloc, "B\\Wrong");
+    wrong_class.file_path = "/m/b/src/Wrong.php";
+    try sym_table.addClass(wrong_class);
+
+    var svc_class = ClassSymbol.init(alloc, "B\\Svc");
+    svc_class.file_path = "/m/b/src/Svc.php";
+    try svc_class.addMethod(makeTestMethod(alloc, "process", "B\\Svc", "/m/b/src/Svc.php", .public, &.{
+        .{ .name = "obj", .type_info = TypeInfo{ .kind = .simple, .base_type = "B\\Expected", .type_parts = &.{}, .is_builtin = false }, .has_default = false, .is_variadic = false, .is_by_reference = false, .is_promoted = false, .phpdoc_type = null },
+    }, null));
+    try sym_table.addClass(svc_class);
+
+    try sym_table.resolveInheritance();
+
+    var plugin_class = ClassSymbol.init(alloc, "P\\Client");
+    plugin_class.file_path = "/m/p/src/Client.php";
+    try sym_table.addClass(plugin_class);
+
+    var call_graph = ProjectCallGraph.init(alloc, &sym_table);
+    const arg_types = try alloc.alloc(?TypeInfo, 1);
+    arg_types[0] = TypeInfo{ .kind = .simple, .base_type = "B\\Wrong", .type_parts = &.{}, .is_builtin = false };
+    try call_graph.calls.append(alloc, makeCallWithArgs(alloc, "P\\Client::go", "process", "/m/p/src/Client.php", "B\\Svc::process", 5, arg_types, 1));
+
+    var configs = try alloc.alloc(ProjectConfig, 2);
+    configs[0] = ProjectConfig.init(alloc, "/m/b");
+    configs[1] = ProjectConfig.init(alloc, "/m/p");
+
+    var tva = TypeViolationAnalyzer.init(alloc, &call_graph, configs, &sym_table);
+    const result = try tva.analyze();
+    try std.testing.expect(result.error_count > 0);
+    try std.testing.expectEqual(ViolationKind.wrong_argument_type, result.violations[0].kind);
+}
+
+test "ph2b: too few args" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    var sym_table = SymbolTable.init(alloc);
+    var bundle_class = ClassSymbol.init(alloc, "B\\Svc");
+    bundle_class.file_path = "/m/b/src/Svc.php";
+    try bundle_class.addMethod(makeTestMethod(alloc, "run", "B\\Svc", "/m/b/src/Svc.php", .public, &.{
+        .{ .name = "a", .type_info = try TypeInfo.simple(alloc, "string"), .has_default = false, .is_variadic = false, .is_by_reference = false, .is_promoted = false, .phpdoc_type = null },
+        .{ .name = "b", .type_info = try TypeInfo.simple(alloc, "int"), .has_default = false, .is_variadic = false, .is_by_reference = false, .is_promoted = false, .phpdoc_type = null },
+    }, null));
+    try sym_table.addClass(bundle_class);
+
+    var plugin_class = ClassSymbol.init(alloc, "P\\Client");
+    plugin_class.file_path = "/m/p/src/Client.php";
+    try sym_table.addClass(plugin_class);
+
+    var call_graph = ProjectCallGraph.init(alloc, &sym_table);
+    const arg_types = try alloc.alloc(?TypeInfo, 1);
+    arg_types[0] = try TypeInfo.simple(alloc, "string");
+    try call_graph.calls.append(alloc, makeCallWithArgs(alloc, "P\\Client::go", "run", "/m/p/src/Client.php", "B\\Svc::run", 5, arg_types, 1));
+
+    var configs = try alloc.alloc(ProjectConfig, 2);
+    configs[0] = ProjectConfig.init(alloc, "/m/b");
+    configs[1] = ProjectConfig.init(alloc, "/m/p");
+
+    var tva = TypeViolationAnalyzer.init(alloc, &call_graph, configs, &sym_table);
+    const result = try tva.analyze();
+    try std.testing.expect(result.error_count > 0);
+    try std.testing.expectEqual(ViolationKind.wrong_argument_count, result.violations[0].kind);
+}
+
+test "ph2b: too many args" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    var sym_table = SymbolTable.init(alloc);
+    var bundle_class = ClassSymbol.init(alloc, "B\\Svc");
+    bundle_class.file_path = "/m/b/src/Svc.php";
+    try bundle_class.addMethod(makeTestMethod(alloc, "run", "B\\Svc", "/m/b/src/Svc.php", .public, &.{
+        .{ .name = "a", .type_info = try TypeInfo.simple(alloc, "string"), .has_default = false, .is_variadic = false, .is_by_reference = false, .is_promoted = false, .phpdoc_type = null },
+    }, null));
+    try sym_table.addClass(bundle_class);
+
+    var plugin_class = ClassSymbol.init(alloc, "P\\Client");
+    plugin_class.file_path = "/m/p/src/Client.php";
+    try sym_table.addClass(plugin_class);
+
+    var call_graph = ProjectCallGraph.init(alloc, &sym_table);
+    const arg_types = try alloc.alloc(?TypeInfo, 3);
+    arg_types[0] = try TypeInfo.simple(alloc, "string");
+    arg_types[1] = try TypeInfo.simple(alloc, "int");
+    arg_types[2] = try TypeInfo.simple(alloc, "bool");
+    try call_graph.calls.append(alloc, makeCallWithArgs(alloc, "P\\Client::go", "run", "/m/p/src/Client.php", "B\\Svc::run", 5, arg_types, 3));
+
+    var configs = try alloc.alloc(ProjectConfig, 2);
+    configs[0] = ProjectConfig.init(alloc, "/m/b");
+    configs[1] = ProjectConfig.init(alloc, "/m/p");
+
+    var tva = TypeViolationAnalyzer.init(alloc, &call_graph, configs, &sym_table);
+    const result = try tva.analyze();
+    try std.testing.expect(result.error_count > 0);
+    try std.testing.expectEqual(ViolationKind.wrong_argument_count, result.violations[0].kind);
+}
+
+test "ph2b: variadic accepts extras" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    var sym_table = SymbolTable.init(alloc);
+    var bundle_class = ClassSymbol.init(alloc, "B\\Svc");
+    bundle_class.file_path = "/m/b/src/Svc.php";
+    try bundle_class.addMethod(makeTestMethod(alloc, "log", "B\\Svc", "/m/b/src/Svc.php", .public, &.{
+        .{ .name = "msg", .type_info = try TypeInfo.simple(alloc, "string"), .has_default = false, .is_variadic = false, .is_by_reference = false, .is_promoted = false, .phpdoc_type = null },
+        .{ .name = "args", .type_info = try TypeInfo.simple(alloc, "mixed"), .has_default = false, .is_variadic = true, .is_by_reference = false, .is_promoted = false, .phpdoc_type = null },
+    }, null));
+    try sym_table.addClass(bundle_class);
+
+    var plugin_class = ClassSymbol.init(alloc, "P\\Client");
+    plugin_class.file_path = "/m/p/src/Client.php";
+    try sym_table.addClass(plugin_class);
+
+    var call_graph = ProjectCallGraph.init(alloc, &sym_table);
+    const arg_types = try alloc.alloc(?TypeInfo, 4);
+    arg_types[0] = try TypeInfo.simple(alloc, "string");
+    arg_types[1] = try TypeInfo.simple(alloc, "int");
+    arg_types[2] = try TypeInfo.simple(alloc, "string");
+    arg_types[3] = try TypeInfo.simple(alloc, "bool");
+    try call_graph.calls.append(alloc, makeCallWithArgs(alloc, "P\\Client::go", "log", "/m/p/src/Client.php", "B\\Svc::log", 5, arg_types, 4));
+
+    var configs = try alloc.alloc(ProjectConfig, 2);
+    configs[0] = ProjectConfig.init(alloc, "/m/b");
+    configs[1] = ProjectConfig.init(alloc, "/m/p");
+
+    var tva = TypeViolationAnalyzer.init(alloc, &call_graph, configs, &sym_table);
+    const result = try tva.analyze();
+    try std.testing.expectEqual(@as(usize, 0), result.error_count);
+}
+
+test "ph2b: default param fewer args OK" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    var sym_table = SymbolTable.init(alloc);
+    var bundle_class = ClassSymbol.init(alloc, "B\\Svc");
+    bundle_class.file_path = "/m/b/src/Svc.php";
+    try bundle_class.addMethod(makeTestMethod(alloc, "run", "B\\Svc", "/m/b/src/Svc.php", .public, &.{
+        .{ .name = "a", .type_info = try TypeInfo.simple(alloc, "string"), .has_default = false, .is_variadic = false, .is_by_reference = false, .is_promoted = false, .phpdoc_type = null },
+        .{ .name = "b", .type_info = try TypeInfo.simple(alloc, "int"), .has_default = true, .is_variadic = false, .is_by_reference = false, .is_promoted = false, .phpdoc_type = null },
+    }, null));
+    try sym_table.addClass(bundle_class);
+
+    var plugin_class = ClassSymbol.init(alloc, "P\\Client");
+    plugin_class.file_path = "/m/p/src/Client.php";
+    try sym_table.addClass(plugin_class);
+
+    var call_graph = ProjectCallGraph.init(alloc, &sym_table);
+    const arg_types = try alloc.alloc(?TypeInfo, 1);
+    arg_types[0] = try TypeInfo.simple(alloc, "string");
+    try call_graph.calls.append(alloc, makeCallWithArgs(alloc, "P\\Client::go", "run", "/m/p/src/Client.php", "B\\Svc::run", 5, arg_types, 1));
+
+    var configs = try alloc.alloc(ProjectConfig, 2);
+    configs[0] = ProjectConfig.init(alloc, "/m/b");
+    configs[1] = ProjectConfig.init(alloc, "/m/p");
+
+    var tva = TypeViolationAnalyzer.init(alloc, &call_graph, configs, &sym_table);
+    const result = try tva.analyze();
+    try std.testing.expectEqual(@as(usize, 0), result.error_count);
+}
+
+test "ph2b: union type param" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    var sym_table = SymbolTable.init(alloc);
+    var bundle_class = ClassSymbol.init(alloc, "B\\Svc");
+    bundle_class.file_path = "/m/b/src/Svc.php";
+
+    const union_parts = try alloc.alloc([]const u8, 2);
+    union_parts[0] = "string";
+    union_parts[1] = "int";
+    try bundle_class.addMethod(makeTestMethod(alloc, "run", "B\\Svc", "/m/b/src/Svc.php", .public, &.{
+        .{ .name = "val", .type_info = TypeInfo{ .kind = .union_type, .base_type = "string|int", .type_parts = union_parts, .is_builtin = true }, .has_default = false, .is_variadic = false, .is_by_reference = false, .is_promoted = false, .phpdoc_type = null },
+    }, null));
+    try sym_table.addClass(bundle_class);
+
+    var plugin_class = ClassSymbol.init(alloc, "P\\Client");
+    plugin_class.file_path = "/m/p/src/Client.php";
+    try sym_table.addClass(plugin_class);
+
+    var call_graph = ProjectCallGraph.init(alloc, &sym_table);
+    const arg_types = try alloc.alloc(?TypeInfo, 1);
+    arg_types[0] = try TypeInfo.simple(alloc, "int");
+    try call_graph.calls.append(alloc, makeCallWithArgs(alloc, "P\\Client::go", "run", "/m/p/src/Client.php", "B\\Svc::run", 5, arg_types, 1));
+
+    var configs = try alloc.alloc(ProjectConfig, 2);
+    configs[0] = ProjectConfig.init(alloc, "/m/b");
+    configs[1] = ProjectConfig.init(alloc, "/m/p");
+
+    var tva = TypeViolationAnalyzer.init(alloc, &call_graph, configs, &sym_table);
+    const result = try tva.analyze();
+    try std.testing.expectEqual(@as(usize, 0), result.error_count);
+}
+
+test "ph2b: mixed accepts anything" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    var sym_table = SymbolTable.init(alloc);
+    var bundle_class = ClassSymbol.init(alloc, "B\\Svc");
+    bundle_class.file_path = "/m/b/src/Svc.php";
+    try bundle_class.addMethod(makeTestMethod(alloc, "run", "B\\Svc", "/m/b/src/Svc.php", .public, &.{
+        .{ .name = "val", .type_info = try TypeInfo.simple(alloc, "mixed"), .has_default = false, .is_variadic = false, .is_by_reference = false, .is_promoted = false, .phpdoc_type = null },
+    }, null));
+    try sym_table.addClass(bundle_class);
+
+    var plugin_class = ClassSymbol.init(alloc, "P\\Client");
+    plugin_class.file_path = "/m/p/src/Client.php";
+    try sym_table.addClass(plugin_class);
+
+    var call_graph = ProjectCallGraph.init(alloc, &sym_table);
+    const arg_types = try alloc.alloc(?TypeInfo, 1);
+    arg_types[0] = try TypeInfo.simple(alloc, "string");
+    try call_graph.calls.append(alloc, makeCallWithArgs(alloc, "P\\Client::go", "run", "/m/p/src/Client.php", "B\\Svc::run", 5, arg_types, 1));
+
+    var configs = try alloc.alloc(ProjectConfig, 2);
+    configs[0] = ProjectConfig.init(alloc, "/m/b");
+    configs[1] = ProjectConfig.init(alloc, "/m/p");
+
+    var tva = TypeViolationAnalyzer.init(alloc, &call_graph, configs, &sym_table);
+    const result = try tva.analyze();
+    try std.testing.expectEqual(@as(usize, 0), result.error_count);
+}
+
+test "ph2b: unresolved arg skipped" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    var sym_table = SymbolTable.init(alloc);
+    var bundle_class = ClassSymbol.init(alloc, "B\\Svc");
+    bundle_class.file_path = "/m/b/src/Svc.php";
+    try bundle_class.addMethod(makeTestMethod(alloc, "run", "B\\Svc", "/m/b/src/Svc.php", .public, &.{
+        .{ .name = "val", .type_info = try TypeInfo.simple(alloc, "string"), .has_default = false, .is_variadic = false, .is_by_reference = false, .is_promoted = false, .phpdoc_type = null },
+    }, null));
+    try sym_table.addClass(bundle_class);
+
+    var plugin_class = ClassSymbol.init(alloc, "P\\Client");
+    plugin_class.file_path = "/m/p/src/Client.php";
+    try sym_table.addClass(plugin_class);
+
+    var call_graph = ProjectCallGraph.init(alloc, &sym_table);
+    const arg_types = try alloc.alloc(?TypeInfo, 1);
+    arg_types[0] = null; // unresolved
+    try call_graph.calls.append(alloc, makeCallWithArgs(alloc, "P\\Client::go", "run", "/m/p/src/Client.php", "B\\Svc::run", 5, arg_types, 1));
+
+    var configs = try alloc.alloc(ProjectConfig, 2);
+    configs[0] = ProjectConfig.init(alloc, "/m/b");
+    configs[1] = ProjectConfig.init(alloc, "/m/p");
+
+    var tva = TypeViolationAnalyzer.init(alloc, &call_graph, configs, &sym_table);
+    const result = try tva.analyze();
+    try std.testing.expectEqual(@as(usize, 0), result.error_count);
+}
+
+test "ph2b: untyped param skipped" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    var sym_table = SymbolTable.init(alloc);
+    var bundle_class = ClassSymbol.init(alloc, "B\\Svc");
+    bundle_class.file_path = "/m/b/src/Svc.php";
+    try bundle_class.addMethod(makeTestMethod(alloc, "run", "B\\Svc", "/m/b/src/Svc.php", .public, &.{
+        .{ .name = "val", .type_info = null, .has_default = false, .is_variadic = false, .is_by_reference = false, .is_promoted = false, .phpdoc_type = null },
+    }, null));
+    try sym_table.addClass(bundle_class);
+
+    var plugin_class = ClassSymbol.init(alloc, "P\\Client");
+    plugin_class.file_path = "/m/p/src/Client.php";
+    try sym_table.addClass(plugin_class);
+
+    var call_graph = ProjectCallGraph.init(alloc, &sym_table);
+    const arg_types = try alloc.alloc(?TypeInfo, 1);
+    arg_types[0] = try TypeInfo.simple(alloc, "string");
+    try call_graph.calls.append(alloc, makeCallWithArgs(alloc, "P\\Client::go", "run", "/m/p/src/Client.php", "B\\Svc::run", 5, arg_types, 1));
+
+    var configs = try alloc.alloc(ProjectConfig, 2);
+    configs[0] = ProjectConfig.init(alloc, "/m/b");
+    configs[1] = ProjectConfig.init(alloc, "/m/p");
+
+    var tva = TypeViolationAnalyzer.init(alloc, &call_graph, configs, &sym_table);
+    const result = try tva.analyze();
+    try std.testing.expectEqual(@as(usize, 0), result.error_count);
+}
+
+test "ph2b: cross-project wrong type" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    var sym_table = SymbolTable.init(alloc);
+    var bundle_class = ClassSymbol.init(alloc, "B\\Svc");
+    bundle_class.file_path = "/m/b/src/Svc.php";
+    try bundle_class.addMethod(makeTestMethod(alloc, "run", "B\\Svc", "/m/b/src/Svc.php", .public, &.{
+        .{ .name = "count", .type_info = try TypeInfo.simple(alloc, "int"), .has_default = false, .is_variadic = false, .is_by_reference = false, .is_promoted = false, .phpdoc_type = null },
+    }, null));
+    try sym_table.addClass(bundle_class);
+
+    var plugin_class = ClassSymbol.init(alloc, "P\\Client");
+    plugin_class.file_path = "/m/p/src/Client.php";
+    try sym_table.addClass(plugin_class);
+
+    var call_graph = ProjectCallGraph.init(alloc, &sym_table);
+    const arg_types = try alloc.alloc(?TypeInfo, 1);
+    arg_types[0] = try TypeInfo.simple(alloc, "bool");
+    try call_graph.calls.append(alloc, makeCallWithArgs(alloc, "P\\Client::go", "run", "/m/p/src/Client.php", "B\\Svc::run", 5, arg_types, 1));
+
+    var configs = try alloc.alloc(ProjectConfig, 2);
+    configs[0] = ProjectConfig.init(alloc, "/m/b");
+    configs[1] = ProjectConfig.init(alloc, "/m/p");
+
+    var tva = TypeViolationAnalyzer.init(alloc, &call_graph, configs, &sym_table);
+    const result = try tva.analyze();
+    try std.testing.expect(result.error_count > 0);
+}
+
+test "ph2b: confidence scoring - filtered out" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    var sym_table = SymbolTable.init(alloc);
+    var bundle_class = ClassSymbol.init(alloc, "B\\Svc");
+    bundle_class.file_path = "/m/b/src/Svc.php";
+    try bundle_class.addMethod(makeTestMethod(alloc, "run", "B\\Svc", "/m/b/src/Svc.php", .public, &.{
+        .{ .name = "count", .type_info = try TypeInfo.simple(alloc, "int"), .has_default = false, .is_variadic = false, .is_by_reference = false, .is_promoted = false, .phpdoc_type = null },
+    }, null));
+    try sym_table.addClass(bundle_class);
+
+    var plugin_class = ClassSymbol.init(alloc, "P\\Client");
+    plugin_class.file_path = "/m/p/src/Client.php";
+    try sym_table.addClass(plugin_class);
+
+    var call_graph = ProjectCallGraph.init(alloc, &sym_table);
+    const arg_types = try alloc.alloc(?TypeInfo, 1);
+    arg_types[0] = try TypeInfo.simple(alloc, "string");
+    // Low confidence call
+    var low_call = makeCallWithArgs(alloc, "P\\Client::go", "run", "/m/p/src/Client.php", "B\\Svc::run", 5, arg_types, 1);
+    low_call.resolution_confidence = 0.3;
+    try call_graph.calls.append(alloc, low_call);
+
+    var configs = try alloc.alloc(ProjectConfig, 2);
+    configs[0] = ProjectConfig.init(alloc, "/m/b");
+    configs[1] = ProjectConfig.init(alloc, "/m/p");
+
+    var tva = TypeViolationAnalyzer.init(alloc, &call_graph, configs, &sym_table);
+    tva.min_confidence = 0.8; // Filter out the low-confidence call
+    const result = try tva.analyze();
+    // The arg type violation should be filtered out
+    try std.testing.expectEqual(@as(usize, 0), result.error_count);
+}
+
+test "ph2b: multiple violations in single call" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    var sym_table = SymbolTable.init(alloc);
+    var bundle_class = ClassSymbol.init(alloc, "B\\Svc");
+    bundle_class.file_path = "/m/b/src/Svc.php";
+    try bundle_class.addMethod(makeTestMethod(alloc, "run", "B\\Svc", "/m/b/src/Svc.php", .public, &.{
+        .{ .name = "name", .type_info = try TypeInfo.simple(alloc, "string"), .has_default = false, .is_variadic = false, .is_by_reference = false, .is_promoted = false, .phpdoc_type = null },
+        .{ .name = "count", .type_info = try TypeInfo.simple(alloc, "int"), .has_default = false, .is_variadic = false, .is_by_reference = false, .is_promoted = false, .phpdoc_type = null },
+    }, null));
+    try sym_table.addClass(bundle_class);
+
+    var plugin_class = ClassSymbol.init(alloc, "P\\Client");
+    plugin_class.file_path = "/m/p/src/Client.php";
+    try sym_table.addClass(plugin_class);
+
+    var call_graph = ProjectCallGraph.init(alloc, &sym_table);
+    const arg_types = try alloc.alloc(?TypeInfo, 2);
+    arg_types[0] = try TypeInfo.simple(alloc, "int"); // wrong: int instead of string
+    arg_types[1] = try TypeInfo.simple(alloc, "string"); // wrong: string instead of int
+    try call_graph.calls.append(alloc, makeCallWithArgs(alloc, "P\\Client::go", "run", "/m/p/src/Client.php", "B\\Svc::run", 5, arg_types, 2));
+
+    var configs = try alloc.alloc(ProjectConfig, 2);
+    configs[0] = ProjectConfig.init(alloc, "/m/b");
+    configs[1] = ProjectConfig.init(alloc, "/m/p");
+
+    var tva = TypeViolationAnalyzer.init(alloc, &call_graph, configs, &sym_table);
+    const result = try tva.analyze();
+    // Should have 2 type violations (one per wrong argument)
+    var type_violations: usize = 0;
+    for (result.violations) |v| {
+        if (v.kind == .wrong_argument_type) type_violations += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), type_violations);
 }

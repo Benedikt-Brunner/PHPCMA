@@ -260,6 +260,13 @@ pub const CallAnalyzer = struct {
             }
         }
 
+        // Resolve argument types
+        if (node.childByFieldName("arguments")) |args_node| {
+            const arg_info = try self.resolveArgumentTypes(args_node, source);
+            call.argument_types = arg_info.types;
+            call.argument_count = arg_info.count;
+        }
+
         try self.calls.append(self.allocator, call);
     }
 
@@ -333,6 +340,13 @@ pub const CallAnalyzer = struct {
             call.resolution_confidence = 0.5; // Known class but not in symbol table
         }
 
+        // Resolve argument types
+        if (node.childByFieldName("arguments")) |args_node| {
+            const arg_info = try self.resolveArgumentTypes(args_node, source);
+            call.argument_types = arg_info.types;
+            call.argument_count = arg_info.count;
+        }
+
         try self.calls.append(self.allocator, call);
     }
 
@@ -380,7 +394,53 @@ pub const CallAnalyzer = struct {
             call.resolution_method = .explicit_type;
         }
 
+        // Resolve argument types
+        if (node.childByFieldName("arguments")) |args_node| {
+            const arg_info = try self.resolveArgumentTypes(args_node, source);
+            call.argument_types = arg_info.types;
+            call.argument_count = arg_info.count;
+        }
+
         try self.calls.append(self.allocator, call);
+    }
+
+    // ========================================================================
+    // Argument Type Resolution
+    // ========================================================================
+
+    const ArgumentInfo = struct {
+        types: []const ?TypeInfo,
+        count: u32,
+    };
+
+    /// Resolve the types of all arguments in a call's argument list
+    fn resolveArgumentTypes(self: *CallAnalyzer, args_node: ts.Node, source: []const u8) !ArgumentInfo {
+        var arg_types: std.ArrayListUnmanaged(?TypeInfo) = .empty;
+        var i: u32 = 0;
+        while (i < args_node.namedChildCount()) : (i += 1) {
+            if (args_node.namedChild(i)) |arg_node| {
+                const arg_kind = arg_node.kind();
+                // Skip non-argument nodes (e.g., "argument" wrapper nodes)
+                if (std.mem.eql(u8, arg_kind, "argument")) {
+                    // The actual expression is the first named child of the argument node
+                    if (arg_node.namedChild(0)) |expr_node| {
+                        const type_info = try self.type_resolver.resolveExpressionType(expr_node, source);
+                        try arg_types.append(self.allocator, type_info);
+                    } else {
+                        try arg_types.append(self.allocator, null);
+                    }
+                } else {
+                    // Direct expression node (some tree-sitter versions)
+                    const type_info = try self.type_resolver.resolveExpressionType(arg_node, source);
+                    try arg_types.append(self.allocator, type_info);
+                }
+            }
+        }
+        const count: u32 = @intCast(arg_types.items.len);
+        return .{
+            .types = try arg_types.toOwnedSlice(self.allocator),
+            .count = count,
+        };
     }
 
     // ========================================================================
