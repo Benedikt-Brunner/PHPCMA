@@ -1060,7 +1060,7 @@ fn analyzeFile() !void {
     try call_graph.addCalls(&analyzer);
 
     // Output
-    const stdout: std.fs.File = .{ .handle = std.posix.STDOUT_FILENO };
+    const stdout: std.fs.File = std.fs.File.stdout();
 
     if (file_config.output.len > 0) {
         const out_file = try std.fs.cwd().createFile(file_config.output, .{});
@@ -1087,7 +1087,7 @@ fn analyzeProject() !void {
     defer _ = arena.deinit();
     const allocator = arena.allocator();
 
-    const stdout: std.fs.File = .{ .handle = std.posix.STDOUT_FILENO };
+    const stdout: std.fs.File = std.fs.File.stdout();
 
     // Pass 1: Parse composer.json and discover files
     if (project_config.verbose) {
@@ -1208,7 +1208,7 @@ fn analyzeCalledBefore() !void {
     defer _ = arena.deinit();
     const allocator = arena.allocator();
 
-    const stdout: std.fs.File = .{ .handle = std.posix.STDOUT_FILENO };
+    const stdout: std.fs.File = std.fs.File.stdout();
 
     // Validate that either -c or -g is provided (but not both or neither)
     const has_composer = called_before_config.composer.len > 0;
@@ -1430,7 +1430,7 @@ fn analyzeCheckBoundaries() !void {
     defer _ = arena.deinit();
     const allocator = arena.allocator();
 
-    const stdout: std.fs.File = .{ .handle = std.posix.STDOUT_FILENO };
+    const stdout: std.fs.File = std.fs.File.stdout();
 
     // Pass 1: Parse .phpcma.json and discover files
     if (check_boundaries_config.verbose) {
@@ -1566,7 +1566,7 @@ fn analyzeCheckTypes() !void {
     defer _ = arena.deinit();
     const allocator = arena.allocator();
 
-    const stdout: std.fs.File = .{ .handle = std.posix.STDOUT_FILENO };
+    const stdout: std.fs.File = std.fs.File.stdout();
 
     // Pass 1: Parse .phpcma.json and discover files
     if (check_types_config.verbose) {
@@ -1703,7 +1703,7 @@ fn analyzeReport() !void {
     defer _ = arena.deinit();
     const allocator = arena.allocator();
 
-    const stdout: std.fs.File = .{ .handle = std.posix.STDOUT_FILENO };
+    const stdout: std.fs.File = std.fs.File.stdout();
 
     // Validate input
     const has_composer = report_config.composer.len > 0;

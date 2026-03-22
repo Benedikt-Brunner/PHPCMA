@@ -275,6 +275,61 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_return_type_tests.step);
 
     // ----------------------------------------------------------------
+    // Distribution: Cross-compilation for all major platforms
+    // ----------------------------------------------------------------
+    const dist_step = b.step("dist", "Build ReleaseFast binaries for all major platforms");
+
+    const dist_targets: []const std.Target.Query = &.{
+        .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu },
+        .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu },
+        .{ .cpu_arch = .x86_64, .os_tag = .macos },
+        .{ .cpu_arch = .aarch64, .os_tag = .macos },
+        .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu },
+    };
+
+    for (dist_targets) |dist_target| {
+        const resolved = b.resolveTargetQuery(dist_target);
+
+        const dist_ts_dep = b.dependency("tree_sitter", .{
+            .target = resolved,
+            .optimize = .ReleaseFast,
+        });
+
+        const dist_cli_dep = b.dependency("cli", .{
+            .target = resolved,
+            .optimize = .ReleaseFast,
+        });
+
+        const dist_exe = b.addExecutable(.{
+            .name = "phpcma",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/main.zig"),
+                .target = resolved,
+                .optimize = .ReleaseFast,
+            }),
+        });
+
+        dist_exe.root_module.addImport("tree-sitter", dist_ts_dep.module("tree_sitter"));
+        dist_exe.root_module.addImport("cli", dist_cli_dep.module("cli"));
+        dist_exe.addIncludePath(php_src_root);
+        dist_exe.addCSourceFile(.{
+            .file = php_src_root.path(b, "parser.c"),
+            .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+        });
+        dist_exe.addCSourceFile(.{
+            .file = php_src_root.path(b, "scanner.c"),
+            .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+        });
+        dist_exe.linkLibC();
+
+        const target_triple = dist_target.zigTriple(b.allocator) catch @panic("OOM");
+        const install = b.addInstallArtifact(dist_exe, .{
+            .dest_dir = .{ .override = .{ .custom = b.fmt("dist/{s}", .{target_triple}) } },
+        });
+        dist_step.dependOn(&install.step);
+    }
+
+    // ----------------------------------------------------------------
     // Benchmarks (ReleaseFast)
     // ----------------------------------------------------------------
     const bench_step = b.step("bench", "Run performance benchmarks");
