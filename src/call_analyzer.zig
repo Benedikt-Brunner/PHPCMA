@@ -190,13 +190,26 @@ pub const CallAnalyzer = struct {
 
     fn enterFunction(self: *CallAnalyzer, node: ts.Node, source: []const u8) !void {
         // Get function name
+        var func_fqn: ?[]const u8 = null;
         if (node.childByFieldName("name")) |name_node| {
             const func_name = getNodeText(source, name_node);
             self.current_method = func_name;
+            func_fqn = self.type_resolver.file_context.resolveFQCN(func_name) catch null;
         }
 
         // Push new scope
-        _ = try self.type_resolver.pushScope();
+        const scope = try self.type_resolver.pushScope();
+
+        // Add parameter types to scope (like enterMethod)
+        if (func_fqn) |fqn| {
+            if (self.symbol_table.getFunction(fqn)) |func| {
+                for (func.parameters) |param| {
+                    const type_info = param.type_info orelse param.phpdoc_type orelse continue;
+                    const var_name = try std.fmt.allocPrint(self.allocator, "${s}", .{param.name});
+                    try scope.setVariableType(var_name, type_info);
+                }
+            }
+        }
 
         // Process function body
         if (node.childByFieldName("body")) |body| {
@@ -1936,7 +1949,7 @@ test "CallAnalyzer: function call with namespace" {
     const call = findCall(calls, "helper");
     try std.testing.expect(call != null);
     try std.testing.expect(call.?.call_type == .function);
-    try std.testing.expectEqualStrings("helper", call.?.caller_fqn);
+    try std.testing.expectEqualStrings("main", call.?.caller_fqn);
 }
 
 test "CallAnalyzer: chained call (return type chain)" {
