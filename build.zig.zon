@@ -37,8 +37,8 @@
             .hash = "tree_sitter-0.25.0-8heIf7iZAQDu5oiKLKffYhdvWpEuxc5OhsySDlkFLxFT",
         },
         .tree_sitter_php = .{
-            .url = "git+https://github.com/tree-sitter/tree-sitter-php#master",
-            .hash = "N-V-__8AANi85gCqBhAQTyoIc-a56b5UGTSCkIXvWQeewtUT",
+            .url = "git+https://github.com/tree-sitter/tree-sitter-php#3f2465c217d0a966d41e584b42d75522f2a3149e",
+            .hash = "N-V-__8AABgQ6QDtA30cV_6CED5zMGr5jsjUIpLkA0gSeCqS",
         },
         .cli = .{
             .url = "git+https://github.com/sam701/zig-cli?ref=zig-0.15#cb44aade25a3c1eddd8b6f990b50c2189442c1e2",
