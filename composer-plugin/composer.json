@@ -1,0 +1,33 @@
+{
+    "name": "pickware/phpcma",
+    "description": "Composer plugin that auto-installs the PHPCMA binary into vendor/bin",
+    "type": "composer-plugin",
+    "license": "MIT",
+    "require": {
+        "php": "^8.1",
+        "composer-plugin-api": "^2.0"
+    },
+    "require-dev": {
+        "composer/composer": "^2.0",
+        "phpunit/phpunit": "^10.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Pickware\\Phpcma\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Pickware\\Phpcma\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "class": "Pickware\\Phpcma\\PhpcmaPlugin"
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "scripts": {
+        "test": "phpunit --colors=always"
+    }
+}

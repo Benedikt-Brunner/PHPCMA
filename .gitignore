@@ -1,3 +1,6 @@
 zig-out/
 .zig-cache/
 .beads/
+composer-plugin/vendor/
+composer-plugin/composer.lock
+composer-plugin/.phpunit.cache/
