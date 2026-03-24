@@ -430,6 +430,14 @@ pub const TypeViolationAnalyzer = struct {
         // mixed accepts anything
         if (param_type.kind == .mixed or std.mem.eql(u8, param_type.base_type, "mixed")) return true;
 
+        // Defense-in-depth: skip compatibility check if either side still
+        // carries an unconcretized self/static/parent (should have been
+        // resolved upstream, but guard against it here to avoid false positives)
+        if (arg_type.kind == .self_type or arg_type.kind == .static_type or arg_type.kind == .parent_type) return true;
+        if (param_type.kind == .self_type or param_type.kind == .static_type or param_type.kind == .parent_type) return true;
+        if (std.mem.eql(u8, arg_type.base_type, "self") or std.mem.eql(u8, arg_type.base_type, "static") or std.mem.eql(u8, arg_type.base_type, "parent")) return true;
+        if (std.mem.eql(u8, param_type.base_type, "self") or std.mem.eql(u8, param_type.base_type, "static") or std.mem.eql(u8, param_type.base_type, "parent")) return true;
+
         // Same base type
         if (std.mem.eql(u8, arg_type.base_type, param_type.base_type)) return true;
 
