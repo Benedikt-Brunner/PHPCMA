@@ -28,6 +28,9 @@ pub const UnifiedReport = struct {
     // Confidence distribution
     confidence: ConfidenceDistribution,
 
+    // Dead code analysis
+    dead_code: DeadCodeSection,
+
     // Violations from all phases
     violations: std.ArrayListUnmanaged(Violation),
 
@@ -38,6 +41,7 @@ pub const UnifiedReport = struct {
             .type_checks = TypeCheckSection.init(),
             .cross_project = CrossProjectSection.init(),
             .confidence = ConfidenceDistribution.init(),
+            .dead_code = DeadCodeSection.init(),
             .violations = .empty,
         };
     }
@@ -45,6 +49,7 @@ pub const UnifiedReport = struct {
     pub fn deinit(self: *UnifiedReport) void {
         self.violations.deinit(self.allocator);
         self.cross_project.boundary_calls.deinit(self.allocator);
+        self.dead_code.top_dead_candidates.deinit(self.allocator);
     }
 
     /// Populate the report from a symbol table and call graph
@@ -183,6 +188,34 @@ pub const UnifiedReport = struct {
             try writer.print("  API health:       {s}\n\n", .{self.cross_project.apiHealthLabel()});
         }
 
+        // Dead code section
+        if (self.dead_code.dead_classes > 0 or self.dead_code.dead_interfaces > 0 or
+            self.dead_code.dead_traits > 0 or self.dead_code.dead_functions > 0 or
+            self.dead_code.dead_methods > 0 or self.dead_code.dead_properties > 0)
+        {
+            try writer.writeAll("── Dead Code ────────────────────────────────────────────────────────────────\n\n");
+            try writer.print("  Dead classes:     {d}\n", .{self.dead_code.dead_classes});
+            try writer.print("  Dead interfaces:  {d}\n", .{self.dead_code.dead_interfaces});
+            try writer.print("  Dead traits:      {d}\n", .{self.dead_code.dead_traits});
+            try writer.print("  Dead functions:   {d}\n", .{self.dead_code.dead_functions});
+            try writer.print("  Dead methods:     {d} ({d} private, {d} public)\n", .{
+                self.dead_code.dead_methods,
+                self.dead_code.dead_methods_private,
+                self.dead_code.dead_methods_public,
+            });
+            try writer.print("  Dead properties:  {d}\n\n", .{self.dead_code.dead_properties});
+
+            if (self.dead_code.kept_alive_by_unresolved > 0 or
+                self.dead_code.kept_alive_by_string > 0 or
+                self.dead_code.kept_alive_by_structure > 0)
+            {
+                try writer.writeAll("  Conservatively kept alive:\n");
+                try writer.print("    By unresolved calls:  {d} symbols\n", .{self.dead_code.kept_alive_by_unresolved});
+                try writer.print("    By string/reflection: {d} symbols\n", .{self.dead_code.kept_alive_by_string});
+                try writer.print("    By structural deps:   {d} symbols\n\n", .{self.dead_code.kept_alive_by_structure});
+            }
+        }
+
         // Confidence distribution
         try writer.writeAll("── Confidence Distribution ──────────────────────────────────────────────────\n\n");
         try writer.print("  Exact:      {d:.1}% ({d} calls)\n", .{ self.confidence.exact_pct, self.confidence.exact_count });
@@ -248,6 +281,33 @@ pub const UnifiedReport = struct {
         try self.writeCheckJson(writer, "property_types", self.type_checks.property_types, true);
         try self.writeCheckJson(writer, "return_types", self.type_checks.return_types, true);
         try self.writeCheckJson(writer, "null_safety", self.type_checks.null_safety, false);
+        try writer.writeAll("  },\n");
+
+        // Dead code
+        try writer.writeAll("  \"dead_code\": {\n");
+        try writer.print("    \"dead_classes\": {d},\n", .{self.dead_code.dead_classes});
+        try writer.print("    \"dead_interfaces\": {d},\n", .{self.dead_code.dead_interfaces});
+        try writer.print("    \"dead_traits\": {d},\n", .{self.dead_code.dead_traits});
+        try writer.print("    \"dead_functions\": {d},\n", .{self.dead_code.dead_functions});
+        try writer.print("    \"dead_methods\": {d},\n", .{self.dead_code.dead_methods});
+        try writer.print("    \"dead_properties\": {d},\n", .{self.dead_code.dead_properties});
+        try writer.print("    \"kept_alive_by_unresolved\": {d},\n", .{self.dead_code.kept_alive_by_unresolved});
+        try writer.print("    \"kept_alive_by_string\": {d},\n", .{self.dead_code.kept_alive_by_string});
+        try writer.print("    \"kept_alive_by_structure\": {d},\n", .{self.dead_code.kept_alive_by_structure});
+        try writer.writeAll("    \"top_dead_candidates\": [");
+        for (self.dead_code.top_dead_candidates.items, 0..) |c, i| {
+            if (i > 0) try writer.writeAll(",");
+            try writer.writeAll("\n      {");
+            try writer.print("\"fqn\": \"{s}\", ", .{c.fqn});
+            try writer.print("\"kind\": \"{s}\", ", .{c.kind});
+            try writer.print("\"file\": \"{s}\", ", .{c.file_path});
+            try writer.print("\"line\": {d}", .{c.line});
+            try writer.writeAll("}");
+        }
+        if (self.dead_code.top_dead_candidates.items.len > 0) {
+            try writer.writeAll("\n    ");
+        }
+        try writer.writeAll("]\n");
         try writer.writeAll("  },\n");
 
         // Confidence distribution
@@ -562,6 +622,45 @@ pub const ConfidenceDistribution = struct {
             .unresolved_count = 0,
         };
     }
+};
+
+pub const DeadCodeSection = struct {
+    dead_classes: usize,
+    dead_interfaces: usize,
+    dead_traits: usize,
+    dead_functions: usize,
+    dead_methods: usize,
+    dead_properties: usize,
+    dead_methods_private: usize,
+    dead_methods_public: usize,
+    kept_alive_by_unresolved: usize,
+    kept_alive_by_string: usize,
+    kept_alive_by_structure: usize,
+    top_dead_candidates: std.ArrayListUnmanaged(DeadCandidate),
+
+    pub fn init() DeadCodeSection {
+        return .{
+            .dead_classes = 0,
+            .dead_interfaces = 0,
+            .dead_traits = 0,
+            .dead_functions = 0,
+            .dead_methods = 0,
+            .dead_properties = 0,
+            .dead_methods_private = 0,
+            .dead_methods_public = 0,
+            .kept_alive_by_unresolved = 0,
+            .kept_alive_by_string = 0,
+            .kept_alive_by_structure = 0,
+            .top_dead_candidates = .empty,
+        };
+    }
+};
+
+pub const DeadCandidate = struct {
+    fqn: []const u8,
+    kind: []const u8,
+    file_path: []const u8,
+    line: u32,
 };
 
 pub const Violation = struct {
@@ -1449,4 +1548,96 @@ test "null safety regression: text output shows null safety row" {
 
     // Verify violation message appears in violations section
     try std.testing.expect(std.mem.indexOf(u8, output, "Possibly null on $x") != null);
+}
+
+test "dead code section: JSON output includes dead_code counts and candidates" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Svc {
+        \\    public function run(): void {}
+        \\}
+    ;
+
+    const result = try buildTestGraph(alloc, source);
+
+    var r = UnifiedReport.init(alloc);
+    defer r.deinit();
+    r.populate(result[0], result[1]);
+
+    // Simulate dead code findings
+    r.dead_code.dead_classes = 3;
+    r.dead_code.dead_methods = 10;
+    r.dead_code.dead_methods_private = 8;
+    r.dead_code.dead_methods_public = 2;
+    r.dead_code.kept_alive_by_unresolved = 42;
+    try r.dead_code.top_dead_candidates.append(alloc, .{
+        .fqn = "App\\OldService",
+        .kind = "class",
+        .file_path = "src/OldService.php",
+        .line = 15,
+    });
+
+    const pipe = try std.posix.pipe();
+    const write_file = std.fs.File{ .handle = pipe[1] };
+    const read_file = std.fs.File{ .handle = pipe[0] };
+    defer read_file.close();
+
+    try r.toJson(write_file);
+    write_file.close();
+
+    var output_buf: [8192]u8 = undefined;
+    const n = try read_file.readAll(&output_buf);
+    const output = output_buf[0..n];
+
+    // Verify dead_code section present
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"dead_code\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"dead_classes\": 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"dead_methods\": 10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"kept_alive_by_unresolved\": 42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "App\\OldService") != null);
+}
+
+test "dead code section: text output includes dead code header" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Svc {
+        \\    public function run(): void {}
+        \\}
+    ;
+
+    const result = try buildTestGraph(alloc, source);
+
+    var r = UnifiedReport.init(alloc);
+    defer r.deinit();
+    r.populate(result[0], result[1]);
+
+    // Set dead code counts
+    r.dead_code.dead_classes = 5;
+    r.dead_code.dead_functions = 3;
+
+    const pipe = try std.posix.pipe();
+    const write_file = std.fs.File{ .handle = pipe[1] };
+    const read_file = std.fs.File{ .handle = pipe[0] };
+    defer read_file.close();
+
+    try r.toText(write_file);
+    write_file.close();
+
+    var output_buf: [8192]u8 = undefined;
+    const n = try read_file.readAll(&output_buf);
+    const output = output_buf[0..n];
+
+    // Verify dead code section appears in text output
+    try std.testing.expect(std.mem.indexOf(u8, output, "Dead Code") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Dead classes:") != null);
 }
