@@ -19,6 +19,9 @@ const parallel = @import("parallel.zig");
 // Report module
 const report = @import("report.zig");
 
+// Framework stubs
+const framework_stubs = @import("framework_stubs.zig");
+
 // Plugin imports
 const plugin_interface = @import("plugins/plugin_interface.zig");
 const plugin_registry = @import("plugins/plugin_registry.zig");
@@ -1226,6 +1229,9 @@ fn analyzeProject() !void {
         try stdout.writeAll("\n");
     }
 
+    // Register framework API stubs (Shopware/Symfony/Doctrine)
+    try framework_stubs.registerFrameworkStubs(allocator, &sym_table);
+
     // Pass 3: Resolve inheritance
     if (project_config.verbose) {
         try stdout.writeAll("Pass 3: Resolving inheritance...\n");
@@ -1392,6 +1398,9 @@ fn analyzeCalledBefore() !void {
         &file_sources,
         &collectSymbolsFromSource,
     );
+
+    // Register framework API stubs (Shopware/Symfony/Doctrine)
+    try framework_stubs.registerFrameworkStubs(allocator, &sym_table);
 
     // Pass 3: Resolve inheritance
     if (called_before_config.verbose) {
@@ -1589,6 +1598,9 @@ fn analyzeCheckBoundaries() !void {
         try stdout.writeAll("\n");
     }
 
+    // Register framework API stubs (Shopware/Symfony/Doctrine)
+    try framework_stubs.registerFrameworkStubs(allocator, &sym_table);
+
     // Pass 3: Resolve inheritance
     if (check_boundaries_config.verbose) {
         try stdout.writeAll("Pass 3: Resolving inheritance...\n");
@@ -1724,6 +1736,9 @@ fn analyzeCheckTypes() !void {
         try sym_table.printStats(stdout);
         try stdout.writeAll("\n");
     }
+
+    // Register framework API stubs (Shopware/Symfony/Doctrine)
+    try framework_stubs.registerFrameworkStubs(allocator, &sym_table);
 
     // Pass 3: Resolve inheritance
     if (check_types_config.verbose) {
@@ -1895,6 +1910,9 @@ fn analyzeReport() !void {
         &file_sources,
         &collectSymbolsFromSource,
     );
+
+    // Register framework API stubs (Shopware/Symfony/Doctrine)
+    try framework_stubs.registerFrameworkStubs(allocator, &sym_table);
 
     // Pass 3: Resolve inheritance
     if (report_config.verbose) {
