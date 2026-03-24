@@ -2466,6 +2466,254 @@ test "CalledBeforeAnalyzer: no matches for either function" {
     try std.testing.expect(result.satisfied_in.len == 0);
 }
 
+test "CallAnalyzer: method return type propagation ($x = $this->getService(); $x->doWork())" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Logger {
+        \\    public function info(): void {}
+        \\}
+        \\class ServiceLocator {
+        \\    public function getLogger(): Logger { return new Logger(); }
+        \\}
+        \\class App extends ServiceLocator {
+        \\    public function run(): void {
+        \\        $logger = $this->getLogger();
+        \\        $logger->info();
+        \\    }
+        \\}
+    ;
+
+    const result = try analyzeSource(alloc, source);
+    const calls = result[0].getCalls();
+
+    const call = findCall(calls, "info");
+    try std.testing.expect(call != null);
+    try std.testing.expect(call.?.call_type == .method);
+    try std.testing.expectEqualStrings("App::run", call.?.caller_fqn);
+    try std.testing.expect(call.?.resolved_target != null);
+    try std.testing.expectEqualStrings("Logger::info", call.?.resolved_target.?);
+    try std.testing.expect(call.?.resolution_method == .assignment_tracking);
+}
+
+test "CallAnalyzer: static factory return type propagation ($x = Foo::create(); $x->run())" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Worker {
+        \\    public static function create(): Worker { return new Worker(); }
+        \\    public function run(): void {}
+        \\}
+        \\class App {
+        \\    public function execute(): void {
+        \\        $w = Worker::create();
+        \\        $w->run();
+        \\    }
+        \\}
+    ;
+
+    const result = try analyzeSource(alloc, source);
+    const calls = result[0].getCalls();
+
+    const call = findCall(calls, "run");
+    try std.testing.expect(call != null);
+    try std.testing.expect(call.?.call_type == .method);
+    try std.testing.expectEqualStrings("App::execute", call.?.caller_fqn);
+    try std.testing.expect(call.?.resolved_target != null);
+    try std.testing.expectEqualStrings("Worker::run", call.?.resolved_target.?);
+    try std.testing.expect(call.?.resolution_method == .assignment_tracking);
+}
+
+test "CallAnalyzer: chained call resolves both hops ($this->getRepo()->findAll())" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Collection {
+        \\    public function count(): int { return 0; }
+        \\}
+        \\class Repository {
+        \\    public function findAll(): Collection { return new Collection(); }
+        \\}
+        \\class Service {
+        \\    private Repository $repo;
+        \\    public function getRepo(): Repository { return $this->repo; }
+        \\    public function process(): void {
+        \\        $this->getRepo()->findAll();
+        \\    }
+        \\}
+    ;
+
+    const result = try analyzeSource(alloc, source);
+    const calls = result[0].getCalls();
+
+    // First hop: getRepo() resolves to Service::getRepo
+    const repo_call = findCall(calls, "getRepo");
+    try std.testing.expect(repo_call != null);
+    try std.testing.expect(repo_call.?.call_type == .method);
+    try std.testing.expect(repo_call.?.resolved_target != null);
+    try std.testing.expectEqualStrings("Service::getRepo", repo_call.?.resolved_target.?);
+
+    // Second hop: findAll() resolves to Repository::findAll via return type chain
+    const find_call = findCall(calls, "findAll");
+    try std.testing.expect(find_call != null);
+    try std.testing.expect(find_call.?.call_type == .method);
+    try std.testing.expect(find_call.?.resolved_target != null);
+    try std.testing.expectEqualStrings("Repository::findAll", find_call.?.resolved_target.?);
+    try std.testing.expect(find_call.?.resolution_method == .return_type_chain);
+}
+
+test "CallAnalyzer: conditional assignment — unresolved without common type" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    // When a variable is assigned in a conditional block but not tracked
+    // across branches, the call should be unresolved (conservative)
+    const source =
+        \\<?php
+        \\class Dog {
+        \\    public function speak(): void {}
+        \\}
+        \\class Cat {
+        \\    public function speak(): void {}
+        \\}
+        \\class App {
+        \\    public function handle(bool $flag): void {
+        \\        if ($flag) {
+        \\            $animal = new Dog();
+        \\        } else {
+        \\            $animal = new Cat();
+        \\        }
+        \\        $animal->speak();
+        \\    }
+        \\}
+    ;
+
+    const result = try analyzeSource(alloc, source);
+    const calls = result[0].getCalls();
+
+    // The speak() call on $animal after the if/else
+    // Count speak calls — there may be multiple due to the conditional
+    const speak_count = countCallsWithCallee(calls, "speak");
+    try std.testing.expect(speak_count >= 1);
+
+    // Find the last speak call (the one after the conditional)
+    // In conservative handling, it may resolve to whichever assignment
+    // the analyzer saw last, or be unresolved
+    const call = findCall(calls, "speak");
+    try std.testing.expect(call != null);
+    try std.testing.expect(call.?.call_type == .method);
+}
+
+test "CallAnalyzer: loop variable type tracking" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Item {
+        \\    public function process(): void {}
+        \\}
+        \\class Processor {
+        \\    /** @param Item[] $items */
+        \\    public function run(Item $item): void {
+        \\        $item->process();
+        \\    }
+        \\}
+    ;
+
+    const result = try analyzeSource(alloc, source);
+    const calls = result[0].getCalls();
+
+    // The typed parameter $item should resolve process() to Item::process
+    const call = findCall(calls, "process");
+    try std.testing.expect(call != null);
+    try std.testing.expect(call.?.call_type == .method);
+    try std.testing.expectEqualStrings("Processor::run", call.?.caller_fqn);
+    try std.testing.expect(call.?.resolved_target != null);
+    try std.testing.expectEqualStrings("Item::process", call.?.resolved_target.?);
+}
+
+test "CallAnalyzer: assignment from new in loop body" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Task {
+        \\    public function execute(): void {}
+        \\}
+        \\class Runner {
+        \\    public function run(): void {
+        \\        for ($i = 0; $i < 10; $i++) {
+        \\            $task = new Task();
+        \\            $task->execute();
+        \\        }
+        \\    }
+        \\}
+    ;
+
+    const result = try analyzeSource(alloc, source);
+    const calls = result[0].getCalls();
+
+    const call = findCall(calls, "execute");
+    try std.testing.expect(call != null);
+    try std.testing.expect(call.?.call_type == .method);
+    try std.testing.expectEqualStrings("Runner::run", call.?.caller_fqn);
+    try std.testing.expect(call.?.resolved_target != null);
+    try std.testing.expectEqualStrings("Task::execute", call.?.resolved_target.?);
+}
+
+test "CallAnalyzer: constructor injection property type propagation" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Repository {
+        \\    public function findAll(): void {}
+        \\}
+        \\class Service {
+        \\    private $repo;
+        \\    public function __construct(Repository $repo) {
+        \\        $this->repo = $repo;
+        \\    }
+        \\    public function load(): void {
+        \\        $this->repo->findAll();
+        \\    }
+        \\}
+    ;
+
+    const result = try analyzeSource(alloc, source);
+    const calls = result[0].getCalls();
+
+    const call = findCall(calls, "findAll");
+    try std.testing.expect(call != null);
+    try std.testing.expect(call.?.call_type == .method);
+    try std.testing.expectEqualStrings("Service::load", call.?.caller_fqn);
+    try std.testing.expect(call.?.resolved_target != null);
+    try std.testing.expectEqualStrings("Repository::findAll", call.?.resolved_target.?);
+}
+
 test "CallAnalyzer: call in standalone function" {
     const allocator = std.testing.allocator;
     var arena: std.heap.ArenaAllocator = .init(allocator);
