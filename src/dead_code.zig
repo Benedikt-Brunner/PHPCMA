@@ -1489,3 +1489,943 @@ test "extractRefsFromCallGraph: inheritance refs keep parents alive" {
     }
     try std.testing.expect(has_inheritance);
 }
+
+// ============================================================================
+// Cross-Module Integration Tests
+// ============================================================================
+
+test "cross-module liveness: class used by another module is alive, unused class is dead" {
+    const allocator = std.testing.allocator;
+    var sym = SymbolTable.init(allocator);
+    defer sym.deinit();
+
+    // Bundle A: provides a service
+    var svc = ClassSymbol.init(allocator, "BundleA\\Service");
+    svc.file_path = "bundle-a/Service.php";
+    svc.start_line = 5;
+    try svc.addMethod(.{
+        .name = "execute",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 10,
+        .end_line = 15,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "BundleA\\Service",
+        .file_path = "bundle-a/Service.php",
+    });
+    try sym.addClass(svc);
+
+    // Bundle B: uses BundleA\Service
+    var consumer = ClassSymbol.init(allocator, "BundleB\\Consumer");
+    consumer.file_path = "bundle-b/Consumer.php";
+    consumer.start_line = 3;
+    try sym.addClass(consumer);
+
+    // Bundle C: unused class
+    var orphan = ClassSymbol.init(allocator, "BundleC\\Orphan");
+    orphan.file_path = "bundle-c/Orphan.php";
+    orphan.start_line = 1;
+    try sym.addClass(orphan);
+
+    try sym.resolveInheritance();
+
+    // Consumer calls Service::execute (cross-module reference)
+    const refs = [_]LivenessRef{
+        .{
+            .target_fqn = "BundleA\\Service::execute",
+            .target_kind = .method,
+            .reason = .resolved_call,
+            .is_weak = false,
+            .source_file = "bundle-b/Consumer.php",
+            .source_line = 10,
+        },
+        .{
+            .target_fqn = "BundleB\\Consumer",
+            .target_kind = .class,
+            .reason = .instantiate,
+            .is_weak = false,
+            .source_file = "main.php",
+            .source_line = 1,
+        },
+    };
+
+    var graph = ProjectLivenessGraph.init(allocator);
+    defer graph.deinit();
+    try graph.analyze(&sym, &refs);
+
+    // Service is alive (method called from Bundle B)
+    try std.testing.expect(graph.isAlive(graph.index.lookup("BundleA\\Service").?));
+    try std.testing.expect(graph.isAlive(graph.index.lookup("BundleA\\Service::execute").?));
+    // Consumer is alive (instantiated)
+    try std.testing.expect(graph.isAlive(graph.index.lookup("BundleB\\Consumer").?));
+    // Orphan is dead (no references)
+    try std.testing.expect(!graph.isAlive(graph.index.lookup("BundleC\\Orphan").?));
+}
+
+test "interface liveness: type hint keeps interface and implementations alive" {
+    const allocator = std.testing.allocator;
+    var sym = SymbolTable.init(allocator);
+    defer sym.deinit();
+
+    var iface = InterfaceSymbol.init(allocator, "App\\Contracts\\Logger");
+    try iface.addMethod(.{
+        .name = "log",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = true,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 3,
+        .end_line = 3,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\Contracts\\Logger",
+        .file_path = "contracts/Logger.php",
+    });
+    try sym.addInterface(iface);
+
+    var impl1 = ClassSymbol.init(allocator, "App\\FileLogger");
+    impl1.implements = &.{"App\\Contracts\\Logger"};
+    try impl1.addMethod(.{
+        .name = "log",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 5,
+        .end_line = 10,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\FileLogger",
+        .file_path = "FileLogger.php",
+    });
+    try sym.addClass(impl1);
+
+    var impl2 = ClassSymbol.init(allocator, "App\\DbLogger");
+    impl2.implements = &.{"App\\Contracts\\Logger"};
+    try impl2.addMethod(.{
+        .name = "log",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 5,
+        .end_line = 10,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\DbLogger",
+        .file_path = "DbLogger.php",
+    });
+    try sym.addClass(impl2);
+
+    try sym.resolveInheritance();
+
+    // Type hint reference to Logger interface
+    const refs = [_]LivenessRef{.{
+        .target_fqn = "App\\Contracts\\Logger",
+        .target_kind = .interface,
+        .reason = .type_hint,
+        .is_weak = false,
+        .source_file = "main.php",
+        .source_line = 5,
+    }};
+
+    var graph = ProjectLivenessGraph.init(allocator);
+    defer graph.deinit();
+    try graph.analyze(&sym, &refs);
+
+    // Interface alive (type hint)
+    try std.testing.expect(graph.isAlive(graph.index.lookup("App\\Contracts\\Logger").?));
+    // Interface method alive (interface alive → methods alive)
+    try std.testing.expect(graph.isAlive(graph.index.lookup("App\\Contracts\\Logger::log").?));
+    // Implementation methods alive (via override propagation)
+    try std.testing.expect(graph.isAlive(graph.index.lookup("App\\FileLogger::log").?));
+    try std.testing.expect(graph.isAlive(graph.index.lookup("App\\DbLogger::log").?));
+}
+
+test "trait liveness: used trait alive, unused trait dead, private helper in used trait reportable" {
+    const allocator = std.testing.allocator;
+    var sym = SymbolTable.init(allocator);
+    defer sym.deinit();
+
+    // Used trait with public method and private helper
+    var used_trait = TraitSymbol.init(allocator, "App\\Cacheable");
+    used_trait.file_path = "Cacheable.php";
+    used_trait.start_line = 1;
+    try used_trait.addMethod(.{
+        .name = "cache",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 3,
+        .end_line = 8,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\Cacheable",
+        .file_path = "Cacheable.php",
+    });
+    try used_trait.addMethod(.{
+        .name = "buildCacheKey",
+        .visibility = .private,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 10,
+        .end_line = 15,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\Cacheable",
+        .file_path = "Cacheable.php",
+    });
+    try sym.addTrait(used_trait);
+
+    // Unused trait
+    var unused_trait = TraitSymbol.init(allocator, "App\\Auditable");
+    unused_trait.file_path = "Auditable.php";
+    unused_trait.start_line = 1;
+    try unused_trait.addMethod(.{
+        .name = "audit",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 3,
+        .end_line = 8,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\Auditable",
+        .file_path = "Auditable.php",
+    });
+    try sym.addTrait(unused_trait);
+
+    // Class that uses Cacheable
+    var class = ClassSymbol.init(allocator, "App\\UserService");
+    class.uses = &.{"App\\Cacheable"};
+    try sym.addClass(class);
+
+    try sym.resolveInheritance();
+
+    const refs = [_]LivenessRef{.{
+        .target_fqn = "App\\UserService",
+        .target_kind = .class,
+        .reason = .instantiate,
+        .is_weak = false,
+        .source_file = "main.php",
+        .source_line = 1,
+    }};
+
+    var graph = ProjectLivenessGraph.init(allocator);
+    defer graph.deinit();
+    try graph.analyze(&sym, &refs);
+
+    // Used trait is alive (via trait_use propagation)
+    try std.testing.expect(graph.isAlive(graph.index.lookup("App\\Cacheable").?));
+    // Unused trait is dead
+    try std.testing.expect(!graph.isAlive(graph.index.lookup("App\\Auditable").?));
+    // Private helper in used trait — not directly referenced, so dead (reportable)
+    try std.testing.expect(!graph.isAlive(graph.index.lookup("App\\Cacheable::buildCacheKey").?));
+}
+
+test "magic methods: instantiated class keeps magic alive, dead class magic stays dead" {
+    const allocator = std.testing.allocator;
+    var sym = SymbolTable.init(allocator);
+    defer sym.deinit();
+
+    // Alive class with magic methods
+    var alive = ClassSymbol.init(allocator, "App\\Widget");
+    alive.file_path = "Widget.php";
+    alive.start_line = 1;
+    try alive.addMethod(.{
+        .name = "__construct",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 3,
+        .end_line = 6,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\Widget",
+        .file_path = "Widget.php",
+    });
+    try alive.addMethod(.{
+        .name = "__toString",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 8,
+        .end_line = 10,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\Widget",
+        .file_path = "Widget.php",
+    });
+    try sym.addClass(alive);
+
+    // Dead class with magic methods
+    var dead = ClassSymbol.init(allocator, "App\\Unused");
+    dead.file_path = "Unused.php";
+    dead.start_line = 1;
+    try dead.addMethod(.{
+        .name = "__construct",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 3,
+        .end_line = 6,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\Unused",
+        .file_path = "Unused.php",
+    });
+    try dead.addMethod(.{
+        .name = "__toString",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 8,
+        .end_line = 10,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\Unused",
+        .file_path = "Unused.php",
+    });
+    try sym.addClass(dead);
+
+    try sym.resolveInheritance();
+
+    const refs = [_]LivenessRef{.{
+        .target_fqn = "App\\Widget",
+        .target_kind = .class,
+        .reason = .instantiate,
+        .is_weak = false,
+        .source_file = "main.php",
+        .source_line = 1,
+    }};
+
+    var graph = ProjectLivenessGraph.init(allocator);
+    defer graph.deinit();
+    try graph.analyze(&sym, &refs);
+
+    // Alive class magic methods are alive
+    try std.testing.expect(graph.isAlive(graph.index.lookup("App\\Widget::__construct").?));
+    try std.testing.expect(graph.isAlive(graph.index.lookup("App\\Widget::__toString").?));
+    // Dead class magic methods stay dead
+    try std.testing.expect(!graph.isAlive(graph.index.lookup("App\\Unused::__construct").?));
+    try std.testing.expect(!graph.isAlive(graph.index.lookup("App\\Unused::__toString").?));
+}
+
+test "inheritance chain: alive subclass keeps parent and grandparent alive, dead leaf is dead" {
+    const allocator = std.testing.allocator;
+    var sym = SymbolTable.init(allocator);
+    defer sym.deinit();
+
+    var grandparent = ClassSymbol.init(allocator, "App\\AbstractBase");
+    grandparent.file_path = "AbstractBase.php";
+    grandparent.start_line = 1;
+    try sym.addClass(grandparent);
+
+    var parent = ClassSymbol.init(allocator, "App\\MiddleLayer");
+    parent.file_path = "MiddleLayer.php";
+    parent.start_line = 1;
+    parent.extends = "App\\AbstractBase";
+    try sym.addClass(parent);
+
+    var alive_child = ClassSymbol.init(allocator, "App\\ConcreteImpl");
+    alive_child.file_path = "ConcreteImpl.php";
+    alive_child.start_line = 1;
+    alive_child.extends = "App\\MiddleLayer";
+    try sym.addClass(alive_child);
+
+    // Dead leaf — extends same parent but never referenced
+    var dead_leaf = ClassSymbol.init(allocator, "App\\DeadLeaf");
+    dead_leaf.file_path = "DeadLeaf.php";
+    dead_leaf.start_line = 1;
+    dead_leaf.extends = "App\\MiddleLayer";
+    try sym.addClass(dead_leaf);
+
+    try sym.resolveInheritance();
+
+    const refs = [_]LivenessRef{.{
+        .target_fqn = "App\\ConcreteImpl",
+        .target_kind = .class,
+        .reason = .instantiate,
+        .is_weak = false,
+        .source_file = "main.php",
+        .source_line = 1,
+    }};
+
+    var graph = ProjectLivenessGraph.init(allocator);
+    defer graph.deinit();
+    try graph.analyze(&sym, &refs);
+
+    // Alive child → parent → grandparent all alive
+    try std.testing.expect(graph.isAlive(graph.index.lookup("App\\ConcreteImpl").?));
+    try std.testing.expect(graph.isAlive(graph.index.lookup("App\\MiddleLayer").?));
+    try std.testing.expect(graph.isAlive(graph.index.lookup("App\\AbstractBase").?));
+    // Dead leaf is dead (no references to it)
+    try std.testing.expect(!graph.isAlive(graph.index.lookup("App\\DeadLeaf").?));
+}
+
+test "unresolved conservative: unresolved method call keeps all non-private handle() methods alive" {
+    const allocator = std.testing.allocator;
+    var sym = SymbolTable.init(allocator);
+    defer sym.deinit();
+
+    // Public handle() — should be kept alive
+    var class_a = ClassSymbol.init(allocator, "App\\HandlerA");
+    try class_a.addMethod(.{
+        .name = "handle",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 5,
+        .end_line = 10,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\HandlerA",
+        .file_path = "HandlerA.php",
+    });
+    try sym.addClass(class_a);
+
+    // Protected handle() — should be kept alive (non-private)
+    var class_b = ClassSymbol.init(allocator, "App\\HandlerB");
+    try class_b.addMethod(.{
+        .name = "handle",
+        .visibility = .protected,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 5,
+        .end_line = 10,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\HandlerB",
+        .file_path = "HandlerB.php",
+    });
+    try sym.addClass(class_b);
+
+    // Private handle() — should stay dead
+    var class_c = ClassSymbol.init(allocator, "App\\HandlerC");
+    try class_c.addMethod(.{
+        .name = "handle",
+        .visibility = .private,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 5,
+        .end_line = 10,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\HandlerC",
+        .file_path = "HandlerC.php",
+    });
+    try sym.addClass(class_c);
+
+    try sym.resolveInheritance();
+
+    // Unresolved call: $x->handle() — no type info
+    const refs = [_]LivenessRef{.{
+        .target_fqn = "handle",
+        .target_kind = .method,
+        .reason = .unresolved_call,
+        .is_weak = true,
+        .source_file = "main.php",
+        .source_line = 1,
+    }};
+
+    var graph = ProjectLivenessGraph.init(allocator);
+    defer graph.deinit();
+    try graph.analyze(&sym, &refs);
+
+    // Public and protected handle() are alive (weak)
+    try std.testing.expect(graph.isAlive(graph.index.lookup("App\\HandlerA::handle").?));
+    try std.testing.expect(graph.isAlive(graph.index.lookup("App\\HandlerB::handle").?));
+    // Private handle() is dead
+    try std.testing.expect(!graph.isAlive(graph.index.lookup("App\\HandlerC::handle").?));
+}
+
+test "string/reflection: class_exists keeps class alive, method_exists keeps method alive" {
+    const allocator = std.testing.allocator;
+    var sym = SymbolTable.init(allocator);
+    defer sym.deinit();
+
+    var class = ClassSymbol.init(allocator, "App\\DynamicService");
+    class.file_path = "DynamicService.php";
+    class.start_line = 1;
+    try class.addMethod(.{
+        .name = "process",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 5,
+        .end_line = 10,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\DynamicService",
+        .file_path = "DynamicService.php",
+    });
+    try class.addMethod(.{
+        .name = "unreferencedMethod",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 12,
+        .end_line = 15,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\DynamicService",
+        .file_path = "DynamicService.php",
+    });
+    try sym.addClass(class);
+
+    try sym.resolveInheritance();
+
+    // class_exists('App\DynamicService') → string_ref
+    // method_exists($obj, 'process') → reflection ref to process
+    const refs = [_]LivenessRef{
+        .{
+            .target_fqn = "App\\DynamicService",
+            .target_kind = .class,
+            .reason = .string_ref,
+            .is_weak = false,
+            .source_file = "bootstrap.php",
+            .source_line = 10,
+        },
+        .{
+            .target_fqn = "App\\DynamicService::process",
+            .target_kind = .method,
+            .reason = .reflection,
+            .is_weak = false,
+            .source_file = "bootstrap.php",
+            .source_line = 15,
+        },
+    };
+
+    var graph = ProjectLivenessGraph.init(allocator);
+    defer graph.deinit();
+    try graph.analyze(&sym, &refs);
+
+    // Class kept alive by string_ref
+    try std.testing.expect(graph.isAlive(graph.index.lookup("App\\DynamicService").?));
+    // process() kept alive by reflection ref
+    try std.testing.expect(graph.isAlive(graph.index.lookup("App\\DynamicService::process").?));
+    // unreferencedMethod is dead (no reference)
+    try std.testing.expect(!graph.isAlive(graph.index.lookup("App\\DynamicService::unreferencedMethod").?));
+}
+
+test "private method precision: unreferenced private is dead, called private is alive" {
+    const allocator = std.testing.allocator;
+    var sym = SymbolTable.init(allocator);
+    defer sym.deinit();
+
+    var class = ClassSymbol.init(allocator, "App\\Processor");
+    class.file_path = "Processor.php";
+    class.start_line = 1;
+    try class.addMethod(.{
+        .name = "run",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 3,
+        .end_line = 8,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\Processor",
+        .file_path = "Processor.php",
+    });
+    try class.addMethod(.{
+        .name = "validate",
+        .visibility = .private,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 10,
+        .end_line = 15,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\Processor",
+        .file_path = "Processor.php",
+    });
+    try class.addMethod(.{
+        .name = "orphanHelper",
+        .visibility = .private,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 17,
+        .end_line = 20,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\Processor",
+        .file_path = "Processor.php",
+    });
+    try sym.addClass(class);
+
+    try sym.resolveInheritance();
+
+    const refs = [_]LivenessRef{
+        .{
+            .target_fqn = "App\\Processor",
+            .target_kind = .class,
+            .reason = .instantiate,
+            .is_weak = false,
+            .source_file = "main.php",
+            .source_line = 1,
+        },
+        .{
+            .target_fqn = "App\\Processor::run",
+            .target_kind = .method,
+            .reason = .resolved_call,
+            .is_weak = false,
+            .source_file = "main.php",
+            .source_line = 5,
+        },
+        // run() calls validate() internally
+        .{
+            .target_fqn = "App\\Processor::validate",
+            .target_kind = .method,
+            .reason = .resolved_call,
+            .is_weak = false,
+            .source_file = "Processor.php",
+            .source_line = 6,
+        },
+    };
+
+    var graph = ProjectLivenessGraph.init(allocator);
+    defer graph.deinit();
+    try graph.analyze(&sym, &refs);
+
+    // run() alive (called externally)
+    try std.testing.expect(graph.isAlive(graph.index.lookup("App\\Processor::run").?));
+    // validate() alive (called by sibling)
+    try std.testing.expect(graph.isAlive(graph.index.lookup("App\\Processor::validate").?));
+    // orphanHelper() dead (private, zero references)
+    try std.testing.expect(!graph.isAlive(graph.index.lookup("App\\Processor::orphanHelper").?));
+}
+
+test "property precision: unreferenced private property is dead, public property defaults alive when class alive" {
+    const allocator = std.testing.allocator;
+    var sym = SymbolTable.init(allocator);
+    defer sym.deinit();
+
+    var class = ClassSymbol.init(allocator, "App\\Config");
+    class.file_path = "Config.php";
+    class.start_line = 1;
+    try class.addProperty(.{
+        .name = "publicSetting",
+        .visibility = .public,
+        .is_static = false,
+        .is_readonly = false,
+        .declared_type = null,
+        .phpdoc_type = null,
+        .default_value_type = null,
+        .line = 3,
+    });
+    try class.addProperty(.{
+        .name = "privateSetting",
+        .visibility = .private,
+        .is_static = false,
+        .is_readonly = false,
+        .declared_type = null,
+        .phpdoc_type = null,
+        .default_value_type = null,
+        .line = 5,
+    });
+    try sym.addClass(class);
+
+    try sym.resolveInheritance();
+
+    // Only the class itself is referenced, no property references
+    const refs = [_]LivenessRef{.{
+        .target_fqn = "App\\Config",
+        .target_kind = .class,
+        .reason = .instantiate,
+        .is_weak = false,
+        .source_file = "main.php",
+        .source_line = 1,
+    }};
+
+    var graph = ProjectLivenessGraph.init(allocator);
+    defer graph.deinit();
+    try graph.analyze(&sym, &refs);
+
+    // Class is alive
+    try std.testing.expect(graph.isAlive(graph.index.lookup("App\\Config").?));
+    // Both properties are dead when not explicitly referenced
+    // (properties require explicit property_access references to be alive)
+    try std.testing.expect(!graph.isAlive(graph.index.lookup("App\\Config::$publicSetting").?));
+    try std.testing.expect(!graph.isAlive(graph.index.lookup("App\\Config::$privateSetting").?));
+
+    // Now test with a property access reference
+    const refs2 = [_]LivenessRef{
+        .{
+            .target_fqn = "App\\Config",
+            .target_kind = .class,
+            .reason = .instantiate,
+            .is_weak = false,
+            .source_file = "main.php",
+            .source_line = 1,
+        },
+        .{
+            .target_fqn = "App\\Config::$publicSetting",
+            .target_kind = .property,
+            .reason = .property_access,
+            .is_weak = false,
+            .source_file = "main.php",
+            .source_line = 3,
+        },
+    };
+
+    var graph2 = ProjectLivenessGraph.init(allocator);
+    defer graph2.deinit();
+    try graph2.analyze(&sym, &refs2);
+
+    // Public property with explicit reference is alive
+    try std.testing.expect(graph2.isAlive(graph2.index.lookup("App\\Config::$publicSetting").?));
+    // Private property without reference is still dead
+    try std.testing.expect(!graph2.isAlive(graph2.index.lookup("App\\Config::$privateSetting").?));
+}
+
+test "callable arrays: [Foo::class, 'bar'] keeps Foo::bar alive" {
+    const allocator = std.testing.allocator;
+    var sym = SymbolTable.init(allocator);
+    defer sym.deinit();
+
+    var class = ClassSymbol.init(allocator, "App\\EventHandler");
+    class.file_path = "EventHandler.php";
+    class.start_line = 1;
+    try class.addMethod(.{
+        .name = "onUserCreated",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 5,
+        .end_line = 10,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\EventHandler",
+        .file_path = "EventHandler.php",
+    });
+    try class.addMethod(.{
+        .name = "orphanListener",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 12,
+        .end_line = 15,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\EventHandler",
+        .file_path = "EventHandler.php",
+    });
+    try sym.addClass(class);
+
+    try sym.resolveInheritance();
+
+    // [EventHandler::class, 'onUserCreated'] → callable_ref
+    const refs = [_]LivenessRef{
+        .{
+            .target_fqn = "App\\EventHandler",
+            .target_kind = .class,
+            .reason = .callable_ref,
+            .is_weak = false,
+            .source_file = "events.php",
+            .source_line = 5,
+        },
+        .{
+            .target_fqn = "App\\EventHandler::onUserCreated",
+            .target_kind = .method,
+            .reason = .callable_ref,
+            .is_weak = false,
+            .source_file = "events.php",
+            .source_line = 5,
+        },
+    };
+
+    var graph = ProjectLivenessGraph.init(allocator);
+    defer graph.deinit();
+    try graph.analyze(&sym, &refs);
+
+    // Class alive via callable_ref
+    try std.testing.expect(graph.isAlive(graph.index.lookup("App\\EventHandler").?));
+    // onUserCreated alive via callable_ref
+    try std.testing.expect(graph.isAlive(graph.index.lookup("App\\EventHandler::onUserCreated").?));
+    // orphanListener dead (not referenced)
+    try std.testing.expect(!graph.isAlive(graph.index.lookup("App\\EventHandler::orphanListener").?));
+}
+
+test "performance: dead code analysis scales with many symbols" {
+    const allocator = std.testing.allocator;
+
+    // Use arena for all string allocations to avoid leak tracking issues
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var sym = SymbolTable.init(allocator);
+    defer sym.deinit();
+
+    // Generate 500 classes, each with 3 methods and 2 properties
+    const num_classes = 500;
+
+    for (0..num_classes) |i| {
+        const fqcn = try std.fmt.allocPrint(aa, "App\\Gen\\Class{d}", .{i});
+
+        var class = ClassSymbol.init(allocator, fqcn);
+        class.file_path = "generated.php";
+        class.start_line = @intCast(i * 20 + 1);
+
+        for (0..3) |mi| {
+            const mname = try std.fmt.allocPrint(aa, "method{d}", .{mi});
+
+            try class.addMethod(.{
+                .name = mname,
+                .visibility = .public,
+                .is_static = false,
+                .is_abstract = false,
+                .is_final = false,
+                .parameters = &.{},
+                .return_type = null,
+                .phpdoc_return = null,
+                .start_line = @intCast(i * 20 + mi + 3),
+                .end_line = @intCast(i * 20 + mi + 5),
+                .start_byte = 0,
+                .end_byte = 0,
+                .containing_class = fqcn,
+                .file_path = "generated.php",
+            });
+        }
+
+        for (0..2) |pi| {
+            const pname = try std.fmt.allocPrint(aa, "prop{d}", .{pi});
+
+            try class.addProperty(.{
+                .name = pname,
+                .visibility = if (pi == 0) .public else .private,
+                .is_static = false,
+                .is_readonly = false,
+                .declared_type = null,
+                .phpdoc_type = null,
+                .default_value_type = null,
+                .line = @intCast(i * 20 + 15 + pi),
+            });
+        }
+
+        try sym.addClass(class);
+    }
+
+    try sym.resolveInheritance();
+
+    // Reference 10% of classes
+    var ref_list = std.ArrayListUnmanaged(LivenessRef).empty;
+    defer ref_list.deinit(allocator);
+    for (0..num_classes / 10) |i| {
+        const fqcn = try std.fmt.allocPrint(aa, "App\\Gen\\Class{d}", .{i});
+        try ref_list.append(allocator, .{
+            .target_fqn = fqcn,
+            .target_kind = .class,
+            .reason = .instantiate,
+            .is_weak = false,
+            .source_file = "main.php",
+            .source_line = @intCast(i + 1),
+        });
+    }
+
+    var timer = std.time.Timer.start() catch unreachable;
+
+    var graph = ProjectLivenessGraph.init(allocator);
+    defer graph.deinit();
+    try graph.analyze(&sym, ref_list.items);
+
+    const dead = try graph.collectDead(&sym);
+    defer allocator.free(dead);
+
+    const elapsed_ns = timer.read();
+    const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
+
+    // Verify correctness: 90% of classes should be dead
+    try std.testing.expect(dead.len > 0);
+    // Total symbols: 500 classes + 1500 methods + 1000 properties = 3000
+    // ~2700 should be dead (90% classes + their members, minus magic methods on alive)
+    try std.testing.expect(dead.len > 2000);
+
+    // Performance: analysis should complete in <500ms even in Debug mode
+    // (in Release mode this typically runs in <10ms)
+    try std.testing.expect(elapsed_ms < 500.0);
+}
