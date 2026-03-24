@@ -393,6 +393,123 @@ else
 fi
 
 # ============================================================================
+# Test 13: Null safety in report output (regression)
+# ============================================================================
+echo "Test 13: Null safety in report output"
+
+# Create a fixture with nullable patterns
+NULL_TEST_DIR="$TMPDIR_E2E/null-safety-test"
+mkdir -p "$NULL_TEST_DIR/src"
+
+cat > "$NULL_TEST_DIR/composer.json" << 'EOF'
+{"autoload":{"psr-4":{"NullTest\\":"src/"}}}
+EOF
+
+# File with both guarded and unguarded nullable accesses
+cat > "$NULL_TEST_DIR/src/NullService.php" << 'PHPEOF'
+<?php
+namespace NullTest;
+
+class NullService
+{
+    public function findUser(int $id): ?User { return null; }
+
+    public function guardedAccess(?Foo $x): void
+    {
+        if ($x !== null) {
+            $x->method();
+        }
+    }
+
+    public function unguardedAccess(?Foo $x): void
+    {
+        $x->method();
+    }
+
+    public function instanceofGuard(?Bar $bar): void
+    {
+        if ($bar instanceof Bar) {
+            $bar->doStuff();
+        }
+    }
+
+    public function coalesceGuard(?string $val): string
+    {
+        $safe = $val ?? 'default';
+        return $safe;
+    }
+
+    public function earlyReturnGuard(?Baz $baz): void
+    {
+        if ($baz === null) {
+            return;
+        }
+        $baz->process();
+    }
+}
+PHPEOF
+
+# Test report text output includes null safety section
+OUTPUT=$("$PHPCMA" report --composer="$NULL_TEST_DIR/composer.json" --format=text 2>&1) || true
+EXIT_CODE=$?
+
+assert_exit_code 0 "$EXIT_CODE" "exits with 0"
+assert_contains "$OUTPUT" "Null safety" "text report contains 'Null safety' row"
+echo ""
+
+# ============================================================================
+# Test 14: Null safety violations appear in JSON report
+# ============================================================================
+echo "Test 14: Null safety violations in JSON report"
+JSON_FILE="$TMPDIR_E2E/null_safety_report.json"
+OUTPUT=$("$PHPCMA" report --composer="$NULL_TEST_DIR/composer.json" --format=json --output="$JSON_FILE" 2>&1) || true
+EXIT_CODE=$?
+
+assert_exit_code 0 "$EXIT_CODE" "exits with 0"
+assert_file_exists "$JSON_FILE" "JSON report file created"
+assert_file_not_empty "$JSON_FILE" "JSON report file is not empty"
+
+JSON_CONTENT=$(cat "$JSON_FILE")
+assert_contains "$JSON_CONTENT" "\"null_safety\"" "JSON contains null_safety section"
+
+# Verify null_safety unchecked is NOT the old call-resolution artifact
+# It should be 0 (from NullSafetyAnalyzer, which doesn't produce 'unchecked')
+TOTAL=$((TOTAL + 1))
+NULL_UNCHECKED=$(echo "$JSON_CONTENT" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(data['type_checks']['null_safety']['unchecked'])
+" 2>/dev/null || echo "PARSE_ERROR")
+if [ "$NULL_UNCHECKED" = "0" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ null_safety.unchecked is 0 (no call-resolution artifact)"
+elif [ "$NULL_UNCHECKED" = "PARSE_ERROR" ]; then
+    FAIL=$((FAIL + 1))
+    echo "  ✗ could not parse null_safety.unchecked from JSON"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ null_safety.unchecked is $NULL_UNCHECKED (expected 0 — call-resolution artifact still present)"
+fi
+echo ""
+
+# ============================================================================
+# Test 15: Null safety violations appear in SARIF report
+# ============================================================================
+echo "Test 15: Null safety violations in SARIF report"
+SARIF_FILE="$TMPDIR_E2E/null_safety_report.sarif"
+OUTPUT=$("$PHPCMA" report --composer="$NULL_TEST_DIR/composer.json" --format=sarif --output="$SARIF_FILE" 2>&1) || true
+EXIT_CODE=$?
+
+assert_exit_code 0 "$EXIT_CODE" "exits with 0"
+assert_file_exists "$SARIF_FILE" "SARIF report file created"
+assert_file_not_empty "$SARIF_FILE" "SARIF report file is not empty"
+
+SARIF_CONTENT=$(cat "$SARIF_FILE")
+assert_contains "$SARIF_CONTENT" "sarif-schema-2.1.0" "SARIF has correct schema"
+assert_contains "$SARIF_CONTENT" "phpcma/null-safety" "SARIF contains null-safety rule"
+echo ""
+
+# ============================================================================
 # Summary
 # ============================================================================
 echo "========================================"
