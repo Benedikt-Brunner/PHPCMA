@@ -88,17 +88,9 @@ pub const TypeResolver = struct {
     pub fn resolveExpressionType(self: *TypeResolver, node: ts.Node, source: []const u8) !?TypeInfo {
         const kind = node.kind();
 
-        // Variable reference
+        // Variable reference (handles $this, scope lookup, and parameter types)
         if (std.mem.eql(u8, kind, "variable_name")) {
             return self.resolveVariableType(node, source);
-        }
-
-        // $this reference
-        if (std.mem.eql(u8, kind, "variable_name")) {
-            const text = getNodeText(source, node);
-            if (std.mem.eql(u8, text, "$this")) {
-                return self.resolveThisType();
-            }
         }
 
         // new ClassName()
@@ -549,7 +541,6 @@ pub const TypeResolver = struct {
 
     /// Track constructor parameters for property type inference
     pub fn trackConstructorInjection(self: *TypeResolver, method: *const MethodSymbol, source: []const u8, body_node: ts.Node) !void {
-        _ = source;
         if (!std.mem.eql(u8, method.name, "__construct")) return;
 
         // Build a map of parameter name -> type
@@ -562,17 +553,61 @@ pub const TypeResolver = struct {
         }
 
         // Traverse constructor body looking for $this->prop = $param patterns
-        try self.scanConstructorAssignments(body_node, &param_types);
+        try self.scanConstructorAssignments(body_node, &param_types, source);
     }
 
-    fn scanConstructorAssignments(self: *TypeResolver, node: ts.Node, param_types: *std.StringHashMap(TypeInfo)) !void {
-        // This would traverse the AST looking for patterns like:
+    fn scanConstructorAssignments(self: *TypeResolver, node: ts.Node, param_types: *std.StringHashMap(TypeInfo), source: []const u8) !void {
+        // Traverse the AST looking for patterns like:
         // $this->repository = $repository;
         // Where $repository is a typed constructor parameter
-        _ = self;
-        _ = node;
-        _ = param_types;
-        // Implementation would go here - for now we rely on property type declarations
+        const kind = node.kind();
+
+        if (std.mem.eql(u8, kind, "assignment_expression")) {
+            const lhs = node.childByFieldName("left") orelse return;
+            const rhs = node.childByFieldName("right") orelse return;
+
+            // Check if LHS is $this->property
+            if (std.mem.eql(u8, lhs.kind(), "member_access_expression")) {
+                const obj_node = lhs.childByFieldName("object") orelse return;
+                const name_node = lhs.childByFieldName("name") orelse return;
+
+                const obj_text = getNodeText(source, obj_node);
+                if (!std.mem.eql(u8, obj_text, "$this")) return;
+
+                const prop_name = getNodeText(source, name_node);
+
+                // Check if RHS is a variable that matches a typed parameter
+                if (std.mem.eql(u8, rhs.kind(), "variable_name")) {
+                    const rhs_text = getNodeText(source, rhs);
+                    const param_name = if (rhs_text.len > 0 and rhs_text[0] == '$')
+                        rhs_text[1..]
+                    else
+                        rhs_text;
+
+                    if (param_types.get(param_name)) |type_info| {
+                        // Update the property's type in the symbol table
+                        if (self.current_class) |class| {
+                            if (self.symbol_table.getClassMut(class.fqcn)) |mutable_class| {
+                                if (mutable_class.properties.getPtr(prop_name)) |prop| {
+                                    if (prop.declared_type == null and prop.phpdoc_type == null) {
+                                        prop.default_value_type = type_info;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // Recurse into children
+        var i: u32 = 0;
+        while (i < node.namedChildCount()) : (i += 1) {
+            if (node.namedChild(i)) |child| {
+                try self.scanConstructorAssignments(child, param_types, source);
+            }
+        }
     }
 
     // ========================================================================
