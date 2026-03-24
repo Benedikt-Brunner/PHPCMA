@@ -14,6 +14,7 @@ const call_analyzer = @import("call_analyzer.zig");
 const boundary_analyzer = @import("boundary_analyzer.zig");
 const type_violation_analyzer = @import("type_violation_analyzer.zig");
 const return_type_checker = @import("return_type_checker.zig");
+const null_safety = @import("null_safety.zig");
 const NodeKindIds = @import("node_kind_ids.zig").NodeKindIds;
 const parallel = @import("parallel.zig");
 
@@ -1978,9 +1979,59 @@ fn analyzeReport() !void {
         &call_graph,
     );
 
-    // Pass 6: Generate unified report
+    // Pass 6: Null safety analysis (per-file)
     if (report_config.verbose) {
-        try stdout.writeAll("Pass 6: Generating unified report...\n\n");
+        try stdout.writeAll("Pass 6: Analyzing null safety...\n");
+    }
+
+    const ns_parser = ts.Parser.create();
+    defer ns_parser.destroy();
+    try ns_parser.setLanguage(php_lang);
+
+    var total_guarded: u32 = 0;
+    var total_unguarded: u32 = 0;
+    var null_violations = std.ArrayListUnmanaged(report.Violation){};
+    defer null_violations.deinit(allocator);
+
+    for (files) |file_path| {
+        const source = file_sources.get(file_path) orelse continue;
+        const file_ctx_ptr = file_contexts.getPtr(file_path) orelse continue;
+
+        const tree = ns_parser.parseString(source, null) orelse continue;
+        defer tree.destroy();
+
+        var analyzer = null_safety.NullSafetyAnalyzer.init(allocator, &sym_table, file_ctx_ptr, php_lang);
+        defer analyzer.deinit();
+
+        const result = analyzer.analyzeFile(tree, source) catch continue;
+
+        total_guarded += result.guarded_accesses;
+        total_unguarded += result.unguarded_accesses;
+
+        for (result.violations) |v| {
+            const severity: report.Violation.Severity = switch (v.severity) {
+                .definite => .err,
+                .possible => .warning,
+                .guarded => .note,
+            };
+            try null_violations.append(allocator, .{
+                .severity = severity,
+                .category = "null-safety",
+                .file_path = file_path,
+                .line = v.line,
+                .message = v.message,
+            });
+        }
+    }
+
+    if (report_config.verbose) {
+        const msg = try std.fmt.allocPrint(allocator, "  Guarded: {d}, Unguarded: {d}, Violations: {d}\n\n", .{ total_guarded, total_unguarded, null_violations.items.len });
+        try stdout.writeAll(msg);
+    }
+
+    // Pass 7: Generate unified report
+    if (report_config.verbose) {
+        try stdout.writeAll("Pass 7: Generating unified report...\n\n");
     }
 
     var unified_report = report.UnifiedReport.init(allocator);
@@ -2003,6 +2054,16 @@ fn analyzeReport() !void {
             .line = diag.line,
             .message = try diag.format(allocator),
         });
+    }
+
+    // Populate null safety results from real analysis
+    unified_report.type_checks.null_safety.pass = total_guarded;
+    unified_report.type_checks.null_safety.fail = total_unguarded;
+    unified_report.type_checks.null_safety.unchecked = 0;
+
+    // Add null safety violations
+    for (null_violations.items) |v| {
+        try unified_report.addViolation(v);
     }
 
     // Output
