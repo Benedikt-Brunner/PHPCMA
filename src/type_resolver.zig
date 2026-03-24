@@ -248,16 +248,17 @@ pub const TypeResolver = struct {
             if (object_type.kind == .generic and object_type.type_params.len > 0) {
                 if (self.symbol_table.getClass(object_type.base_type)) |class| {
                     if (class.template_params.len > 0) {
-                        return generics.resolveGenericMethodReturn(
+                        const ret = generics.resolveGenericMethodReturn(
                             self.allocator,
                             class,
                             method,
                             object_type,
-                        ) catch return method.effectiveReturnType();
+                        ) catch return self.concretizeReturnType(method);
+                        return ret;
                     }
                 }
             }
-            return method.effectiveReturnType();
+            return self.concretizeReturnType(method);
         }
 
         return null;
@@ -296,10 +297,16 @@ pub const TypeResolver = struct {
 
         // Look up method
         if (self.symbol_table.resolveMethod(fqcn, method_name)) |method| {
-            return method.effectiveReturnType();
+            return self.concretizeReturnType(method);
         }
 
         return null;
+    }
+
+    /// Concretize a method's effective return type using its containing_class as context
+    fn concretizeReturnType(self: *TypeResolver, method: *const MethodSymbol) ?TypeInfo {
+        const ret = method.effectiveReturnType() orelse return null;
+        return self.concretizeSpecialType(ret, method.containing_class);
     }
 
     /// Resolve type of property access
@@ -346,6 +353,138 @@ pub const TypeResolver = struct {
             return func.effectiveReturnType();
         }
 
+        return null;
+    }
+
+    // ========================================================================
+    // Special Type Concretization
+    // ========================================================================
+
+    /// Concretize self/static/parent types to their concrete FQCN.
+    /// Called when returning method/static-call return types so that
+    /// downstream argument type checking compares concrete class names.
+    fn concretizeSpecialType(self: *TypeResolver, type_info: TypeInfo, context_class_fqcn: []const u8) TypeInfo {
+        return switch (type_info.kind) {
+            .self_type, .static_type => TypeInfo{
+                .kind = .simple,
+                .base_type = context_class_fqcn,
+                .type_parts = type_info.type_parts,
+                .type_params = type_info.type_params,
+                .is_builtin = false,
+            },
+            .parent_type => blk: {
+                if (self.symbol_table.getClass(context_class_fqcn)) |class| {
+                    if (class.extends) |parent_fqcn| {
+                        break :blk TypeInfo{
+                            .kind = .simple,
+                            .base_type = parent_fqcn,
+                            .type_parts = type_info.type_parts,
+                            .type_params = type_info.type_params,
+                            .is_builtin = false,
+                        };
+                    }
+                }
+                break :blk type_info;
+            },
+            .nullable => blk: {
+                // For nullable types, concretize the inner type if it's a special reference
+                const inner_kind = self.specialKindFromBaseName(type_info.base_type);
+                if (inner_kind) |sk| {
+                    const inner = TypeInfo{
+                        .kind = sk,
+                        .base_type = type_info.base_type,
+                        .type_parts = &.{},
+                        .is_builtin = false,
+                    };
+                    const concretized = self.concretizeSpecialType(inner, context_class_fqcn);
+                    if (concretized.kind == .simple) {
+                        break :blk TypeInfo{
+                            .kind = .nullable,
+                            .base_type = concretized.base_type,
+                            .type_parts = type_info.type_parts,
+                            .type_params = type_info.type_params,
+                            .is_builtin = false,
+                        };
+                    }
+                }
+                break :blk type_info;
+            },
+            .union_type => blk: {
+                // For union types, concretize any parts that are special types
+                var needs_concretize = false;
+                for (type_info.type_parts) |part| {
+                    if (self.specialKindFromBaseName(part) != null) {
+                        needs_concretize = true;
+                        break;
+                    }
+                }
+                if (!needs_concretize) break :blk type_info;
+
+                const new_parts = self.allocator.alloc([]const u8, type_info.type_parts.len) catch break :blk type_info;
+                for (type_info.type_parts, 0..) |part, i| {
+                    if (self.specialKindFromBaseName(part)) |sk| {
+                        const inner = TypeInfo{
+                            .kind = sk,
+                            .base_type = part,
+                            .type_parts = &.{},
+                            .is_builtin = false,
+                        };
+                        const concretized = self.concretizeSpecialType(inner, context_class_fqcn);
+                        new_parts[i] = concretized.base_type;
+                    } else {
+                        new_parts[i] = part;
+                    }
+                }
+                break :blk TypeInfo{
+                    .kind = .union_type,
+                    .base_type = type_info.base_type,
+                    .type_parts = new_parts,
+                    .type_params = type_info.type_params,
+                    .is_builtin = type_info.is_builtin,
+                };
+            },
+            .intersection => blk: {
+                var needs_concretize = false;
+                for (type_info.type_parts) |part| {
+                    if (self.specialKindFromBaseName(part) != null) {
+                        needs_concretize = true;
+                        break;
+                    }
+                }
+                if (!needs_concretize) break :blk type_info;
+
+                const new_parts = self.allocator.alloc([]const u8, type_info.type_parts.len) catch break :blk type_info;
+                for (type_info.type_parts, 0..) |part, i| {
+                    if (self.specialKindFromBaseName(part)) |sk| {
+                        const inner = TypeInfo{
+                            .kind = sk,
+                            .base_type = part,
+                            .type_parts = &.{},
+                            .is_builtin = false,
+                        };
+                        const concretized = self.concretizeSpecialType(inner, context_class_fqcn);
+                        new_parts[i] = concretized.base_type;
+                    } else {
+                        new_parts[i] = part;
+                    }
+                }
+                break :blk TypeInfo{
+                    .kind = .intersection,
+                    .base_type = type_info.base_type,
+                    .type_parts = new_parts,
+                    .type_params = type_info.type_params,
+                    .is_builtin = type_info.is_builtin,
+                };
+            },
+            else => type_info,
+        };
+    }
+
+    /// Map a base_type string to its special Kind, if applicable
+    fn specialKindFromBaseName(_: *TypeResolver, name: []const u8) ?TypeInfo.Kind {
+        if (std.mem.eql(u8, name, "self")) return .self_type;
+        if (std.mem.eql(u8, name, "static")) return .static_type;
+        if (std.mem.eql(u8, name, "parent")) return .parent_type;
         return null;
     }
 
@@ -1016,4 +1155,225 @@ test "unresolvable variable returns null" {
 
     const type_info = try resolver.resolveExpressionType(var_node, source);
     try std.testing.expect(type_info == null);
+}
+
+test "method returning self concretizes to containing class" {
+    const allocator = std.testing.allocator;
+    var sym_table = SymbolTable.init(allocator);
+    defer sym_table.deinit();
+
+    var file_ctx = types.FileContext.init(allocator, "test.php");
+    defer file_ctx.deinit();
+
+    var resolver = TypeResolver.init(allocator, &sym_table, &file_ctx);
+    defer resolver.deinit();
+
+    // Class with a method returning self
+    var class = types.ClassSymbol.init(allocator, "App\\Builder");
+    try class.addMethod(.{
+        .name = "build",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = TypeInfo{
+            .kind = .self_type,
+            .base_type = "self",
+            .type_parts = &.{},
+            .is_builtin = false,
+        },
+        .phpdoc_return = null,
+        .start_line = 1,
+        .end_line = 5,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\Builder",
+        .file_path = "test.php",
+    });
+    try sym_table.addClass(class);
+
+    // Set up $builder variable
+    const scope = try resolver.pushScope();
+    try scope.setVariableType("$builder", TypeInfo{
+        .kind = .simple,
+        .base_type = "App\\Builder",
+        .type_parts = &.{},
+        .is_builtin = false,
+    });
+
+    const source = "<?php $builder->build();";
+    const tree = testParse(source) orelse return error.ParseFailed;
+    defer tree.destroy();
+
+    const root = tree.rootNode();
+    const call_node = findNodeByKind(root, "member_call_expression") orelse return error.NodeNotFound;
+
+    const type_info = try resolver.resolveExpressionType(call_node, source);
+    try std.testing.expect(type_info != null);
+    // Should be concretized to App\Builder, not "self"
+    try std.testing.expectEqualStrings("App\\Builder", type_info.?.base_type);
+    try std.testing.expectEqual(TypeInfo.Kind.simple, type_info.?.kind);
+}
+
+test "static method returning self concretizes to containing class" {
+    const allocator = std.testing.allocator;
+    var sym_table = SymbolTable.init(allocator);
+    defer sym_table.deinit();
+
+    var file_ctx = types.FileContext.init(allocator, "test.php");
+    defer file_ctx.deinit();
+
+    var resolver = TypeResolver.init(allocator, &sym_table, &file_ctx);
+    defer resolver.deinit();
+
+    // Class with a static method returning self
+    var class = types.ClassSymbol.init(allocator, "App\\Factory");
+    try class.addMethod(.{
+        .name = "create",
+        .visibility = .public,
+        .is_static = true,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = TypeInfo{
+            .kind = .self_type,
+            .base_type = "self",
+            .type_parts = &.{},
+            .is_builtin = false,
+        },
+        .phpdoc_return = null,
+        .start_line = 1,
+        .end_line = 5,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\Factory",
+        .file_path = "test.php",
+    });
+    try sym_table.addClass(class);
+
+    resolver.current_class = sym_table.getClass("App\\Factory");
+
+    const source = "<?php self::create();";
+    const tree = testParse(source) orelse return error.ParseFailed;
+    defer tree.destroy();
+
+    const root = tree.rootNode();
+    const node = findNodeByKind(root, "scoped_call_expression") orelse return error.NodeNotFound;
+    const type_info = try resolver.resolveExpressionType(node, source);
+    try std.testing.expect(type_info != null);
+    try std.testing.expectEqualStrings("App\\Factory", type_info.?.base_type);
+    try std.testing.expectEqual(TypeInfo.Kind.simple, type_info.?.kind);
+}
+
+test "method returning parent concretizes to parent class" {
+    const allocator = std.testing.allocator;
+    var sym_table = SymbolTable.init(allocator);
+    defer sym_table.deinit();
+
+    var file_ctx = types.FileContext.init(allocator, "test.php");
+    defer file_ctx.deinit();
+
+    var resolver = TypeResolver.init(allocator, &sym_table, &file_ctx);
+    defer resolver.deinit();
+
+    // Parent class
+    const parent_class = types.ClassSymbol.init(allocator, "App\\Base");
+    try sym_table.addClass(parent_class);
+
+    // Child class with a method returning parent
+    var child_class = types.ClassSymbol.init(allocator, "App\\Child");
+    child_class.extends = "App\\Base";
+    try child_class.addMethod(.{
+        .name = "getParent",
+        .visibility = .public,
+        .is_static = true,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = TypeInfo{
+            .kind = .parent_type,
+            .base_type = "parent",
+            .type_parts = &.{},
+            .is_builtin = false,
+        },
+        .phpdoc_return = null,
+        .start_line = 1,
+        .end_line = 5,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\Child",
+        .file_path = "test.php",
+    });
+    try sym_table.addClass(child_class);
+
+    resolver.current_class = sym_table.getClass("App\\Child");
+
+    const source = "<?php self::getParent();";
+    const tree = testParse(source) orelse return error.ParseFailed;
+    defer tree.destroy();
+
+    const root = tree.rootNode();
+    const node = findNodeByKind(root, "scoped_call_expression") orelse return error.NodeNotFound;
+    const type_info = try resolver.resolveExpressionType(node, source);
+    try std.testing.expect(type_info != null);
+    try std.testing.expectEqualStrings("App\\Base", type_info.?.base_type);
+    try std.testing.expectEqual(TypeInfo.Kind.simple, type_info.?.kind);
+}
+
+test "nullable self return type concretizes" {
+    const allocator = std.testing.allocator;
+    var sym_table = SymbolTable.init(allocator);
+    defer sym_table.deinit();
+
+    var file_ctx = types.FileContext.init(allocator, "test.php");
+    defer file_ctx.deinit();
+
+    var resolver = TypeResolver.init(allocator, &sym_table, &file_ctx);
+    defer resolver.deinit();
+
+    // Class with a method returning ?self
+    var class = types.ClassSymbol.init(allocator, "App\\Entity");
+    try class.addMethod(.{
+        .name = "findOrNull",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = TypeInfo{
+            .kind = .nullable,
+            .base_type = "self",
+            .type_parts = &.{},
+            .is_builtin = false,
+        },
+        .phpdoc_return = null,
+        .start_line = 1,
+        .end_line = 5,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\Entity",
+        .file_path = "test.php",
+    });
+    try sym_table.addClass(class);
+
+    const scope = try resolver.pushScope();
+    try scope.setVariableType("$entity", TypeInfo{
+        .kind = .simple,
+        .base_type = "App\\Entity",
+        .type_parts = &.{},
+        .is_builtin = false,
+    });
+
+    const source = "<?php $entity->findOrNull();";
+    const tree = testParse(source) orelse return error.ParseFailed;
+    defer tree.destroy();
+
+    const root = tree.rootNode();
+    const call_node = findNodeByKind(root, "member_call_expression") orelse return error.NodeNotFound;
+
+    const type_info = try resolver.resolveExpressionType(call_node, source);
+    try std.testing.expect(type_info != null);
+    try std.testing.expectEqual(TypeInfo.Kind.nullable, type_info.?.kind);
+    try std.testing.expectEqualStrings("App\\Entity", type_info.?.base_type);
 }
