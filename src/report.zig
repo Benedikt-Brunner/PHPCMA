@@ -88,7 +88,7 @@ pub const UnifiedReport = struct {
                     .property_type => self.type_checks.property_types.pass += 1,
                     .static_call, .this_call => self.type_checks.call_site_args.pass += 1,
                     .plugin_generated => self.type_checks.interface_compliance.pass += 1,
-                    .unresolved => self.type_checks.null_safety.unchecked += 1,
+                    .unresolved => {},
                 }
             } else {
                 // Unresolved calls contribute to unchecked counts
