@@ -1358,6 +1358,58 @@ test "framework stubs method signatures are correct" {
     try std.testing.expectEqualStrings("Doctrine\\ORM\\EntityRepository", get_repo.return_type.?.base_type);
 }
 
+test "EntityRepository::search returns EntitySearchResult" {
+    const allocator = std.testing.allocator;
+    var sym_table = SymbolTable.init(allocator);
+    defer sym_table.deinit();
+
+    try registerFrameworkStubs(allocator, &sym_table);
+
+    const repo = sym_table.getClass("Shopware\\Core\\Framework\\DataAbstractionLayer\\EntityRepository").?;
+    const search = repo.methods.getPtr("search").?;
+    try std.testing.expect(search.return_type != null);
+    try std.testing.expectEqualStrings(
+        "Shopware\\Core\\Framework\\DataAbstractionLayer\\Search\\EntitySearchResult",
+        search.return_type.?.base_type,
+    );
+    // search takes (Criteria, Context)
+    try std.testing.expectEqual(@as(usize, 2), search.parameters.len);
+    try std.testing.expectEqualStrings("criteria", search.parameters[0].name);
+    try std.testing.expectEqualStrings("context", search.parameters[1].name);
+}
+
+test "Connection::executeStatement returns int" {
+    const allocator = std.testing.allocator;
+    var sym_table = SymbolTable.init(allocator);
+    defer sym_table.deinit();
+
+    try registerFrameworkStubs(allocator, &sym_table);
+
+    const conn = sym_table.getClass("Doctrine\\DBAL\\Connection").?;
+    const exec_stmt = conn.methods.getPtr("executeStatement").?;
+    try std.testing.expect(exec_stmt.return_type != null);
+    try std.testing.expectEqualStrings("int", exec_stmt.return_type.?.base_type);
+    try std.testing.expectEqual(@as(usize, 3), exec_stmt.parameters.len);
+    try std.testing.expectEqualStrings("sql", exec_stmt.parameters[0].name);
+}
+
+test "Criteria::addFilter returns self" {
+    const allocator = std.testing.allocator;
+    var sym_table = SymbolTable.init(allocator);
+    defer sym_table.deinit();
+
+    try registerFrameworkStubs(allocator, &sym_table);
+
+    const criteria = sym_table.getClass("Shopware\\Core\\Framework\\DataAbstractionLayer\\Search\\Criteria").?;
+    const add_filter = criteria.methods.getPtr("addFilter").?;
+    try std.testing.expect(add_filter.return_type != null);
+    // addFilter returns Criteria (self)
+    try std.testing.expectEqualStrings(
+        "Shopware\\Core\\Framework\\DataAbstractionLayer\\Search\\Criteria",
+        add_filter.return_type.?.base_type,
+    );
+}
+
 test "framework stubs resolve through inheritance" {
     const allocator = std.testing.allocator;
     var sym_table = SymbolTable.init(allocator);

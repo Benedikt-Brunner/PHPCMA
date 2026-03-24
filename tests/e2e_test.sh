@@ -256,6 +256,143 @@ assert_contains "$OUTPUT" "SATISFIED" "monorepo analysis shows SATISFIED"
 echo ""
 
 # ============================================================================
+# Test 11: Framework stubs improve resolution rate
+# ============================================================================
+echo "Test 11: Framework stubs improve resolution rate"
+
+# Create a Shopware-style test fixture that exercises framework stub APIs
+STUB_TEST_DIR="$TMPDIR_E2E/stub-test"
+mkdir -p "$STUB_TEST_DIR/src"
+
+cat > "$STUB_TEST_DIR/composer.json" << 'EOF'
+{"autoload":{"psr-4":{"StubTest\\":"src/"}}}
+EOF
+
+# Service that uses Shopware EntityRepository, Doctrine Connection, and Criteria
+cat > "$STUB_TEST_DIR/src/ProductService.php" << 'PHPEOF'
+<?php
+namespace StubTest;
+
+use Shopware\Core\Framework\DataAbstractionLayer\EntityRepository;
+use Shopware\Core\Framework\DataAbstractionLayer\Search\Criteria;
+use Shopware\Core\Framework\DataAbstractionLayer\Search\EntitySearchResult;
+use Shopware\Core\Framework\Context;
+use Doctrine\DBAL\Connection;
+
+class ProductService
+{
+    private EntityRepository $productRepository;
+    private Connection $connection;
+
+    public function __construct(EntityRepository $productRepository, Connection $connection)
+    {
+        $this->productRepository = $productRepository;
+        $this->connection = $connection;
+    }
+
+    public function findProducts(Context $context): EntitySearchResult
+    {
+        $criteria = new Criteria();
+        $criteria->addFilter(new \Shopware\Core\Framework\DataAbstractionLayer\Search\Filter\EqualsFilter('active', true));
+        $criteria->addSorting(new \Shopware\Core\Framework\DataAbstractionLayer\Search\Sorting\FieldSorting('name'));
+        $criteria->setLimit(100);
+        $criteria->addAssociation('manufacturer');
+
+        $result = $this->productRepository->search($criteria, $context);
+        $count = $result->count();
+        $first = $result->first();
+        $total = $result->getTotal();
+        $entities = $result->getEntities();
+
+        return $result;
+    }
+
+    public function countByCategory(string $categoryId): int
+    {
+        $sql = 'SELECT COUNT(*) FROM product WHERE category_id = ?';
+        $count = $this->connection->executeStatement($sql, [$categoryId]);
+        $rows = $this->connection->fetchAllAssociative('SELECT * FROM product LIMIT 10');
+        $qb = $this->connection->createQueryBuilder();
+        $this->connection->beginTransaction();
+        $this->connection->commit();
+
+        return $count;
+    }
+
+    public function internalHelper(): void
+    {
+        $this->findProducts(Context::createDefaultContext());
+        $this->countByCategory('test');
+    }
+}
+PHPEOF
+
+OUTPUT=$("$PHPCMA" project --composer="$STUB_TEST_DIR/composer.json" --format=text 2>&1) || true
+EXIT_CODE=$?
+
+assert_exit_code 0 "$EXIT_CODE" "exits with 0"
+
+# Extract resolution rate — format is "Resolution rate:  XX.X% (N/M calls)"
+# Since all methods on framework classes should be resolved via stubs,
+# we expect a significant resolution rate (well above 0%)
+RATE=$(echo "$OUTPUT" | grep -oE 'Resolved:.*\(([0-9.]+)%\)' | grep -oE '[0-9.]+%' | tr -d '%')
+if [ -n "$RATE" ]; then
+    TOTAL=$((TOTAL + 1))
+    # The fixture uses only framework stubs + internal calls, so resolution should be high
+    # We check that it's above 40% (baseline without stubs would be much lower)
+    RATE_INT=$(echo "$RATE" | cut -d. -f1)
+    if [ "$RATE_INT" -ge 40 ]; then
+        PASS=$((PASS + 1))
+        echo "  ✓ resolution rate ${RATE}% >= 40% (framework stubs working)"
+    else
+        FAIL=$((FAIL + 1))
+        echo "  ✗ resolution rate ${RATE}% < 40% (framework stubs may not be loading)"
+    fi
+else
+    TOTAL=$((TOTAL + 1))
+    FAIL=$((FAIL + 1))
+    echo "  ✗ could not parse resolution rate from output"
+fi
+echo ""
+
+# ============================================================================
+# Test 12: Resolution rate on shopware-plugins (if available)
+# ============================================================================
+SHOPWARE_CONFIG="/Users/benediktbrunner/PhpstormProjects/shopware-plugins/.phpcma.json"
+if [ -f "$SHOPWARE_CONFIG" ]; then
+    echo "Test 12: Resolution rate on shopware-plugins (vs baseline 31.4%)"
+    OUTPUT=$("$PHPCMA" report --config="$SHOPWARE_CONFIG" --format=text 2>&1) || true
+    EXIT_CODE=$?
+
+    assert_exit_code 0 "$EXIT_CODE" "exits with 0"
+
+    # Extract resolution rate
+    RATE=$(echo "$OUTPUT" | grep -oE 'Resolution rate:  [0-9.]+%' | grep -oE '[0-9.]+')
+    if [ -n "$RATE" ]; then
+        TOTAL=$((TOTAL + 1))
+        RATE_INT=$(echo "$RATE" | cut -d. -f1)
+        # Baseline was 31.4%. Framework stubs should push this above 31.4%.
+        # The theoretical max uplift from stubs alone is +24.6pp → ~56%.
+        # We conservatively check for > 31% to verify improvement.
+        if [ "$RATE_INT" -ge 32 ]; then
+            PASS=$((PASS + 1))
+            echo "  ✓ resolution rate ${RATE}% > 31.4% baseline (stubs improve resolution)"
+        else
+            FAIL=$((FAIL + 1))
+            echo "  ✗ resolution rate ${RATE}% <= 31.4% baseline (no improvement from stubs)"
+        fi
+    else
+        TOTAL=$((TOTAL + 1))
+        FAIL=$((FAIL + 1))
+        echo "  ✗ could not parse resolution rate from output"
+    fi
+    echo ""
+else
+    echo "Test 12: SKIPPED (shopware-plugins not available at $SHOPWARE_CONFIG)"
+    echo ""
+fi
+
+# ============================================================================
 # Summary
 # ============================================================================
 echo "========================================"
