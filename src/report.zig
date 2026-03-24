@@ -1227,3 +1227,226 @@ test "UnifiedReport: Checkstyle empty results" {
     // No <file> elements
     try std.testing.expect(std.mem.indexOf(u8, output, "<file") == null);
 }
+
+// ============================================================================
+// Null Safety Regression Tests
+// ============================================================================
+
+test "null safety regression: populateTypeChecks does not set null_safety from call resolution" {
+    // Regression: previously, populateTypeChecks() would increment
+    // null_safety.unchecked for unresolved call-resolution methods, producing
+    // the "unchecked=41" artifact. After wiring NullSafetyAnalyzer into
+    // main.zig, null_safety must remain zeroed from populate() — only the
+    // real analyzer should set these counts.
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    // Source with calls that produce unresolved resolution methods
+    const source =
+        \\<?php
+        \\class UserService {
+        \\    private $repo;
+        \\    public function __construct($repo) { $this->repo = $repo; }
+        \\    public function process(): void {
+        \\        $this->repo->findAll();
+        \\        $this->repo->save();
+        \\        $this->repo->delete();
+        \\    }
+        \\}
+    ;
+
+    const result = try buildTestGraph(alloc, source);
+
+    var report = UnifiedReport.init(alloc);
+    defer report.deinit();
+    report.populate(result[0], result[1]);
+
+    // null_safety must be all zeros after populate() — it should NOT be
+    // contaminated by call-resolution metadata
+    try std.testing.expectEqual(@as(usize, 0), report.type_checks.null_safety.pass);
+    try std.testing.expectEqual(@as(usize, 0), report.type_checks.null_safety.fail);
+    try std.testing.expectEqual(@as(usize, 0), report.type_checks.null_safety.unchecked);
+}
+
+test "null safety regression: JSON output includes null-safety violations" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Svc {
+        \\    public function run(): void {}
+        \\}
+    ;
+
+    const result = try buildTestGraph(alloc, source);
+
+    var report = UnifiedReport.init(alloc);
+    defer report.deinit();
+    report.populate(result[0], result[1]);
+
+    // Simulate what main.zig does: set null_safety counts from real analyzer
+    report.type_checks.null_safety.pass = 5;
+    report.type_checks.null_safety.fail = 2;
+    report.type_checks.null_safety.unchecked = 0;
+
+    // Add a null-safety violation (as main.zig would)
+    try report.addViolation(.{
+        .severity = .warning,
+        .category = "null-safety",
+        .file_path = "src/Service.php",
+        .line = 10,
+        .message = "Possibly null access on $user",
+    });
+
+    // Write JSON and verify null_safety section
+    const pipe = try std.posix.pipe();
+    const write_file = std.fs.File{ .handle = pipe[1] };
+    const read_file = std.fs.File{ .handle = pipe[0] };
+    defer read_file.close();
+
+    try report.toJson(write_file);
+    write_file.close();
+
+    var output_buf: [8192]u8 = undefined;
+    const n = try read_file.readAll(&output_buf);
+    const output = output_buf[0..n];
+
+    // Verify null_safety section in JSON has real counts
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"null_safety\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"pass\": 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"fail\": 2") != null);
+
+    // Verify violation message is present in violations array
+    try std.testing.expect(std.mem.indexOf(u8, output, "Possibly null access on $user") != null);
+}
+
+test "null safety regression: SARIF output includes null-safety rule and violations" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Svc {
+        \\    public function run(): void {}
+        \\}
+    ;
+
+    const result = try buildTestGraph(alloc, source);
+
+    var unified_report = UnifiedReport.init(alloc);
+    defer unified_report.deinit();
+    unified_report.populate(result[0], result[1]);
+
+    // Add null-safety violations as main.zig would
+    try unified_report.addViolation(.{
+        .severity = .warning,
+        .category = "null-safety",
+        .file_path = "src/UserService.php",
+        .line = 15,
+        .message = "Possibly null method call on $repo",
+    });
+    try unified_report.addViolation(.{
+        .severity = .err,
+        .category = "null-safety",
+        .file_path = "src/OrderService.php",
+        .line = 42,
+        .message = "Definitely null property access on $order",
+    });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out_file = try tmp.dir.createFile("sarif.json", .{});
+    try unified_report.toSarif(out_file);
+    out_file.close();
+
+    const sarif_content = try tmp.dir.readFileAlloc(alloc, "sarif.json", 64 * 1024);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, sarif_content, .{});
+    defer parsed.deinit();
+
+    const run = parsed.value.object.get("runs").?.array.items[0];
+
+    // Verify null-safety rule is present (deduplicated — only 1 rule for 2 violations)
+    const rules = run.object.get("tool").?.object.get("driver").?.object.get("rules").?.array;
+    try std.testing.expect(rules.items.len == 1);
+    try std.testing.expectEqualStrings("phpcma/null-safety", rules.items[0].object.get("id").?.string);
+
+    // Verify both violations are in results
+    const results = run.object.get("results").?.array;
+    try std.testing.expect(results.items.len == 2);
+
+    // Both should reference the null-safety rule
+    try std.testing.expectEqualStrings("phpcma/null-safety", results.items[0].object.get("ruleId").?.string);
+    try std.testing.expectEqualStrings("phpcma/null-safety", results.items[1].object.get("ruleId").?.string);
+
+    // First is warning, second is error
+    try std.testing.expectEqualStrings("warning", results.items[0].object.get("level").?.string);
+    try std.testing.expectEqualStrings("error", results.items[1].object.get("level").?.string);
+
+    // Verify file locations
+    const loc0 = results.items[0].object.get("locations").?.array.items[0].object.get("physicalLocation").?;
+    try std.testing.expectEqualStrings("src/UserService.php", loc0.object.get("artifactLocation").?.object.get("uri").?.string);
+    try std.testing.expect(loc0.object.get("region").?.object.get("startLine").?.integer == 15);
+
+    const loc1 = results.items[1].object.get("locations").?.array.items[0].object.get("physicalLocation").?;
+    try std.testing.expectEqualStrings("src/OrderService.php", loc1.object.get("artifactLocation").?.object.get("uri").?.string);
+    try std.testing.expect(loc1.object.get("region").?.object.get("startLine").?.integer == 42);
+}
+
+test "null safety regression: text output shows null safety row" {
+    const allocator = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer _ = arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\<?php
+        \\class Svc {
+        \\    public function run(): void {}
+        \\}
+    ;
+
+    const result = try buildTestGraph(alloc, source);
+
+    var report = UnifiedReport.init(alloc);
+    defer report.deinit();
+    report.populate(result[0], result[1]);
+
+    // Set null_safety from real analyzer
+    report.type_checks.null_safety.pass = 3;
+    report.type_checks.null_safety.fail = 1;
+
+    // Add a violation
+    try report.addViolation(.{
+        .severity = .warning,
+        .category = "null-safety",
+        .file_path = "src/Svc.php",
+        .line = 5,
+        .message = "Possibly null on $x",
+    });
+
+    const pipe = try std.posix.pipe();
+    const write_file = std.fs.File{ .handle = pipe[1] };
+    const read_file = std.fs.File{ .handle = pipe[0] };
+    defer read_file.close();
+
+    try report.toText(write_file);
+    write_file.close();
+
+    var output_buf: [8192]u8 = undefined;
+    const n = try read_file.readAll(&output_buf);
+    const output = output_buf[0..n];
+
+    // Verify null safety appears in type checks section
+    try std.testing.expect(std.mem.indexOf(u8, output, "Null safety") != null);
+
+    // Verify violation message appears in violations section
+    try std.testing.expect(std.mem.indexOf(u8, output, "Possibly null on $x") != null);
+}
