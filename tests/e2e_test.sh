@@ -510,6 +510,170 @@ assert_contains "$SARIF_CONTENT" "phpcma/null-safety" "SARIF contains null-safet
 echo ""
 
 # ============================================================================
+# Test 16: Return type checker — text output has non-zero counters
+# ============================================================================
+echo "Test 16: Return type checker — non-zero return-type counters in text report"
+OUTPUT=$("$PHPCMA" report --composer="$TEST_PROJECT" --format=text 2>&1) || true
+EXIT_CODE=$?
+
+assert_exit_code 0 "$EXIT_CODE" "exits with 0"
+assert_contains "$OUTPUT" "Return types" "text report has 'Return types' row"
+
+# The ReturnTypeBad.php fixture seeds at least 4 violations (mismatch, missing, null, void_with_value, badBranch)
+# So return_types fail counter must be > 0
+RT_LINE=$(echo "$OUTPUT" | grep "Return types")
+TOTAL=$((TOTAL + 1))
+RT_FAIL=$(echo "$RT_LINE" | grep -oE 'fail:[0-9]+' | grep -oE '[0-9]+')
+if [ -n "$RT_FAIL" ] && [ "$RT_FAIL" -gt 0 ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ return_types fail count = $RT_FAIL (> 0)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ return_types fail count is 0 or missing (expected > 0)"
+    echo "    RT_LINE: $RT_LINE"
+fi
+
+# pass counter should also be > 0 (ReturnTypeGood has valid methods)
+TOTAL=$((TOTAL + 1))
+RT_PASS=$(echo "$RT_LINE" | grep -oE 'pass:[0-9]+' | grep -oE '[0-9]+')
+if [ -n "$RT_PASS" ] && [ "$RT_PASS" -gt 0 ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ return_types pass count = $RT_PASS (> 0)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ return_types pass count is 0 or missing (expected > 0)"
+    echo "    RT_LINE: $RT_LINE"
+fi
+echo ""
+
+# ============================================================================
+# Test 17: Return type checker — violations appear in text report
+# ============================================================================
+echo "Test 17: Return type checker — violations in text output"
+assert_contains "$OUTPUT" "return type mismatch" "text report lists return type mismatch violations"
+assert_contains "$OUTPUT" "ReturnTypeBad" "violations reference ReturnTypeBad class"
+echo ""
+
+# ============================================================================
+# Test 18: Return type checker — JSON report includes return-type data
+# ============================================================================
+echo "Test 18: Return type checker — JSON report includes return-type violations"
+JSON_OUTPUT=$("$PHPCMA" report --composer="$TEST_PROJECT" --format=json 2>&1) || true
+EXIT_CODE=$?
+
+assert_exit_code 0 "$EXIT_CODE" "exits with 0"
+assert_contains "$JSON_OUTPUT" "\"return_types\"" "JSON has return_types section"
+
+# Check that return_types has non-zero fail
+TOTAL=$((TOTAL + 1))
+RT_JSON_FAIL=$(echo "$JSON_OUTPUT" | grep -o '"return_types":[^}]*' | grep -oE '"fail": *[0-9]+' | grep -oE '[0-9]+')
+if [ -n "$RT_JSON_FAIL" ] && [ "$RT_JSON_FAIL" -gt 0 ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ JSON return_types fail = $RT_JSON_FAIL (> 0)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ JSON return_types fail is 0 or missing (expected > 0)"
+fi
+
+# Violations array should contain return type mismatch entries
+assert_contains "$JSON_OUTPUT" "return type mismatch" "JSON violations include return type mismatch"
+echo ""
+
+# ============================================================================
+# Test 19: Return type checker — good fixtures produce no violations
+# ============================================================================
+echo "Test 19: Return type checker — good fixtures produce no false positives"
+
+# Create a clean fixture with only well-typed methods
+RT_GOOD_DIR="$TMPDIR_E2E/rt-good"
+mkdir -p "$RT_GOOD_DIR/src"
+cat > "$RT_GOOD_DIR/composer.json" << 'EOF'
+{"autoload":{"psr-4":{"RtGood\\":"src/"}}}
+EOF
+
+cat > "$RT_GOOD_DIR/src/Clean.php" << 'PHPEOF'
+<?php
+namespace RtGood;
+
+class Clean
+{
+    public function getInt(): int
+    {
+        return 42;
+    }
+
+    public function getString(): string
+    {
+        return "hello";
+    }
+
+    public function doVoid(): void
+    {
+        $x = 1;
+    }
+
+    public function conditional(bool $flag): int
+    {
+        if ($flag) {
+            return 1;
+        } else {
+            return 2;
+        }
+    }
+
+    public function nullable(): ?int
+    {
+        return null;
+    }
+}
+PHPEOF
+
+OUTPUT=$("$PHPCMA" report --composer="$RT_GOOD_DIR/composer.json" --format=text 2>&1) || true
+EXIT_CODE=$?
+
+assert_exit_code 0 "$EXIT_CODE" "exits with 0"
+
+# fail count for return_types should be 0
+RT_LINE=$(echo "$OUTPUT" | grep "Return types")
+TOTAL=$((TOTAL + 1))
+RT_FAIL=$(echo "$RT_LINE" | grep -oE 'fail:[0-9]+' | grep -oE '[0-9]+')
+if [ -n "$RT_FAIL" ] && [ "$RT_FAIL" -eq 0 ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ return_types fail = 0 for clean fixture"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ return_types fail = $RT_FAIL (expected 0 for clean fixture)"
+    echo "    RT_LINE: $RT_LINE"
+fi
+
+# pass count should be > 0
+TOTAL=$((TOTAL + 1))
+RT_PASS=$(echo "$RT_LINE" | grep -oE 'pass:[0-9]+' | grep -oE '[0-9]+')
+if [ -n "$RT_PASS" ] && [ "$RT_PASS" -gt 0 ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ return_types pass = $RT_PASS (> 0 for clean fixture)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ return_types pass = 0 (expected > 0 for clean fixture)"
+    echo "    RT_LINE: $RT_LINE"
+fi
+assert_not_contains "$OUTPUT" "return type mismatch" "no return-type violations for clean fixture"
+echo ""
+
+# ============================================================================
+# Test 20: Return type checker — verbose shows return type pass
+# ============================================================================
+echo "Test 20: Return type checker — verbose mode shows pass 4 return types"
+OUTPUT=$("$PHPCMA" report --composer="$TEST_PROJECT" --verbose --format=text 2>&1) || true
+EXIT_CODE=$?
+
+assert_exit_code 0 "$EXIT_CODE" "exits with 0"
+assert_contains "$OUTPUT" "Pass 4: Checking return types" "verbose shows Pass 4 return type check"
+assert_contains "$OUTPUT" "Methods analyzed:" "verbose shows methods analyzed count"
+assert_contains "$OUTPUT" "diagnostics:" "verbose shows diagnostics count"
+echo ""
+
+# ============================================================================
 # Summary
 # ============================================================================
 echo "========================================"
