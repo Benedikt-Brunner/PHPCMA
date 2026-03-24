@@ -21,6 +21,9 @@ const parallel = @import("parallel.zig");
 // Report module
 const report = @import("report.zig");
 
+// Dead code analysis
+const dead_code = @import("dead_code.zig");
+
 // Framework stubs
 const framework_stubs = @import("framework_stubs.zig");
 
@@ -844,6 +847,19 @@ var check_types_config = struct {
     interface_scope: []const u8 = "all",
 }{};
 
+var check_dead_config = struct {
+    composer: []const u8 = "",
+    config: []const u8 = "",
+    output: []const u8 = "",
+    format: []const u8 = "text",
+    verbose: bool = false,
+    include_public_methods: bool = false,
+    include_public_properties: bool = false,
+    show_reasons: bool = false,
+    max_results: u32 = 0,
+    group_by: []const u8 = "kind",
+}{};
+
 pub fn main() !void {
     var r = try cli.AppRunner.init(std.heap.page_allocator);
 
@@ -1089,6 +1105,69 @@ pub fn main() !void {
                         }),
                         .target = cli.CommandTarget{
                             .action = cli.CommandAction{ .exec = analyzeReport },
+                        },
+                    },
+                    .{
+                        .name = "check-dead",
+                        .description = .{ .one_line = "Detect dead (unreferenced) code in a PHP project" },
+                        .options = try r.allocOptions(&.{
+                            .{
+                                .long_name = "composer",
+                                .short_alias = 'c',
+                                .help = "Path to composer.json (single project mode)",
+                                .value_ref = r.mkRef(&check_dead_config.composer),
+                            },
+                            .{
+                                .long_name = "config",
+                                .short_alias = 'g',
+                                .help = "Path to .phpcma.json (monorepo mode)",
+                                .value_ref = r.mkRef(&check_dead_config.config),
+                            },
+                            .{
+                                .long_name = "output",
+                                .short_alias = 'o',
+                                .help = "Output file (default: stdout)",
+                                .value_ref = r.mkRef(&check_dead_config.output),
+                            },
+                            .{
+                                .long_name = "format",
+                                .help = "Output format: text, json, sarif, or checkstyle (default: text)",
+                                .value_ref = r.mkRef(&check_dead_config.format),
+                            },
+                            .{
+                                .long_name = "verbose",
+                                .short_alias = 'v',
+                                .help = "Verbose output",
+                                .value_ref = r.mkRef(&check_dead_config.verbose),
+                            },
+                            .{
+                                .long_name = "include-public-methods",
+                                .help = "Include public methods in dead code report (off by default)",
+                                .value_ref = r.mkRef(&check_dead_config.include_public_methods),
+                            },
+                            .{
+                                .long_name = "include-public-properties",
+                                .help = "Include public properties in dead code report (off by default)",
+                                .value_ref = r.mkRef(&check_dead_config.include_public_properties),
+                            },
+                            .{
+                                .long_name = "show-reasons",
+                                .help = "Show why symbols were kept alive",
+                                .value_ref = r.mkRef(&check_dead_config.show_reasons),
+                            },
+                            .{
+                                .long_name = "max-results",
+                                .help = "Maximum number of dead symbols to report (default: unlimited)",
+                                .value_ref = r.mkRef(&check_dead_config.max_results),
+                            },
+                            .{
+                                .long_name = "group-by",
+                                .help = "Group results by: module, file, or kind (default: kind)",
+                                .value_ref = r.mkRef(&check_dead_config.group_by),
+                            },
+                        }),
+                        .target = cli.CommandTarget{
+                            .action = cli.CommandAction{ .exec = analyzeCheckDead },
                         },
                     },
                 }),
@@ -1817,6 +1896,511 @@ fn analyzeCheckTypes() !void {
     }
 }
 
+fn analyzeCheckDead() !void {
+    var arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
+    defer _ = arena.deinit();
+    const allocator = arena.allocator();
+
+    const stdout: std.fs.File = std.fs.File.stdout();
+
+    // Validate input
+    const has_composer = check_dead_config.composer.len > 0;
+    const has_config = check_dead_config.config.len > 0;
+
+    if (!has_composer and !has_config) {
+        try stdout.writeAll("Error: Either --composer (-c) or --config (-g) must be specified\n");
+        return;
+    }
+
+    if (has_composer and has_config) {
+        try stdout.writeAll("Error: Cannot use both --composer (-c) and --config (-g) at the same time\n");
+        return;
+    }
+
+    // Pass 1: Discover files
+    var project_configs: []ProjectConfig = undefined;
+    var files: []const []const u8 = undefined;
+
+    if (has_config) {
+        if (check_dead_config.verbose) {
+            try stdout.writeAll("Pass 1: Discovering files from .phpcma.json (monorepo mode)...\n");
+        }
+
+        var phpcma_config = config_parser.parseConfigFile(allocator, check_dead_config.config) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "Error parsing .phpcma.json: {}\n", .{err});
+            try stdout.writeAll(msg);
+            return;
+        };
+
+        if (check_dead_config.verbose) {
+            try config_parser.printConfig(&phpcma_config, stdout);
+            try stdout.writeAll("\n");
+        }
+
+        project_configs = config_parser.parseDiscoveredProjects(allocator, &phpcma_config) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "Error parsing projects: {}\n", .{err});
+            try stdout.writeAll(msg);
+            return;
+        };
+
+        files = config_parser.discoverFilesFromConfigs(allocator, project_configs) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "Error discovering files: {}\n", .{err});
+            try stdout.writeAll(msg);
+            return;
+        };
+    } else {
+        if (check_dead_config.verbose) {
+            try stdout.writeAll("Pass 1: Discovering files from composer.json...\n");
+        }
+
+        const single_config = composer.parseComposerJson(allocator, check_dead_config.composer) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "Error parsing composer.json: {}\n", .{err});
+            try stdout.writeAll(msg);
+            return;
+        };
+
+        var configs_array = try allocator.alloc(ProjectConfig, 1);
+        configs_array[0] = single_config;
+        project_configs = configs_array;
+        files = try composer.discoverFiles(allocator, &single_config);
+    }
+
+    if (check_dead_config.verbose) {
+        const msg = try std.fmt.allocPrint(allocator, "Discovered {d} PHP files\n\n", .{files.len});
+        try stdout.writeAll(msg);
+    }
+
+    // Pass 2: Collect symbols
+    if (check_dead_config.verbose) {
+        const thread_count = parallel.getThreadCount(files.len);
+        const msg = try std.fmt.allocPrint(allocator, "Pass 2: Collecting symbols ({d} threads)...\n", .{thread_count});
+        try stdout.writeAll(msg);
+    }
+
+    var sym_table = SymbolTable.init(allocator);
+    defer sym_table.deinit();
+
+    var file_contexts = std.StringHashMap(FileContext).init(allocator);
+    defer {
+        var it = file_contexts.valueIterator();
+        while (it.next()) |ctx| {
+            ctx.deinit();
+        }
+        file_contexts.deinit();
+    }
+
+    var file_sources = std.StringHashMap([]const u8).init(allocator);
+    defer file_sources.deinit();
+
+    try parallel.parallelSymbolCollect(
+        allocator,
+        files,
+        project_configs,
+        &sym_table,
+        &file_contexts,
+        &file_sources,
+        &collectSymbolsFromSource,
+    );
+
+    // Register framework API stubs
+    try framework_stubs.registerFrameworkStubs(allocator, &sym_table);
+
+    // Pass 3: Resolve inheritance
+    if (check_dead_config.verbose) {
+        try stdout.writeAll("Pass 3: Resolving inheritance...\n");
+    }
+
+    try sym_table.resolveInheritance();
+
+    // Pass 4: Analyze calls
+    if (check_dead_config.verbose) {
+        const thread_count = parallel.getThreadCount(files.len);
+        const msg = try std.fmt.allocPrint(allocator, "Pass 4: Analyzing calls ({d} threads)...\n", .{thread_count});
+        try stdout.writeAll(msg);
+    }
+
+    var call_graph = ProjectCallGraph.init(allocator, &sym_table);
+    defer call_graph.deinit();
+
+    try parallel.parallelCallAnalysis(
+        allocator,
+        files,
+        &file_sources,
+        &file_contexts,
+        &sym_table,
+        &call_graph,
+    );
+
+    // Pass 5: Dead code analysis
+    if (check_dead_config.verbose) {
+        try stdout.writeAll("Pass 5: Running dead code analysis...\n");
+    }
+
+    // Extract liveness references from call graph
+    const refs = try dead_code.extractRefsFromCallGraph(allocator, &call_graph, &sym_table);
+    defer allocator.free(refs);
+
+    // Run liveness analysis
+    var graph = dead_code.ProjectLivenessGraph.init(allocator);
+    defer graph.deinit();
+    try graph.analyze(&sym_table, refs);
+
+    // Collect dead symbols
+    const dead_symbols = try graph.collectDead(&sym_table);
+    defer allocator.free(dead_symbols);
+
+    // Count statistics
+    var dead_classes: usize = 0;
+    var dead_interfaces: usize = 0;
+    var dead_traits: usize = 0;
+    var dead_functions: usize = 0;
+    var dead_methods: usize = 0;
+    var dead_properties: usize = 0;
+    var dead_methods_private: usize = 0;
+    var dead_methods_public: usize = 0;
+
+    for (dead_symbols) |d| {
+        switch (d.kind) {
+            .class => dead_classes += 1,
+            .interface => dead_interfaces += 1,
+            .trait => dead_traits += 1,
+            .function => dead_functions += 1,
+            .method => {
+                dead_methods += 1;
+                const vis = dead_code.ProjectLivenessGraph.getMethodVisibility(d.fqn, &sym_table);
+                if (vis == .private) {
+                    dead_methods_private += 1;
+                } else {
+                    dead_methods_public += 1;
+                }
+            },
+            .property => dead_properties += 1,
+        }
+    }
+
+    // Count kept-alive symbols
+    const total_symbols = graph.index.count();
+    var kept_unresolved: usize = 0;
+    var kept_string: usize = 0;
+    var kept_structure: usize = 0;
+    var sid: dead_code.SymbolId = 0;
+    while (sid < total_symbols) : (sid += 1) {
+        if (graph.isWeaklyAlive(sid)) {
+            kept_unresolved += 1;
+        }
+    }
+    // String/reflection and structural deps tracked as weak references
+    kept_string = 0;
+    kept_structure = 0;
+
+    // Filter dead symbols based on config flags
+    var filtered_dead = std.ArrayListUnmanaged(dead_code.DeadSymbol).empty;
+    defer filtered_dead.deinit(allocator);
+
+    for (dead_symbols) |d| {
+        switch (d.kind) {
+            .method => {
+                const vis = dead_code.ProjectLivenessGraph.getMethodVisibility(d.fqn, &sym_table);
+                if (vis != .private and !check_dead_config.include_public_methods) continue;
+            },
+            .property => {
+                if (!check_dead_config.include_public_properties) {
+                    // Check if property is public
+                    const owner_fqn = if (std.mem.indexOf(u8, d.fqn, "::")) |sep| d.fqn[0..sep] else continue;
+                    const raw_name = d.fqn[(std.mem.indexOf(u8, d.fqn, "::") orelse continue) + 2 ..];
+                    const prop_name = if (raw_name.len > 0 and raw_name[0] == '$') raw_name[1..] else raw_name;
+                    if (sym_table.classes.get(owner_fqn)) |class| {
+                        if (class.properties.get(prop_name)) |prop| {
+                            if (prop.visibility != .private) continue;
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+        try filtered_dead.append(allocator, d);
+    }
+
+    // Apply max-results limit
+    var results_to_show = filtered_dead.items;
+    if (check_dead_config.max_results > 0 and results_to_show.len > check_dead_config.max_results) {
+        results_to_show = results_to_show[0..check_dead_config.max_results];
+    }
+
+    if (check_dead_config.verbose) {
+        const msg = try std.fmt.allocPrint(allocator, "  Total symbols: {d}, Dead: {d}, Filtered: {d}\n\n", .{
+            total_symbols, dead_symbols.len, results_to_show.len,
+        });
+        try stdout.writeAll(msg);
+    }
+
+    // Output
+    const out_file = if (check_dead_config.output.len > 0) blk: {
+        break :blk try std.fs.cwd().createFile(check_dead_config.output, .{});
+    } else stdout;
+
+    defer {
+        if (check_dead_config.output.len > 0) {
+            out_file.close();
+        }
+    }
+
+    if (std.mem.eql(u8, check_dead_config.format, "json")) {
+        try writeDeadCodeJson(allocator, out_file, results_to_show, dead_classes, dead_interfaces, dead_traits, dead_functions, dead_methods, dead_properties, dead_methods_private, dead_methods_public, kept_unresolved, kept_string, kept_structure);
+    } else if (std.mem.eql(u8, check_dead_config.format, "sarif")) {
+        try writeDeadCodeSarif(out_file, results_to_show);
+    } else if (std.mem.eql(u8, check_dead_config.format, "checkstyle")) {
+        try writeDeadCodeCheckstyle(out_file, results_to_show);
+    } else {
+        try writeDeadCodeText(out_file, results_to_show, dead_classes, dead_interfaces, dead_traits, dead_functions, dead_methods, dead_properties, dead_methods_private, dead_methods_public, kept_unresolved, kept_string, kept_structure);
+    }
+
+    if (check_dead_config.output.len > 0) {
+        const msg = try std.fmt.allocPrint(allocator, "Output written to: {s}\n", .{check_dead_config.output});
+        try stdout.writeAll(msg);
+    }
+}
+
+fn writeDeadCodeText(
+    file: std.fs.File,
+    results: []const dead_code.DeadSymbol,
+    dead_classes: usize,
+    dead_interfaces: usize,
+    dead_traits: usize,
+    dead_functions: usize,
+    dead_methods: usize,
+    dead_properties: usize,
+    dead_methods_private: usize,
+    dead_methods_public: usize,
+    kept_unresolved: usize,
+    kept_string: usize,
+    kept_structure: usize,
+) !void {
+    var buf: [4096]u8 = undefined;
+    var w = file.writer(&buf);
+    const writer = &w.interface;
+
+    try writer.writeAll("Dead Code Analysis\n");
+    try writer.writeAll("==================\n");
+    try writer.print("Dead classes:     {d}\n", .{dead_classes});
+    try writer.print("Dead interfaces:   {d}\n", .{dead_interfaces});
+    try writer.print("Dead traits:       {d}\n", .{dead_traits});
+    try writer.print("Dead functions:    {d}\n", .{dead_functions});
+    try writer.print("Dead methods:     {d} ({d} private, {d} public)\n", .{ dead_methods, dead_methods_private, dead_methods_public });
+    try writer.print("Dead properties:  {d} (private only)\n\n", .{dead_properties});
+
+    if (kept_unresolved > 0 or kept_string > 0 or kept_structure > 0) {
+        try writer.writeAll("Conservatively kept alive:\n");
+        try writer.print("  By unresolved calls:    {d} symbols\n", .{kept_unresolved});
+        try writer.print("  By string/reflection:    {d} symbols\n", .{kept_string});
+        try writer.print("  By structural deps:     {d} symbols\n\n", .{kept_structure});
+    }
+
+    if (results.len > 0) {
+        try writer.writeAll("Definitely dead symbols:\n");
+        for (results) |d| {
+            const kind_str = switch (d.kind) {
+                .class => "class",
+                .interface => "interface",
+                .trait => "trait",
+                .function => "function",
+                .method => "method",
+                .property => "property",
+            };
+            try writer.print("  [DEAD] {s} ({s})\n", .{ d.fqn, kind_str });
+            try writer.print("    at {s}:{d}\n", .{ d.file_path, d.line });
+        }
+    }
+
+    try writer.flush();
+}
+
+fn writeDeadCodeJson(
+    allocator: std.mem.Allocator,
+    file: std.fs.File,
+    results: []const dead_code.DeadSymbol,
+    dead_classes: usize,
+    dead_interfaces: usize,
+    dead_traits: usize,
+    dead_functions: usize,
+    dead_methods: usize,
+    dead_properties: usize,
+    dead_methods_private: usize,
+    dead_methods_public: usize,
+    kept_unresolved: usize,
+    kept_string: usize,
+    kept_structure: usize,
+) !void {
+    _ = allocator;
+    var buf: [4096]u8 = undefined;
+    var w = file.writer(&buf);
+    const writer = &w.interface;
+
+    try writer.writeAll("{\n");
+    try writer.writeAll("  \"dead_code\": {\n");
+    try writer.print("    \"dead_classes\": {d},\n", .{dead_classes});
+    try writer.print("    \"dead_interfaces\": {d},\n", .{dead_interfaces});
+    try writer.print("    \"dead_traits\": {d},\n", .{dead_traits});
+    try writer.print("    \"dead_functions\": {d},\n", .{dead_functions});
+    try writer.print("    \"dead_methods\": {d},\n", .{dead_methods});
+    try writer.print("    \"dead_properties\": {d},\n", .{dead_properties});
+    try writer.print("    \"dead_methods_private\": {d},\n", .{dead_methods_private});
+    try writer.print("    \"dead_methods_public\": {d},\n", .{dead_methods_public});
+    try writer.print("    \"kept_alive_by_unresolved\": {d},\n", .{kept_unresolved});
+    try writer.print("    \"kept_alive_by_string\": {d},\n", .{kept_string});
+    try writer.print("    \"kept_alive_by_structure\": {d},\n", .{kept_structure});
+    try writer.writeAll("    \"dead_symbols\": [");
+    for (results, 0..) |d, i| {
+        if (i > 0) try writer.writeAll(",");
+        const kind_str = switch (d.kind) {
+            .class => "class",
+            .interface => "interface",
+            .trait => "trait",
+            .function => "function",
+            .method => "method",
+            .property => "property",
+        };
+        try writer.writeAll("\n      {");
+        try writer.print("\"fqn\": \"{s}\", ", .{d.fqn});
+        try writer.print("\"kind\": \"{s}\", ", .{kind_str});
+        try writer.print("\"file\": \"{s}\", ", .{d.file_path});
+        try writer.print("\"line\": {d}", .{d.line});
+        try writer.writeAll("}");
+    }
+    if (results.len > 0) {
+        try writer.writeAll("\n    ");
+    }
+    try writer.writeAll("]\n");
+    try writer.writeAll("  }\n");
+    try writer.writeAll("}\n");
+    try writer.flush();
+}
+
+fn writeDeadCodeSarif(file: std.fs.File, results: []const dead_code.DeadSymbol) !void {
+    var buf: [4096]u8 = undefined;
+    var w = file.writer(&buf);
+    const writer = &w.interface;
+
+    try writer.writeAll("{\n");
+    try writer.writeAll("  \"$schema\": \"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json\",\n");
+    try writer.writeAll("  \"version\": \"2.1.0\",\n");
+    try writer.writeAll("  \"runs\": [{\n");
+    try writer.writeAll("    \"tool\": {\n");
+    try writer.writeAll("      \"driver\": {\n");
+    try writer.writeAll("        \"name\": \"phpcma\",\n");
+    try writer.writeAll("        \"version\": \"0.4.0\",\n");
+    try writer.writeAll("        \"informationUri\": \"https://github.com/benedikt-brunner/phpcma\",\n");
+    try writer.writeAll("        \"rules\": [\n");
+    try writer.writeAll("          {\n");
+    try writer.writeAll("            \"id\": \"phpcma/dead-code\",\n");
+    try writer.writeAll("            \"shortDescription\": {\n");
+    try writer.writeAll("              \"text\": \"Dead code detection\"\n");
+    try writer.writeAll("            },\n");
+    try writer.writeAll("            \"defaultConfiguration\": {\n");
+    try writer.writeAll("              \"level\": \"warning\"\n");
+    try writer.writeAll("            }\n");
+    try writer.writeAll("          }\n");
+    try writer.writeAll("        ]\n");
+    try writer.writeAll("      }\n");
+    try writer.writeAll("    },\n");
+
+    try writer.writeAll("    \"results\": [");
+    for (results, 0..) |d, i| {
+        if (i > 0) try writer.writeAll(",");
+        const kind_str = switch (d.kind) {
+            .class => "class",
+            .interface => "interface",
+            .trait => "trait",
+            .function => "function",
+            .method => "method",
+            .property => "property",
+        };
+        try writer.writeAll("\n      {\n");
+        try writer.writeAll("        \"ruleId\": \"phpcma/dead-code\",\n");
+        try writer.writeAll("        \"level\": \"warning\",\n");
+        try writer.writeAll("        \"message\": {\n");
+        try writer.print("          \"text\": \"Dead {s}: {s}\"\n", .{ kind_str, d.fqn });
+        try writer.writeAll("        },\n");
+        try writer.writeAll("        \"locations\": [{\n");
+        try writer.writeAll("          \"physicalLocation\": {\n");
+        try writer.writeAll("            \"artifactLocation\": {\n");
+        try writer.print("              \"uri\": \"{s}\"\n", .{d.file_path});
+        try writer.writeAll("            },\n");
+        try writer.writeAll("            \"region\": {\n");
+        try writer.print("              \"startLine\": {d}\n", .{d.line});
+        try writer.writeAll("            }\n");
+        try writer.writeAll("          }\n");
+        try writer.writeAll("        }]\n");
+        try writer.writeAll("      }");
+    }
+    if (results.len > 0) {
+        try writer.writeAll("\n    ");
+    }
+    try writer.writeAll("]\n");
+    try writer.writeAll("  }]\n");
+    try writer.writeAll("}\n");
+    try writer.flush();
+}
+
+fn writeDeadCodeCheckstyle(file: std.fs.File, results: []const dead_code.DeadSymbol) !void {
+    var buf: [4096]u8 = undefined;
+    var w = file.writer(&buf);
+    const writer = &w.interface;
+
+    try writer.writeAll("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    try writer.writeAll("<checkstyle version=\"4.3\">\n");
+
+    if (results.len == 0) {
+        try writer.writeAll("</checkstyle>\n");
+        try writer.flush();
+        return;
+    }
+
+    // Group by file
+    var emitted: usize = 0;
+    while (emitted < results.len) {
+        const current_file = results[emitted].file_path;
+
+        // Skip if already emitted
+        var already_done = false;
+        for (results[0..emitted]) |prev| {
+            if (std.mem.eql(u8, prev.file_path, current_file)) {
+                already_done = true;
+                break;
+            }
+        }
+        if (already_done) {
+            emitted += 1;
+            continue;
+        }
+
+        try writer.print("  <file name=\"{s}\">\n", .{current_file});
+
+        for (results) |d| {
+            if (!std.mem.eql(u8, d.file_path, current_file)) continue;
+            const kind_str = switch (d.kind) {
+                .class => "class",
+                .interface => "interface",
+                .trait => "trait",
+                .function => "function",
+                .method => "method",
+                .property => "property",
+            };
+            try writer.print("    <error line=\"{d}\" column=\"1\" severity=\"warning\" message=\"Dead {s}: {s}\" source=\"phpcma.dead-code\"/>\n", .{
+                d.line,
+                kind_str,
+                d.fqn,
+            });
+        }
+
+        try writer.writeAll("  </file>\n");
+        emitted += 1;
+    }
+
+    try writer.writeAll("</checkstyle>\n");
+    try writer.flush();
+}
+
 fn analyzeReport() !void {
     var arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
     defer _ = arena.deinit();
@@ -2039,15 +2623,82 @@ fn analyzeReport() !void {
         try stdout.writeAll(msg);
     }
 
-    // Pass 7: Generate unified report
+    // Pass 7: Dead code analysis
     if (report_config.verbose) {
-        try stdout.writeAll("Pass 7: Generating unified report...\n\n");
+        try stdout.writeAll("Pass 7: Running dead code analysis...\n");
+    }
+
+    const dc_refs = try dead_code.extractRefsFromCallGraph(allocator, &call_graph, &sym_table);
+    defer allocator.free(dc_refs);
+
+    var dc_graph = dead_code.ProjectLivenessGraph.init(allocator);
+    defer dc_graph.deinit();
+    try dc_graph.analyze(&sym_table, dc_refs);
+
+    const dc_dead = try dc_graph.collectDead(&sym_table);
+    defer allocator.free(dc_dead);
+
+    if (report_config.verbose) {
+        const msg = try std.fmt.allocPrint(allocator, "  Dead symbols found: {d}\n\n", .{dc_dead.len});
+        try stdout.writeAll(msg);
+    }
+
+    // Pass 8: Generate unified report
+    if (report_config.verbose) {
+        try stdout.writeAll("Pass 8: Generating unified report...\n\n");
     }
 
     var unified_report = report.UnifiedReport.init(allocator);
     defer unified_report.deinit();
     unified_report.populate(&sym_table, &call_graph);
     unified_report.coverage.total_files = files.len;
+
+    // Populate dead code section
+    for (dc_dead) |d| {
+        switch (d.kind) {
+            .class => unified_report.dead_code.dead_classes += 1,
+            .interface => unified_report.dead_code.dead_interfaces += 1,
+            .trait => unified_report.dead_code.dead_traits += 1,
+            .function => unified_report.dead_code.dead_functions += 1,
+            .method => {
+                unified_report.dead_code.dead_methods += 1;
+                const vis = dead_code.ProjectLivenessGraph.getMethodVisibility(d.fqn, &sym_table);
+                if (vis == .private) {
+                    unified_report.dead_code.dead_methods_private += 1;
+                } else {
+                    unified_report.dead_code.dead_methods_public += 1;
+                }
+            },
+            .property => unified_report.dead_code.dead_properties += 1,
+        }
+
+        // Add top candidates (limit to 50)
+        if (unified_report.dead_code.top_dead_candidates.items.len < 50) {
+            const kind_str = switch (d.kind) {
+                .class => "class",
+                .interface => "interface",
+                .trait => "trait",
+                .function => "function",
+                .method => "method",
+                .property => "property",
+            };
+            try unified_report.dead_code.top_dead_candidates.append(allocator, .{
+                .fqn = d.fqn,
+                .kind = kind_str,
+                .file_path = d.file_path,
+                .line = d.line,
+            });
+        }
+    }
+
+    // Count kept-alive-by-unresolved
+    const dc_total = dc_graph.index.count();
+    var dc_sid: dead_code.SymbolId = 0;
+    while (dc_sid < dc_total) : (dc_sid += 1) {
+        if (dc_graph.isWeaklyAlive(dc_sid)) {
+            unified_report.dead_code.kept_alive_by_unresolved += 1;
+        }
+    }
 
     // Merge return type checker results into report
     const rt_result = rt_checker.result();

@@ -8,6 +8,10 @@ const FunctionSymbol = types.FunctionSymbol;
 const MethodSymbol = types.MethodSymbol;
 const Visibility = types.Visibility;
 const SymbolTable = @import("symbol_table.zig").SymbolTable;
+const call_analyzer = @import("call_analyzer.zig");
+const ProjectCallGraph = call_analyzer.ProjectCallGraph;
+const EnhancedFunctionCall = types.EnhancedFunctionCall;
+const ResolutionMethod = types.ResolutionMethod;
 
 // ============================================================================
 // Symbol Identification
@@ -666,7 +670,7 @@ pub const ProjectLivenessGraph = struct {
         return if (std.mem.indexOf(u8, fqn, "::")) |sep| fqn[sep + 2 ..] else fqn;
     }
 
-    fn getMethodVisibility(method_fqn: []const u8, sym: *const SymbolTable) Visibility {
+    pub fn getMethodVisibility(method_fqn: []const u8, sym: *const SymbolTable) Visibility {
         const sep = std.mem.indexOf(u8, method_fqn, "::") orelse return .public;
         const class_fqcn = method_fqn[0..sep];
         const method_name = method_fqn[sep + 2 ..];
@@ -725,6 +729,134 @@ pub const ProjectLivenessGraph = struct {
         return .{ .file_path = "", .line = 0 };
     }
 };
+
+// ============================================================================
+// Reference Extraction — call graph → LivenessRef[]
+// ============================================================================
+
+/// Extract liveness references from a ProjectCallGraph.
+/// Each resolved call becomes a strong reference; each unresolved call becomes
+/// a weak reference for conservative expansion.
+pub fn extractRefsFromCallGraph(
+    allocator: std.mem.Allocator,
+    call_graph: *const ProjectCallGraph,
+    sym_table: *const SymbolTable,
+) ![]LivenessRef {
+    var refs = std.ArrayListUnmanaged(LivenessRef).empty;
+
+    // 1. Every resolved call → strong reference to the target
+    for (call_graph.calls.items) |call| {
+        if (call.resolved_target) |target| {
+            const target_kind: SymbolKind = switch (call.call_type) {
+                .function => .function,
+                .method, .static_method => .method,
+            };
+            const reason: LivenessReason = switch (call.resolution_method) {
+                .constructor_call, .constructor_injection => .instantiate,
+                .static_call => .static_access,
+                .plugin_generated => .resolved_call,
+                .phpdoc => .phpdoc,
+                .unresolved => .unresolved_call,
+                .native_type,
+                .explicit_type,
+                .assignment,
+                .assignment_tracking,
+                .this_call,
+                .this_reference,
+                .self_reference,
+                .static_reference,
+                .parent_reference,
+                .property_type,
+                .return_type_chain,
+                => .resolved_call,
+            };
+            try refs.append(allocator, .{
+                .target_fqn = target,
+                .target_kind = target_kind,
+                .reason = reason,
+                .is_weak = call.resolution_method == .unresolved,
+                .source_file = call.file_path,
+                .source_line = call.line,
+            });
+
+            // A resolved call to Class::method also keeps the class alive
+            if (target_kind == .method) {
+                if (std.mem.indexOf(u8, target, "::")) |sep| {
+                    const class_fqcn = target[0..sep];
+                    try refs.append(allocator, .{
+                        .target_fqn = class_fqcn,
+                        .target_kind = .class,
+                        .reason = .resolved_call,
+                        .is_weak = false,
+                        .source_file = call.file_path,
+                        .source_line = call.line,
+                    });
+                }
+            }
+        } else {
+            // Unresolved call → weak reference for conservative expansion
+            const target_kind: SymbolKind = switch (call.call_type) {
+                .function => .function,
+                .method, .static_method => .method,
+            };
+            try refs.append(allocator, .{
+                .target_fqn = call.callee_name,
+                .target_kind = target_kind,
+                .reason = .unresolved_call,
+                .is_weak = true,
+                .source_file = call.file_path,
+                .source_line = call.line,
+            });
+        }
+    }
+
+    // 2. All classes that appear as type hints / extends / implements are alive
+    var class_it = sym_table.classes.iterator();
+    while (class_it.next()) |entry| {
+        const fqcn = entry.key_ptr.*;
+        const class = entry.value_ptr;
+
+        // extends → parent alive
+        if (class.extends) |parent| {
+            try refs.append(allocator, .{
+                .target_fqn = parent,
+                .target_kind = .class,
+                .reason = .inheritance,
+                .is_weak = false,
+                .source_file = class.file_path,
+                .source_line = class.start_line,
+            });
+        }
+
+        // implements → interfaces alive
+        for (class.implements) |iface_fqcn| {
+            try refs.append(allocator, .{
+                .target_fqn = iface_fqcn,
+                .target_kind = .interface,
+                .reason = .interface_impl,
+                .is_weak = false,
+                .source_file = class.file_path,
+                .source_line = class.start_line,
+            });
+        }
+
+        // trait use → traits alive
+        for (class.uses) |trait_fqcn| {
+            try refs.append(allocator, .{
+                .target_fqn = trait_fqcn,
+                .target_kind = .trait,
+                .reason = .trait_use,
+                .is_weak = false,
+                .source_file = class.file_path,
+                .source_line = class.start_line,
+            });
+        }
+
+        _ = fqcn;
+    }
+
+    return refs.toOwnedSlice(allocator);
+}
 
 // ============================================================================
 // Tests
@@ -1200,4 +1332,160 @@ test "collectDead returns only dead symbols" {
     }
     try std.testing.expect(found_dead_class);
     try std.testing.expect(found_dead_func);
+}
+
+test "extractRefsFromCallGraph: resolved calls produce strong references" {
+    const allocator = std.testing.allocator;
+    var sym = SymbolTable.init(allocator);
+    defer sym.deinit();
+
+    var class = ClassSymbol.init(allocator, "App\\Service");
+    class.file_path = "service.php";
+    class.start_line = 1;
+    try class.addMethod(.{
+        .name = "run",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 5,
+        .end_line = 10,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\Service",
+        .file_path = "service.php",
+    });
+    try sym.addClass(class);
+
+    var unused_class = ClassSymbol.init(allocator, "App\\Unused");
+    unused_class.file_path = "unused.php";
+    unused_class.start_line = 1;
+    try sym.addClass(unused_class);
+
+    try sym.resolveInheritance();
+
+    var call_graph = ProjectCallGraph.init(allocator, &sym);
+    defer call_graph.deinit();
+
+    // Simulate a resolved call to App\\Service::run
+    try call_graph.calls.append(allocator, .{
+        .caller_fqn = "main",
+        .callee_name = "run",
+        .call_type = .method,
+        .line = 1,
+        .column = 0,
+        .file_path = "main.php",
+        .resolved_target = "App\\Service::run",
+        .resolution_confidence = 1.0,
+        .resolution_method = .this_call,
+    });
+    call_graph.total_calls = 1;
+    call_graph.resolved_calls = 1;
+
+    const refs = try extractRefsFromCallGraph(allocator, &call_graph, &sym);
+    defer allocator.free(refs);
+
+    // Should have at least 2 refs: the method call + the class ref
+    try std.testing.expect(refs.len >= 2);
+
+    // Run full analysis
+    var graph = ProjectLivenessGraph.init(allocator);
+    defer graph.deinit();
+    try graph.analyze(&sym, refs);
+
+    // Service is alive (referenced), Unused is dead
+    try std.testing.expect(graph.isAlive(graph.index.lookup("App\\Service").?));
+    try std.testing.expect(!graph.isAlive(graph.index.lookup("App\\Unused").?));
+}
+
+test "extractRefsFromCallGraph: unresolved calls produce weak references" {
+    const allocator = std.testing.allocator;
+    var sym = SymbolTable.init(allocator);
+    defer sym.deinit();
+
+    var class_a = ClassSymbol.init(allocator, "App\\Alpha");
+    class_a.file_path = "alpha.php";
+    try class_a.addMethod(.{
+        .name = "handle",
+        .visibility = .public,
+        .is_static = false,
+        .is_abstract = false,
+        .is_final = false,
+        .parameters = &.{},
+        .return_type = null,
+        .phpdoc_return = null,
+        .start_line = 5,
+        .end_line = 10,
+        .start_byte = 0,
+        .end_byte = 0,
+        .containing_class = "App\\Alpha",
+        .file_path = "alpha.php",
+    });
+    try sym.addClass(class_a);
+    try sym.resolveInheritance();
+
+    var call_graph = ProjectCallGraph.init(allocator, &sym);
+    defer call_graph.deinit();
+
+    // Simulate an unresolved call
+    try call_graph.calls.append(allocator, .{
+        .caller_fqn = "main",
+        .callee_name = "handle",
+        .call_type = .method,
+        .line = 1,
+        .column = 0,
+        .file_path = "main.php",
+        .resolved_target = null,
+        .resolution_confidence = 0.0,
+        .resolution_method = .unresolved,
+    });
+    call_graph.total_calls = 1;
+    call_graph.unresolved_calls = 1;
+
+    const refs = try extractRefsFromCallGraph(allocator, &call_graph, &sym);
+    defer allocator.free(refs);
+
+    // Should have a weak ref
+    var has_weak = false;
+    for (refs) |r| {
+        if (r.is_weak and r.reason == .unresolved_call) has_weak = true;
+    }
+    try std.testing.expect(has_weak);
+}
+
+test "extractRefsFromCallGraph: inheritance refs keep parents alive" {
+    const allocator = std.testing.allocator;
+    var sym = SymbolTable.init(allocator);
+    defer sym.deinit();
+
+    var parent = ClassSymbol.init(allocator, "App\\Base");
+    parent.file_path = "base.php";
+    parent.start_line = 1;
+    try sym.addClass(parent);
+
+    var child = ClassSymbol.init(allocator, "App\\Child");
+    child.file_path = "child.php";
+    child.start_line = 1;
+    child.extends = "App\\Base";
+    try sym.addClass(child);
+
+    try sym.resolveInheritance();
+
+    var call_graph = ProjectCallGraph.init(allocator, &sym);
+    defer call_graph.deinit();
+
+    const refs = try extractRefsFromCallGraph(allocator, &call_graph, &sym);
+    defer allocator.free(refs);
+
+    // Should have an inheritance ref from child to parent
+    var has_inheritance = false;
+    for (refs) |r| {
+        if (r.reason == .inheritance and std.mem.eql(u8, r.target_fqn, "App\\Base")) {
+            has_inheritance = true;
+        }
+    }
+    try std.testing.expect(has_inheritance);
 }

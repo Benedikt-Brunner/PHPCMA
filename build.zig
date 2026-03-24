@@ -281,6 +281,18 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    dead_code_tests.root_module.addImport("tree-sitter", ts_dep.module("tree_sitter"));
+    dead_code_tests.root_module.addImport("cli", cli_dep.module("cli"));
+    dead_code_tests.addIncludePath(php_src_root);
+    dead_code_tests.addCSourceFile(.{
+        .file = php_src_root.path(b, "parser.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    dead_code_tests.addCSourceFile(.{
+        .file = php_src_root.path(b, "scanner.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    dead_code_tests.linkLibC();
 
     const run_dead_code_tests = b.addRunArtifact(dead_code_tests);
     test_step.dependOn(&run_dead_code_tests.step);
