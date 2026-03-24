@@ -674,6 +674,284 @@ assert_contains "$OUTPUT" "diagnostics:" "verbose shows diagnostics count"
 echo ""
 
 # ============================================================================
+# Test 21: Interface compliance regression — case-a: cross-project interface
+#           + direct call to violating method (should detect return type
+#           mismatch + param count mismatch)
+# ============================================================================
+echo "Test 21: Interface compliance — case-a: cross-project iface + direct call"
+
+IFACE_A_DIR="$TMPDIR_E2E/iface-case-a"
+mkdir -p "$IFACE_A_DIR/packages/lib-iface/src" "$IFACE_A_DIR/packages/lib-impl/src" "$IFACE_A_DIR/packages/app/src"
+
+cat > "$IFACE_A_DIR/.phpcma.json" << 'EOF'
+{"scan_paths":["packages"]}
+EOF
+
+cat > "$IFACE_A_DIR/packages/lib-iface/composer.json" << 'EOF'
+{"autoload":{"psr-4":{"LibIface\\":"src/"}}}
+EOF
+
+cat > "$IFACE_A_DIR/packages/lib-iface/src/SnapshotInterface.php" << 'PHPEOF'
+<?php
+namespace LibIface;
+
+interface SnapshotInterface {
+    public function generateSnapshots(array $entities): array;
+}
+PHPEOF
+
+cat > "$IFACE_A_DIR/packages/lib-impl/composer.json" << 'EOF'
+{"autoload":{"psr-4":{"LibImpl\\":"src/"}}}
+EOF
+
+cat > "$IFACE_A_DIR/packages/lib-impl/src/SnapshotService.php" << 'PHPEOF'
+<?php
+namespace LibImpl;
+
+use LibIface\SnapshotInterface;
+
+class SnapshotService implements SnapshotInterface {
+    public function generateSnapshots(array $entities, bool $includeMeta): string {
+        return 'done';
+    }
+}
+PHPEOF
+
+cat > "$IFACE_A_DIR/packages/app/composer.json" << 'EOF'
+{"autoload":{"psr-4":{"App\\":"src/"}}}
+EOF
+
+cat > "$IFACE_A_DIR/packages/app/src/Runner.php" << 'PHPEOF'
+<?php
+namespace App;
+
+use LibImpl\SnapshotService;
+
+class Runner {
+    public function run(): void {
+        $svc = new SnapshotService();
+        $svc->generateSnapshots([]);
+    }
+}
+PHPEOF
+
+EXIT_CODE=0
+OUTPUT=$("$PHPCMA" check-types --config="$IFACE_A_DIR/.phpcma.json" 2>&1) || EXIT_CODE=$?
+
+assert_exit_code 1 "$EXIT_CODE" "exits with 1 (violations detected)"
+assert_contains "$OUTPUT" "match interface" "output reports interface mismatch"
+assert_contains "$OUTPUT" "return type" "output mentions return type issue"
+assert_contains "$OUTPUT" "params, interface" "output mentions parameter count issue"
+echo ""
+
+# ============================================================================
+# Test 22: Interface compliance regression — case-b: violation exists but only
+#           non-interface method is called (declaration-level pass should still
+#           flag it)
+# ============================================================================
+echo "Test 22: Interface compliance — case-b: no callsite, declaration-level detects"
+
+IFACE_B_DIR="$TMPDIR_E2E/iface-case-b"
+mkdir -p "$IFACE_B_DIR/packages/lib-iface/src" "$IFACE_B_DIR/packages/lib-impl/src" "$IFACE_B_DIR/packages/app/src"
+
+cat > "$IFACE_B_DIR/.phpcma.json" << 'EOF'
+{"scan_paths":["packages"]}
+EOF
+
+cat > "$IFACE_B_DIR/packages/lib-iface/composer.json" << 'EOF'
+{"autoload":{"psr-4":{"LibIface\\":"src/"}}}
+EOF
+
+cat > "$IFACE_B_DIR/packages/lib-iface/src/SnapshotInterface.php" << 'PHPEOF'
+<?php
+namespace LibIface;
+
+interface SnapshotInterface {
+    public function generateSnapshots(array $entities): array;
+}
+PHPEOF
+
+cat > "$IFACE_B_DIR/packages/lib-impl/composer.json" << 'EOF'
+{"autoload":{"psr-4":{"LibImpl\\":"src/"}}}
+EOF
+
+cat > "$IFACE_B_DIR/packages/lib-impl/src/SnapshotService.php" << 'PHPEOF'
+<?php
+namespace LibImpl;
+
+use LibIface\SnapshotInterface;
+
+class SnapshotService implements SnapshotInterface {
+    public function generateSnapshots(array $entities, bool $includeMeta): string {
+        return 'done';
+    }
+
+    public function unrelatedMethod(): void {}
+}
+PHPEOF
+
+cat > "$IFACE_B_DIR/packages/app/composer.json" << 'EOF'
+{"autoload":{"psr-4":{"App\\":"src/"}}}
+EOF
+
+# Only calls the non-interface method — no call to generateSnapshots
+cat > "$IFACE_B_DIR/packages/app/src/Runner.php" << 'PHPEOF'
+<?php
+namespace App;
+
+use LibImpl\SnapshotService;
+
+class Runner {
+    public function run(): void {
+        $svc = new SnapshotService();
+        $svc->unrelatedMethod();
+    }
+}
+PHPEOF
+
+EXIT_CODE=0
+OUTPUT=$("$PHPCMA" check-types --config="$IFACE_B_DIR/.phpcma.json" 2>&1) || EXIT_CODE=$?
+
+assert_exit_code 1 "$EXIT_CODE" "exits with 1 (declaration-level violation detected)"
+assert_contains "$OUTPUT" "interface LibIface" "declaration-level pass flags interface compliance violation"
+assert_contains "$OUTPUT" "SnapshotService" "violation references SnapshotService"
+echo ""
+
+# ============================================================================
+# Test 23: Interface compliance regression — case-c: same-project interface/class
+#           with cross-project caller (should flag interface mismatch)
+# ============================================================================
+echo "Test 23: Interface compliance — case-c: same-project iface+class, cross-project caller"
+
+IFACE_C_DIR="$TMPDIR_E2E/iface-case-c"
+mkdir -p "$IFACE_C_DIR/packages/lib/src" "$IFACE_C_DIR/packages/app/src"
+
+cat > "$IFACE_C_DIR/.phpcma.json" << 'EOF'
+{"scan_paths":["packages"]}
+EOF
+
+cat > "$IFACE_C_DIR/packages/lib/composer.json" << 'EOF'
+{"autoload":{"psr-4":{"Lib\\":"src/"}}}
+EOF
+
+# Interface and implementation in the SAME project
+cat > "$IFACE_C_DIR/packages/lib/src/SnapshotInterface.php" << 'PHPEOF'
+<?php
+namespace Lib;
+
+interface SnapshotInterface {
+    public function generateSnapshots(array $entities): array;
+}
+PHPEOF
+
+cat > "$IFACE_C_DIR/packages/lib/src/SnapshotService.php" << 'PHPEOF'
+<?php
+namespace Lib;
+
+class SnapshotService implements SnapshotInterface {
+    public function generateSnapshots(array $entities, bool $includeMeta): string {
+        return 'done';
+    }
+}
+PHPEOF
+
+# Cross-project caller
+cat > "$IFACE_C_DIR/packages/app/composer.json" << 'EOF'
+{"autoload":{"psr-4":{"App\\":"src/"}}}
+EOF
+
+cat > "$IFACE_C_DIR/packages/app/src/Runner.php" << 'PHPEOF'
+<?php
+namespace App;
+
+use Lib\SnapshotService;
+
+class Runner {
+    public function run(): void {
+        $svc = new SnapshotService();
+        $svc->generateSnapshots([]);
+    }
+}
+PHPEOF
+
+EXIT_CODE=0
+OUTPUT=$("$PHPCMA" check-types --config="$IFACE_C_DIR/.phpcma.json" 2>&1) || EXIT_CODE=$?
+
+assert_exit_code 1 "$EXIT_CODE" "exits with 1 (same-project interface mismatch detected)"
+assert_contains "$OUTPUT" "match interface" "same-project interface mismatch flagged"
+assert_contains "$OUTPUT" "SnapshotService" "violation references SnapshotService"
+echo ""
+
+# ============================================================================
+# Test 24: Interface compliance regression — case-d: caller depends on interface
+#           type (implementation mismatch should be discoverable)
+# ============================================================================
+echo "Test 24: Interface compliance — case-d: caller uses interface type"
+
+IFACE_D_DIR="$TMPDIR_E2E/iface-case-d"
+mkdir -p "$IFACE_D_DIR/packages/lib-iface/src" "$IFACE_D_DIR/packages/lib-impl/src" "$IFACE_D_DIR/packages/app/src"
+
+cat > "$IFACE_D_DIR/.phpcma.json" << 'EOF'
+{"scan_paths":["packages"]}
+EOF
+
+cat > "$IFACE_D_DIR/packages/lib-iface/composer.json" << 'EOF'
+{"autoload":{"psr-4":{"LibIface\\":"src/"}}}
+EOF
+
+cat > "$IFACE_D_DIR/packages/lib-iface/src/SnapshotInterface.php" << 'PHPEOF'
+<?php
+namespace LibIface;
+
+interface SnapshotInterface {
+    public function generateSnapshots(array $entities): array;
+}
+PHPEOF
+
+cat > "$IFACE_D_DIR/packages/lib-impl/composer.json" << 'EOF'
+{"autoload":{"psr-4":{"LibImpl\\":"src/"}}}
+EOF
+
+cat > "$IFACE_D_DIR/packages/lib-impl/src/SnapshotService.php" << 'PHPEOF'
+<?php
+namespace LibImpl;
+
+use LibIface\SnapshotInterface;
+
+class SnapshotService implements SnapshotInterface {
+    public function generateSnapshots(array $entities, bool $includeMeta): string {
+        return 'done';
+    }
+}
+PHPEOF
+
+cat > "$IFACE_D_DIR/packages/app/composer.json" << 'EOF'
+{"autoload":{"psr-4":{"App\\":"src/"}}}
+EOF
+
+# Caller type-hints on the interface, NOT the concrete class
+cat > "$IFACE_D_DIR/packages/app/src/Runner.php" << 'PHPEOF'
+<?php
+namespace App;
+
+use LibIface\SnapshotInterface;
+
+class Runner {
+    public function run(SnapshotInterface $svc): void {
+        $svc->generateSnapshots([]);
+    }
+}
+PHPEOF
+
+EXIT_CODE=0
+OUTPUT=$("$PHPCMA" check-types --config="$IFACE_D_DIR/.phpcma.json" 2>&1) || EXIT_CODE=$?
+
+assert_exit_code 1 "$EXIT_CODE" "exits with 1 (implementation mismatch discoverable via declaration pass)"
+assert_contains "$OUTPUT" "interface LibIface" "interface mismatch found despite interface-typed caller"
+assert_contains "$OUTPUT" "SnapshotService" "violation references the violating implementation"
+echo ""
+
+# ============================================================================
 # Summary
 # ============================================================================
 echo "========================================"
