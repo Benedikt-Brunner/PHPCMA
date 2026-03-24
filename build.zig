@@ -274,6 +274,17 @@ pub fn build(b: *std.Build) void {
     const run_return_type_tests = b.addRunArtifact(return_type_tests);
     test_step.dependOn(&run_return_type_tests.step);
 
+    const dead_code_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/dead_code.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const run_dead_code_tests = b.addRunArtifact(dead_code_tests);
+    test_step.dependOn(&run_dead_code_tests.step);
+
     // ----------------------------------------------------------------
     // Distribution: Cross-compilation for all major platforms
     // ----------------------------------------------------------------
