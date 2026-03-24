@@ -316,6 +316,58 @@ pub const SymbolCollector = struct {
         // Parse PHPDoc if present
         try self.parseMethodPhpDoc(node, &method);
 
+        // For constructors, add promoted parameters as class properties
+        if (std.mem.eql(u8, method_name, "__construct")) {
+            for (method.parameters) |param| {
+                if (!param.is_promoted) continue;
+                const type_info = param.type_info orelse param.phpdoc_type;
+
+                // Parse visibility from the property_promotion_parameter node
+                var visibility: types.Visibility = .public;
+                var is_readonly = false;
+                if (node.childByFieldName("parameters")) |params| {
+                    var pi: u32 = 0;
+                    while (pi < params.namedChildCount()) : (pi += 1) {
+                        if (params.namedChild(pi)) |pnode| {
+                            if (pnode.kindId() == self.ids.property_promotion_parameter) {
+                                // Match by name
+                                if (pnode.childByFieldName("name")) |name_n| {
+                                    const raw = getNodeText(self.source, name_n);
+                                    const pname = if (raw.len > 0 and raw[0] == '$') raw[1..] else raw;
+                                    if (std.mem.eql(u8, pname, param.name)) {
+                                        // Extract visibility and readonly from children
+                                        var ci: u32 = 0;
+                                        while (ci < pnode.childCount()) : (ci += 1) {
+                                            if (pnode.child(ci)) |ch| {
+                                                const ck = ch.kindId();
+                                                if (ck == self.ids.visibility_modifier) {
+                                                    visibility = types.Visibility.fromString(getNodeText(self.source, ch));
+                                                } else if (ck == self.ids.readonly_modifier) {
+                                                    is_readonly = true;
+                                                }
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                try class.addProperty(.{
+                    .name = param.name,
+                    .visibility = visibility,
+                    .is_static = false,
+                    .is_readonly = is_readonly,
+                    .declared_type = type_info,
+                    .phpdoc_type = null,
+                    .default_value_type = null,
+                    .line = node.startPoint().row + 1,
+                });
+            }
+        }
+
         try class.addMethod(method);
     }
 

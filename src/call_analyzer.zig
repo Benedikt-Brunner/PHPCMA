@@ -177,6 +177,13 @@ pub const CallAnalyzer = struct {
             }
         }
 
+        // Track constructor injection for property type inference
+        if (self.type_resolver.current_method) |method| {
+            if (node.childByFieldName("body")) |body| {
+                try self.type_resolver.trackConstructorInjection(method, source, body);
+            }
+        }
+
         // Process method body
         if (node.childByFieldName("body")) |body| {
             try self.traverseNode(body, source);
