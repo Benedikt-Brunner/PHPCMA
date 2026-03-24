@@ -149,6 +149,11 @@ pub const TypeViolationAnalyzer = struct {
             try self.checkCallSite(&bc, &violations, &error_count, &warning_count);
         }
 
+        // Declaration-level interface compliance: check ALL classes implementing
+        // cross-project interfaces, regardless of whether their methods appear
+        // in call sites.
+        try self.checkDeclarationLevelInterfaceCompliance(&violations, &error_count, &warning_count);
+
         // Extract API signatures
         const api_sigs = try self.extractApiSignatures(&boundary_result);
 
@@ -593,6 +598,173 @@ pub const TypeViolationAnalyzer = struct {
                             ),
                             .expected_type = iface_param_type.base_type,
                             .actual_type = class_param_type.base_type,
+                        });
+                        error_count.* += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Declaration-level interface compliance pass.
+    /// Iterates ALL classes in the symbol table and, for each cross-project
+    /// interface they implement, verifies every interface method:
+    ///   - method exists in the implementing class
+    ///   - parameter count matches
+    ///   - parameter types are compatible (contravariant)
+    ///   - return type is compatible (covariant)
+    ///   - visibility is compatible (must be >= interface method visibility)
+    fn checkDeclarationLevelInterfaceCompliance(
+        self: *TypeViolationAnalyzer,
+        violations: *std.ArrayListUnmanaged(TypeViolation),
+        error_count: *usize,
+        warning_count: *usize,
+    ) !void {
+        _ = warning_count;
+        var class_it = self.sym_table.classes.valueIterator();
+        while (class_it.next()) |class| {
+            // Skip classes with no interface implementations
+            if (class.implements.len == 0) continue;
+
+            const class_project = self.boundary_analyzer_inst.fileToProject(class.file_path) orelse continue;
+
+            for (class.implements) |iface_fqcn| {
+                const iface = self.sym_table.getInterface(iface_fqcn) orelse continue;
+
+                const iface_project = self.boundary_analyzer_inst.fileToProject(iface.file_path) orelse continue;
+
+                // Only check cross-project interfaces
+                if (std.mem.eql(u8, iface_project, class_project)) continue;
+
+                // Check every method declared by the interface
+                var method_it = iface.methods.iterator();
+                while (method_it.next()) |entry| {
+                    const iface_method = entry.value_ptr;
+                    const method_name = entry.key_ptr.*;
+
+                    // Look up the method in the implementing class
+                    const class_method = self.sym_table.resolveMethod(class.fqcn, method_name) orelse {
+                        // Method missing entirely
+                        try violations.append(self.allocator, .{
+                            .kind = .interface_mismatch,
+                            .severity = .error_level,
+                            .caller_fqn = class.fqcn,
+                            .callee_fqn = iface_fqcn,
+                            .caller_project = class_project,
+                            .callee_project = iface_project,
+                            .file_path = class.file_path,
+                            .line = class.start_line,
+                            .message = try std.fmt.allocPrint(
+                                self.allocator,
+                                "Class {s} does not implement method {s} required by interface {s}",
+                                .{ class.fqcn, method_name, iface_fqcn },
+                            ),
+                            .expected_type = null,
+                            .actual_type = null,
+                        });
+                        error_count.* += 1;
+                        continue;
+                    };
+
+                    // Check parameter count
+                    if (iface_method.parameters.len != class_method.parameters.len) {
+                        try violations.append(self.allocator, .{
+                            .kind = .interface_mismatch,
+                            .severity = .error_level,
+                            .caller_fqn = class.fqcn,
+                            .callee_fqn = iface_fqcn,
+                            .caller_project = class_project,
+                            .callee_project = iface_project,
+                            .file_path = class_method.file_path,
+                            .line = class_method.start_line,
+                            .message = try std.fmt.allocPrint(
+                                self.allocator,
+                                "Method {s}::{s} has {d} params, interface {s} expects {d}",
+                                .{ class.fqcn, method_name, class_method.parameters.len, iface_fqcn, iface_method.parameters.len },
+                            ),
+                            .expected_type = null,
+                            .actual_type = null,
+                        });
+                        error_count.* += 1;
+                    }
+
+                    // Check parameter types (contravariant: class param should accept at least what interface declares)
+                    const min_params = @min(iface_method.parameters.len, class_method.parameters.len);
+                    for (0..min_params) |i| {
+                        const iface_param_type = iface_method.parameters[i].type_info orelse continue;
+                        const class_param_type = class_method.parameters[i].type_info orelse continue;
+
+                        if (!std.mem.eql(u8, iface_param_type.base_type, class_param_type.base_type)) {
+                            // Contravariance: class can accept a wider type, check compatibility
+                            if (!self.isTypeCompatible(&iface_param_type, &class_param_type)) {
+                                try violations.append(self.allocator, .{
+                                    .kind = .interface_mismatch,
+                                    .severity = .error_level,
+                                    .caller_fqn = class.fqcn,
+                                    .callee_fqn = iface_fqcn,
+                                    .caller_project = class_project,
+                                    .callee_project = iface_project,
+                                    .file_path = class_method.file_path,
+                                    .line = class_method.start_line,
+                                    .message = try std.fmt.allocPrint(
+                                        self.allocator,
+                                        "Parameter '{s}' of {s}::{s} has type {s}, interface {s} declares {s}",
+                                        .{ class_method.parameters[i].name, class.fqcn, method_name, class_param_type.base_type, iface_fqcn, iface_param_type.base_type },
+                                    ),
+                                    .expected_type = iface_param_type.base_type,
+                                    .actual_type = class_param_type.base_type,
+                                });
+                                error_count.* += 1;
+                            }
+                        }
+                    }
+
+                    // Check return type (covariant: class return must be subtype of interface return)
+                    const iface_ret = iface_method.effectiveReturnType();
+                    const class_ret = class_method.effectiveReturnType();
+                    if (iface_ret != null and class_ret != null) {
+                        if (!std.mem.eql(u8, iface_ret.?.base_type, class_ret.?.base_type)) {
+                            if (!self.isTypeCompatible(&class_ret.?, &iface_ret.?)) {
+                                try violations.append(self.allocator, .{
+                                    .kind = .interface_mismatch,
+                                    .severity = .error_level,
+                                    .caller_fqn = class.fqcn,
+                                    .callee_fqn = iface_fqcn,
+                                    .caller_project = class_project,
+                                    .callee_project = iface_project,
+                                    .file_path = class_method.file_path,
+                                    .line = class_method.start_line,
+                                    .message = try std.fmt.allocPrint(
+                                        self.allocator,
+                                        "Method {s}::{s} returns {s}, interface {s} declares {s}",
+                                        .{ class.fqcn, method_name, class_ret.?.base_type, iface_fqcn, iface_ret.?.base_type },
+                                    ),
+                                    .expected_type = iface_ret.?.base_type,
+                                    .actual_type = class_ret.?.base_type,
+                                });
+                                error_count.* += 1;
+                            }
+                        }
+                    }
+
+                    // Check visibility: implementing method must be at least as visible
+                    if (visibilityRank(class_method.visibility) < visibilityRank(iface_method.visibility)) {
+                        try violations.append(self.allocator, .{
+                            .kind = .interface_mismatch,
+                            .severity = .error_level,
+                            .caller_fqn = class.fqcn,
+                            .callee_fqn = iface_fqcn,
+                            .caller_project = class_project,
+                            .callee_project = iface_project,
+                            .file_path = class_method.file_path,
+                            .line = class_method.start_line,
+                            .message = try std.fmt.allocPrint(
+                                self.allocator,
+                                "Method {s}::{s} has {s} visibility, interface {s} requires {s}",
+                                .{ class.fqcn, method_name, visibilityStr(class_method.visibility), iface_fqcn, visibilityStr(iface_method.visibility) },
+                            ),
+                            .expected_type = visibilityStr(iface_method.visibility),
+                            .actual_type = visibilityStr(class_method.visibility),
                         });
                         error_count.* += 1;
                     }
