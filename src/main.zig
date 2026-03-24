@@ -841,6 +841,7 @@ var check_types_config = struct {
     verbose: bool = false,
     strict: bool = false,
     min_confidence: f64 = 0.0,
+    interface_scope: []const u8 = "all",
 }{};
 
 pub fn main() !void {
@@ -1040,6 +1041,11 @@ pub fn main() !void {
                                 .long_name = "min-confidence",
                                 .help = "Minimum resolution confidence to report (0.0-1.0)",
                                 .value_ref = r.mkRef(&check_types_config.min_confidence),
+                            },
+                            .{
+                                .long_name = "interface-scope",
+                                .help = "Interface compliance scope: all or cross-project (default: all)",
+                                .value_ref = r.mkRef(&check_types_config.interface_scope),
                             },
                         }),
                         .target = cli.CommandTarget{
@@ -1776,6 +1782,10 @@ fn analyzeCheckTypes() !void {
     var tva = type_violation_analyzer.TypeViolationAnalyzer.init(allocator, &call_graph, project_configs, &sym_table);
     tva.min_confidence = @floatCast(check_types_config.min_confidence);
     tva.strict = check_types_config.strict;
+    tva.interface_scope = if (std.mem.eql(u8, check_types_config.interface_scope, "cross-project"))
+        .cross_project
+    else
+        .all;
     const result = try tva.analyze();
 
     // Output results

@@ -100,6 +100,11 @@ pub const TypeViolationResult = struct {
     warning_count: usize,
 };
 
+pub const InterfaceScope = enum {
+    all,
+    cross_project,
+};
+
 /// Analyzer for cross-project type violations
 pub const TypeViolationAnalyzer = struct {
     allocator: std.mem.Allocator,
@@ -113,6 +118,9 @@ pub const TypeViolationAnalyzer = struct {
     min_confidence: f32 = 0.0,
     /// Strict mode: treat warnings as errors
     strict: bool = false,
+    /// Interface compliance scope: all checks all class/interface pairs,
+    /// cross_project checks only cross-project pairs (legacy behavior)
+    interface_scope: InterfaceScope = .all,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -170,13 +178,16 @@ pub const TypeViolationAnalyzer = struct {
             breaking_changes.items,
         );
 
+        // Capture counts before toOwnedSlice() drains the lists
+        const total_violations = violations.items.len;
+
         return TypeViolationResult{
             .violations = try violations.toOwnedSlice(self.allocator),
             .api_signatures = api_sigs,
             .breaking_changes = try breaking_changes.toOwnedSlice(self.allocator),
             .stability_scores = scores,
             .total_cross_project_calls = boundary_result.cross_project_calls,
-            .total_violations = violations.items.len,
+            .total_violations = total_violations,
             .error_count = error_count,
             .warning_count = warning_count,
         };
@@ -517,14 +528,15 @@ pub const TypeViolationAnalyzer = struct {
         for (class.implements) |iface_fqcn| {
             const iface = self.sym_table.getInterface(iface_fqcn) orelse continue;
 
-            // Check if this interface is from a different project
+            // Determine project membership for scope filtering
             const iface_project = self.boundary_analyzer_inst.fileToProject(iface.file_path);
             const class_project = self.boundary_analyzer_inst.fileToProject(class.file_path);
 
             if (iface_project == null or class_project == null) continue;
-            if (std.mem.eql(u8, iface_project.?, class_project.?)) continue;
+            if (self.interface_scope == .cross_project and
+                std.mem.eql(u8, iface_project.?, class_project.?)) continue;
 
-            // Cross-project interface: check method signature matches
+            // Check method signature matches
             if (iface.methods.get(method.name)) |iface_method| {
                 // Check return type match
                 const class_ret = method.effectiveReturnType();
@@ -633,8 +645,9 @@ pub const TypeViolationAnalyzer = struct {
 
                 const iface_project = self.boundary_analyzer_inst.fileToProject(iface.file_path) orelse continue;
 
-                // Only check cross-project interfaces
-                if (std.mem.eql(u8, iface_project, class_project)) continue;
+                // Skip same-project pairs only in cross_project mode
+                if (self.interface_scope == .cross_project and
+                    std.mem.eql(u8, iface_project, class_project)) continue;
 
                 // Check every method declared by the interface
                 var method_it = iface.methods.iterator();
