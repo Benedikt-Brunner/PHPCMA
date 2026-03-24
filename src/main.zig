@@ -13,6 +13,7 @@ const generics = @import("generics.zig");
 const call_analyzer = @import("call_analyzer.zig");
 const boundary_analyzer = @import("boundary_analyzer.zig");
 const type_violation_analyzer = @import("type_violation_analyzer.zig");
+const return_type_checker = @import("return_type_checker.zig");
 const NodeKindIds = @import("node_kind_ids.zig").NodeKindIds;
 const parallel = @import("parallel.zig");
 
@@ -1921,10 +1922,47 @@ fn analyzeReport() !void {
 
     try sym_table.resolveInheritance();
 
-    // Pass 4: Analyze calls
+    // Pass 4: Return type checking
+    if (report_config.verbose) {
+        try stdout.writeAll("Pass 4: Checking return types...\n");
+    }
+
+    const php_lang = tree_sitter_php();
+    const parser = ts.Parser.create();
+    defer parser.destroy();
+    try parser.setLanguage(php_lang);
+
+    var rt_checker = return_type_checker.ReturnTypeChecker.init(allocator, &sym_table, php_lang);
+    defer rt_checker.deinit();
+
+    // Iterate all classes, find methods by file, parse and check
+    var class_it = sym_table.classes.iterator();
+    while (class_it.next()) |entry| {
+        const class = entry.value_ptr;
+        var method_it = class.methods.iterator();
+        while (method_it.next()) |m_entry| {
+            const method = m_entry.value_ptr;
+            const file_path = method.file_path;
+            if (file_sources.get(file_path)) |source| {
+                const tree = parser.parseString(source, null) orelse continue;
+                defer tree.destroy();
+                try rt_checker.analyzeMethod(method, class.fqcn, source, tree);
+            }
+        }
+    }
+
+    if (report_config.verbose) {
+        const rt_result = rt_checker.result();
+        const msg = try std.fmt.allocPrint(allocator, "  Methods analyzed: {d}, verified: {d}, uncertain: {d}, diagnostics: {d}\n\n", .{
+            rt_result.methods_analyzed, rt_result.methods_verified, rt_result.methods_uncertain, rt_result.diagnostics.len,
+        });
+        try stdout.writeAll(msg);
+    }
+
+    // Pass 5: Analyze calls
     if (report_config.verbose) {
         const thread_count = parallel.getThreadCount(files.len);
-        const msg = try std.fmt.allocPrint(allocator, "Pass 4: Analyzing calls ({d} threads)...\n", .{thread_count});
+        const msg = try std.fmt.allocPrint(allocator, "Pass 5: Analyzing calls ({d} threads)...\n", .{thread_count});
         try stdout.writeAll(msg);
     }
 
@@ -1940,15 +1978,32 @@ fn analyzeReport() !void {
         &call_graph,
     );
 
-    // Pass 5: Generate unified report
+    // Pass 6: Generate unified report
     if (report_config.verbose) {
-        try stdout.writeAll("Pass 5: Generating unified report...\n\n");
+        try stdout.writeAll("Pass 6: Generating unified report...\n\n");
     }
 
     var unified_report = report.UnifiedReport.init(allocator);
     defer unified_report.deinit();
     unified_report.populate(&sym_table, &call_graph);
     unified_report.coverage.total_files = files.len;
+
+    // Merge return type checker results into report
+    const rt_result = rt_checker.result();
+    unified_report.type_checks.return_types.pass += rt_result.methods_verified;
+    unified_report.type_checks.return_types.fail += rt_result.diagnostics.len;
+    unified_report.type_checks.return_types.unchecked += rt_result.methods_uncertain;
+
+    // Emit checker diagnostics as violations
+    for (rt_result.diagnostics) |diag| {
+        try unified_report.addViolation(.{
+            .severity = .warning,
+            .category = "return-type-mismatch",
+            .file_path = diag.file_path,
+            .line = diag.line,
+            .message = try diag.format(allocator),
+        });
+    }
 
     // Output
     const out_file = if (report_config.output.len > 0) blk: {
