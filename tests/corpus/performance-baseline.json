@@ -1,0 +1,31 @@
+{
+  "corpus": "test-project",
+  "files": 10,
+  "wall_clock_median_ms": 6,
+  "cpu_time_median_ms": 4,
+  "peak_memory_mb": 3.7,
+  "date": "2026-03-25",
+  "commit": "0dac761",
+  "runs": 5,
+  "wall_clock_all_ms": [
+    6,
+    6,
+    5,
+    6,
+    5
+  ],
+  "cpu_time_all_ms": [
+    4,
+    4,
+    4,
+    4,
+    4
+  ],
+  "peak_memory_all_mb": [
+    3.7,
+    3.7,
+    3.7,
+    3.7,
+    3.7
+  ]
+}

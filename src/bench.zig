@@ -743,3 +743,90 @@ test "bench: incremental parse single file" {
     // Sanity: each parse should be < 1ms for a single file
     try std.testing.expect(per_parse < 1 * std.time.ns_per_ms);
 }
+
+// ============================================================================
+// Benchmark 10: Corpus performance measurement (timing report, no pass/fail)
+// ============================================================================
+
+test "bench: corpus performance measurement" {
+    const allocator = std.testing.allocator;
+
+    // Use generated fixtures as a synthetic corpus (200 files — representative)
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const file_count = 200;
+    const paths = try generateFixtureFiles(allocator, tmp_dir.dir, file_count);
+    defer {
+        for (paths) |p| allocator.free(p);
+        allocator.free(paths);
+    }
+    var configs = [_]ProjectConfig{};
+
+    const iterations: usize = 3;
+    var wall_times: [iterations]u64 = undefined;
+    var peak_rss: [iterations]usize = undefined;
+
+    for (0..iterations) |iter| {
+        var timer = try std.time.Timer.start();
+
+        var sym_table = SymbolTable.init(allocator);
+        defer sym_table.deinit();
+        var file_contexts = std.StringHashMap(FileContext).init(allocator);
+        defer {
+            var it = file_contexts.valueIterator();
+            while (it.next()) |v| @constCast(v).deinit();
+            file_contexts.deinit();
+        }
+        var file_sources = std.StringHashMap([]const u8).init(allocator);
+        defer {
+            var it = file_sources.valueIterator();
+            while (it.next()) |v| allocator.free(v.*);
+            file_sources.deinit();
+        }
+
+        try parallel.parallelSymbolCollect(
+            allocator,
+            paths,
+            &configs,
+            &sym_table,
+            &file_contexts,
+            &file_sources,
+            &main_mod.collectSymbolsFromSource,
+        );
+        try sym_table.resolveInheritance();
+
+        var call_graph = ProjectCallGraph.init(allocator, &sym_table);
+        defer call_graph.deinit();
+        try parallel.parallelCallAnalysis(
+            allocator,
+            paths,
+            &file_sources,
+            &file_contexts,
+            &sym_table,
+            &call_graph,
+        );
+
+        wall_times[iter] = timer.read();
+        peak_rss[iter] = getRssBytes();
+    }
+
+    // Sort for median
+    std.mem.sort(u64, &wall_times, {}, std.sort.asc(u64));
+    std.mem.sort(usize, &peak_rss, {}, std.sort.asc(usize));
+
+    const median_wall = wall_times[iterations / 2];
+    const median_rss = peak_rss[iterations / 2];
+    const rss_mb = @as(f64, @floatFromInt(median_rss)) / (1024.0 * 1024.0);
+
+    std.debug.print("\n", .{});
+    std.debug.print("=== Corpus Performance Report ===\n", .{});
+    std.debug.print("Files:       {d}\n", .{file_count});
+    std.debug.print("Iterations:  {d}\n", .{iterations});
+    std.debug.print("Wall clock:  {d:.2}{s} (median)\n", .{ formatDuration(median_wall)[0], formatDuration(median_wall)[1] });
+    std.debug.print("Peak RSS:    {d:.1}MB\n", .{rss_mb});
+    for (0..iterations) |i| {
+        std.debug.print("  Run {d}: {d:.2}{s}\n", .{ i + 1, formatDuration(wall_times[i])[0], formatDuration(wall_times[i])[1] });
+    }
+    std.debug.print("=================================\n", .{});
+}
