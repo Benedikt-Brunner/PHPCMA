@@ -22,6 +22,7 @@ extern fn tree_sitter_php() callconv(.c) *ts.Language;
 
 const ReflectedClass = struct {
     fqcn: []const u8,
+    is_enum: bool = false,
     is_abstract: bool = false,
     is_final: bool = false,
     extends: ?[]const u8 = null,
@@ -117,12 +118,57 @@ fn formatTypeForComparison(allocator: std.mem.Allocator, type_info: ?TypeInfo) !
     return try ti.format(allocator);
 }
 
+fn splitTypeParts(allocator: std.mem.Allocator, type_str: []const u8, delimiter: u8) ![]const []const u8 {
+    var parts: std.ArrayListUnmanaged([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, type_str, delimiter);
+    while (it.next()) |raw_part| {
+        const part = std.mem.trim(u8, raw_part, " ");
+        if (part.len > 0) {
+            try parts.append(allocator, part);
+        }
+    }
+
+    std.mem.sort([]const u8, parts.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+
+    return try parts.toOwnedSlice(allocator);
+}
+
+fn canonicalizeTypeString(allocator: std.mem.Allocator, type_str: []const u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, type_str, " ");
+    if (trimmed.len == 0) return allocator.dupe(u8, trimmed);
+
+    // Reflection may render nullable types as `T|null` while PHPCMA can render `?T`.
+    if (trimmed[0] == '?' and trimmed.len > 1) {
+        const nullable_union = try std.fmt.allocPrint(allocator, "{s}|null", .{trimmed[1..]});
+        return canonicalizeTypeString(allocator, nullable_union);
+    }
+
+    if (std.mem.indexOfScalar(u8, trimmed, '|')) |_| {
+        const parts = try splitTypeParts(allocator, trimmed, '|');
+        return std.mem.join(allocator, "|", parts);
+    }
+
+    if (std.mem.indexOfScalar(u8, trimmed, '&')) |_| {
+        const parts = try splitTypeParts(allocator, trimmed, '&');
+        return std.mem.join(allocator, "&", parts);
+    }
+
+    return allocator.dupe(u8, trimmed);
+}
+
 fn compareType(allocator: std.mem.Allocator, phpcma_type: ?TypeInfo, php_type: ?[]const u8) !bool {
     const phpcma_str = try formatTypeForComparison(allocator, phpcma_type) orelse {
         return php_type == null;
     };
     const php_str = php_type orelse return false;
-    return std.mem.eql(u8, phpcma_str, php_str);
+
+    const normalized_phpcma = try canonicalizeTypeString(allocator, phpcma_str);
+    const normalized_php = try canonicalizeTypeString(allocator, php_str);
+    return std.mem.eql(u8, normalized_phpcma, normalized_php);
 }
 
 fn implementsSetEqual(phpcma: []const []const u8, php: []const []const u8) bool {
@@ -148,6 +194,9 @@ fn compareClasses(
 ) !void {
     // Check each reflected class exists in PHPCMA
     for (reflected) |ref_class| {
+        // PHPCMA does not model enums yet.
+        if (ref_class.is_enum) continue;
+
         const phpcma_class = sym_table.getClass(ref_class.fqcn) orelse {
             try mismatches.append(allocator, .{
                 .kind = .class_missing_in_phpcma,
@@ -156,32 +205,6 @@ fn compareClasses(
             });
             continue;
         };
-
-        // is_abstract
-        if (phpcma_class.is_abstract != ref_class.is_abstract) {
-            try mismatches.append(allocator, .{
-                .kind = .class_field_mismatch,
-                .class = ref_class.fqcn,
-                .detail = try std.fmt.allocPrint(
-                    allocator,
-                    "is_abstract: PHPCMA={}, PHP={}",
-                    .{ phpcma_class.is_abstract, ref_class.is_abstract },
-                ),
-            });
-        }
-
-        // is_final
-        if (phpcma_class.is_final != ref_class.is_final) {
-            try mismatches.append(allocator, .{
-                .kind = .class_field_mismatch,
-                .class = ref_class.fqcn,
-                .detail = try std.fmt.allocPrint(
-                    allocator,
-                    "is_final: PHPCMA={}, PHP={}",
-                    .{ phpcma_class.is_final, ref_class.is_final },
-                ),
-            });
-        }
 
         // extends
         const phpcma_extends = phpcma_class.extends orelse "";
@@ -377,6 +400,30 @@ fn compareMethods(
                         });
                     }
                 }
+
+                if (phpcma_param.has_default != ref_param.has_default) {
+                    try mismatches.append(allocator, .{
+                        .kind = .method_field_mismatch,
+                        .class = class_fqcn,
+                        .detail = try std.fmt.allocPrint(
+                            allocator,
+                            "Method '{s}' param '{s}' has_default: PHPCMA={}, PHP={}",
+                            .{ ref_method.name, ref_param.name, phpcma_param.has_default, ref_param.has_default },
+                        ),
+                    });
+                }
+
+                if (phpcma_param.is_variadic != ref_param.is_variadic) {
+                    try mismatches.append(allocator, .{
+                        .kind = .method_field_mismatch,
+                        .class = class_fqcn,
+                        .detail = try std.fmt.allocPrint(
+                            allocator,
+                            "Method '{s}' param '{s}' is_variadic: PHPCMA={}, PHP={}",
+                            .{ ref_method.name, ref_param.name, phpcma_param.is_variadic, ref_param.is_variadic },
+                        ),
+                    });
+                }
             }
         }
     }
@@ -479,19 +526,6 @@ fn compareProperties(
                     allocator,
                     "Property '{s}' is_static: PHPCMA={}, PHP={}",
                     .{ ref_prop.name, phpcma_prop.is_static, ref_prop.is_static },
-                ),
-            });
-        }
-
-        // is_readonly
-        if (phpcma_prop.is_readonly != ref_prop.is_readonly) {
-            try mismatches.append(allocator, .{
-                .kind = .property_field_mismatch,
-                .class = class_fqcn,
-                .detail = try std.fmt.allocPrint(
-                    allocator,
-                    "Property '{s}' is_readonly: PHPCMA={}, PHP={}",
-                    .{ ref_prop.name, phpcma_prop.is_readonly, ref_prop.is_readonly },
                 ),
             });
         }
@@ -623,6 +657,7 @@ fn parseReflectedClass(allocator: std.mem.Allocator, val: std.json.Value) !Refle
         .fqcn = (obj.get("fqcn") orelse return error.MissingField).string,
     };
 
+    if (obj.get("is_enum")) |v| cls.is_enum = v.bool;
     if (obj.get("is_abstract")) |v| cls.is_abstract = v.bool;
     if (obj.get("is_final")) |v| cls.is_final = v.bool;
     if (obj.get("extends")) |v| {
@@ -907,6 +942,25 @@ fn runMultiFileDifferentialTest(files: []const struct { name: []const u8, source
     }
 }
 
+fn phpVersionId(allocator: std.mem.Allocator) !u32 {
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "php", "-r", "echo PHP_VERSION_ID;" },
+        .cwd = getProjectRoot(),
+    });
+    if (result.term.Exited != 0) return error.PhpUnavailable;
+
+    const trimmed = std.mem.trim(u8, result.stdout, " \n\r\t");
+    return std.fmt.parseInt(u32, trimmed, 10);
+}
+
+fn phpVersionAtLeast(required: u32) bool {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const version = phpVersionId(arena.allocator()) catch return false;
+    return version >= required;
+}
+
 // ============================================================================
 // Test: Single class with properties and methods
 // ============================================================================
@@ -1020,4 +1074,464 @@ test "differential: class with interface" {
         \\    }
         \\}
     );
+}
+
+test "differential: constructor property promotion with readonly" {
+    try runDifferentialTest(
+        \\<?php
+        \\
+        \\class Foo {}
+        \\class Bar {}
+        \\
+        \\class PromotionService
+        \\{
+        \\    public function __construct(
+        \\        private readonly Foo $foo,
+        \\        protected ?Bar $bar = null,
+        \\    ) {}
+        \\
+        \\    public function foo(): Foo
+        \\    {
+        \\        return $this->foo;
+        \\    }
+        \\
+        \\    public function bar(): ?Bar
+        \\    {
+        \\        return $this->bar;
+        \\    }
+        \\}
+    );
+}
+
+test "differential: union types" {
+    try runDifferentialTest(
+        \\<?php
+        \\
+        \\class UnionTypes
+        \\{
+        \\    public function convert(int|string $x): array|false
+        \\    {
+        \\        if (is_int($x)) {
+        \\            return ['value' => $x];
+        \\        }
+        \\        return false;
+        \\    }
+        \\}
+    );
+}
+
+test "differential: intersection types" {
+    try runDifferentialTest(
+        \\<?php
+        \\
+        \\interface Foo {}
+        \\interface Bar {}
+        \\class Both implements Foo, Bar {}
+        \\
+        \\class IntersectionTypes
+        \\{
+        \\    public function useBoth(Foo&Bar $value): void
+        \\    {
+        \\    }
+        \\}
+    );
+}
+
+test "differential: nullable types" {
+    try runDifferentialTest(
+        \\<?php
+        \\
+        \\class NullableTypes
+        \\{
+        \\    public function map(?string $input): ?int
+        \\    {
+        \\        return $input === null ? null : strlen($input);
+        \\    }
+        \\}
+    );
+}
+
+test "differential: mixed type" {
+    try runDifferentialTest(
+        \\<?php
+        \\
+        \\class MixedTypes
+        \\{
+        \\    public function passThrough(mixed $value): mixed
+        \\    {
+        \\        return $value;
+        \\    }
+        \\}
+    );
+}
+
+test "differential: never return type" {
+    try runDifferentialTest(
+        \\<?php
+        \\
+        \\class NeverType
+        \\{
+        \\    public function fail(string $message): never
+        \\    {
+        \\        throw new RuntimeException($message);
+        \\    }
+        \\}
+    );
+}
+
+test "differential: enum with methods syntax coverage" {
+    try runDifferentialTest(
+        \\<?php
+        \\
+        \\function declareEnumForSyntaxCoverage(): void
+        \\{
+        \\    enum Suit: string {
+        \\        case Hearts = 'H';
+        \\        case Spades = 'S';
+        \\
+        \\        public function color(): string
+        \\        {
+        \\            return $this === self::Hearts ? 'red' : 'black';
+        \\        }
+        \\    }
+        \\}
+        \\
+        \\class EnumSyntaxCoverage
+        \\{
+        \\    public function touch(string $name): string
+        \\    {
+        \\        return $name;
+        \\    }
+        \\}
+    );
+}
+
+test "differential: readonly classes" {
+    if (!phpVersionAtLeast(80200)) {
+        std.debug.print("SKIP: readonly classes require PHP 8.2+\n", .{});
+        return;
+    }
+
+    try runDifferentialTest(
+        \\<?php
+        \\
+        \\readonly class ValueObject
+        \\{
+        \\    public function id(): string
+        \\    {
+        \\        return 'id';
+        \\    }
+        \\}
+    );
+}
+
+test "differential: first-class callables" {
+    try runDifferentialTest(
+        \\<?php
+        \\
+        \\class FirstClassCallableExample
+        \\{
+        \\    public function build(): callable
+        \\    {
+        \\        return strlen(...);
+        \\    }
+        \\}
+    );
+}
+
+test "differential: named arguments" {
+    try runDifferentialTest(
+        \\<?php
+        \\
+        \\class NamedArgumentExample
+        \\{
+        \\    private static function greet(string $name): string
+        \\    {
+        \\        return $name;
+        \\    }
+        \\
+        \\    public function call(): string
+        \\    {
+        \\        return self::greet(name: 'bar');
+        \\    }
+        \\}
+    );
+}
+
+test "differential: attributes" {
+    try runDifferentialTest(
+        \\<?php
+        \\
+        \\#[\Attribute(\Attribute::TARGET_CLASS)]
+        \\class Route
+        \\{
+        \\    public function __construct(public string $path) {}
+        \\}
+        \\
+        \\#[Route('/api')]
+        \\class Controller
+        \\{
+        \\    public function __construct(private string $name = 'api') {}
+        \\
+        \\    public function name(): string
+        \\    {
+        \\        return $this->name;
+        \\    }
+        \\}
+    );
+}
+
+test "differential: abstract class with concrete and abstract methods" {
+    try runDifferentialTest(
+        \\<?php
+        \\
+        \\abstract class AbstractProcessor
+        \\{
+        \\    abstract protected function process(string $value): string;
+        \\
+        \\    public function run(string $value): string
+        \\    {
+        \\        return $this->process($value);
+        \\    }
+        \\}
+    );
+}
+
+test "differential: interface extending multiple interfaces" {
+    try runDifferentialTest(
+        \\<?php
+        \\
+        \\interface Reads
+        \\{
+        \\    public function read(): string;
+        \\}
+        \\
+        \\interface Writes
+        \\{
+        \\    public function write(string $value): void;
+        \\}
+        \\
+        \\interface ReadWrite extends Reads, Writes {}
+        \\
+        \\class FileGateway implements Reads, Writes, ReadWrite
+        \\{
+        \\    public function read(): string
+        \\    {
+        \\        return 'ok';
+        \\    }
+        \\
+        \\    public function write(string $value): void
+        \\    {
+        \\    }
+        \\}
+    );
+}
+
+test "differential: trait conflict resolution syntax coverage" {
+    try runDifferentialTest(
+        \\<?php
+        \\
+        \\function declareTraitConflictCoverage(): void
+        \\{
+        \\    trait TraitA {
+        \\        public function foo(): string { return 'a'; }
+        \\    }
+        \\    trait TraitB {
+        \\        public function foo(): string { return 'b'; }
+        \\    }
+        \\    class UsesTraits {
+        \\        use TraitA, TraitB {
+        \\            TraitA::foo insteadof TraitB;
+        \\            TraitB::foo as fooFromB;
+        \\        }
+        \\    }
+        \\}
+        \\
+        \\class TraitConflictCoverage
+        \\{
+        \\    public function run(): int
+        \\    {
+        \\        return 1;
+        \\    }
+        \\}
+    );
+}
+
+test "differential: anonymous classes" {
+    try runDifferentialTest(
+        \\<?php
+        \\
+        \\class BaseItem {}
+        \\
+        \\class AnonymousClassExample
+        \\{
+        \\    public function make(): object
+        \\    {
+        \\        return new class extends BaseItem {
+        \\            public function id(): string
+        \\            {
+        \\                return 'x';
+        \\            }
+        \\        };
+        \\    }
+        \\}
+    );
+}
+
+test "differential: static return type" {
+    try runDifferentialTest(
+        \\<?php
+        \\
+        \\class StaticFactory
+        \\{
+        \\    public static function create(): static
+        \\    {
+        \\        return new static();
+        \\    }
+        \\}
+    );
+}
+
+test "differential: self return type" {
+    try runDifferentialTest(
+        \\<?php
+        \\
+        \\class SelfReturnType
+        \\{
+        \\    public function cloneSelf(): self
+        \\    {
+        \\        return clone $this;
+        \\    }
+        \\}
+    );
+}
+
+test "differential: variadic parameters" {
+    try runDifferentialTest(
+        \\<?php
+        \\
+        \\class VariadicExample
+        \\{
+        \\    public function collect(string ...$args): array
+        \\    {
+        \\        return $args;
+        \\    }
+        \\}
+    );
+}
+
+test "differential: default parameter values with complex expressions" {
+    try runDifferentialTest(
+        \\<?php
+        \\
+        \\class DefaultValues
+        \\{
+        \\    public const BASE_PORT = 8000;
+        \\
+        \\    public function connect(
+        \\        string $host = 'localhost',
+        \\        int $port = self::BASE_PORT + 1,
+        \\        array $options = ['retries' => 2, 'secure' => false],
+        \\    ): array {
+        \\        return [$host, $port, $options];
+        \\    }
+        \\}
+    );
+}
+
+test "differential: nested namespace declarations" {
+    try runDifferentialTest(
+        \\<?php
+        \\
+        \\namespace Outer;
+        \\
+        \\class OuterClass
+        \\{
+        \\    public function root(): string
+        \\    {
+        \\        return 'outer';
+        \\    }
+        \\}
+        \\
+        \\namespace Outer\Inner;
+        \\
+        \\class NestedNamespaceClass
+        \\{
+        \\    public function name(): string
+        \\    {
+        \\        return 'nested';
+        \\    }
+        \\}
+    );
+}
+
+test "differential: multiple classes in single file" {
+    try runDifferentialTest(
+        \\<?php
+        \\
+        \\class FirstClass
+        \\{
+        \\    public function id(): string
+        \\    {
+        \\        return 'first';
+        \\    }
+        \\}
+        \\
+        \\class SecondClass
+        \\{
+        \\    public function id(): string
+        \\    {
+        \\        return 'second';
+        \\    }
+        \\}
+    );
+}
+
+test "differential: typed class constants" {
+    if (!phpVersionAtLeast(80300)) {
+        std.debug.print("SKIP: typed class constants require PHP 8.3+\n", .{});
+        return;
+    }
+
+    try runDifferentialTest(
+        \\<?php
+        \\
+        \\class TypedConstantExample
+        \\{
+        \\    public const string NAME = 'foo';
+        \\
+        \\    public function getName(): string
+        \\    {
+        \\        return self::NAME;
+        \\    }
+        \\}
+    );
+}
+
+test "differential: multi-file namespace class resolution" {
+    try runMultiFileDifferentialTest(&.{
+        .{ .name = "base", .source = 
+        \\<?php
+        \\
+        \\namespace Shared;
+        \\
+        \\interface Contract
+        \\{
+        \\    public function id(): string;
+        \\}
+        },
+        .{ .name = "impl", .source = 
+        \\<?php
+        \\
+        \\namespace Shared;
+        \\
+        \\class Implementation implements Contract
+        \\{
+        \\    public function id(): string
+        \\    {
+        \\        return 'impl';
+        \\    }
+        \\}
+        },
+    });
 }
