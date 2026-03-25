@@ -4,6 +4,8 @@ const types = @import("types.zig");
 const symbol_table = @import("symbol_table.zig");
 const call_analyzer = @import("call_analyzer.zig");
 const main_mod = @import("main.zig");
+const phpdoc = @import("phpdoc.zig");
+const config = @import("config.zig");
 
 const SymbolTable = symbol_table.SymbolTable;
 const FileContext = types.FileContext;
@@ -101,4 +103,47 @@ fn fuzzSymbolCollector(_: void, input: []const u8) anyerror!void {
     // This must not panic or segfault regardless of input.
     // OOM and other errors are expected — only crashes are bugs.
     main_mod.collectSymbolsFromSource(alloc, &sym_table, &file_ctx, source, language, tree) catch return;
+}
+
+// ============================================================================
+// PHPDoc Parser Fuzz Tests
+// ============================================================================
+
+test "fuzz: PHPDoc parser never crashes" {
+    try std.testing.fuzz({}, fuzzPhpDocParser, .{});
+}
+
+fn fuzzPhpDocParser(_: void, input: []const u8) anyerror!void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Fuzz parseTypeString: treats input as a raw type expression
+    _ = phpdoc.parseTypeString(alloc, input) catch {};
+
+    // Fuzz parsePhpDoc: treats input as a PHPDoc comment body
+    var doc = phpdoc.parsePhpDoc(alloc, input) catch return;
+    doc.deinit();
+}
+
+// ============================================================================
+// Config Parser Fuzz Tests
+// ============================================================================
+
+test "fuzz: config parser never crashes" {
+    try std.testing.fuzz({}, fuzzConfigParser, .{});
+}
+
+fn fuzzConfigParser(_: void, input: []const u8) anyerror!void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Treat raw input as JSON config file content
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, input, .{}) catch return;
+    defer parsed.deinit();
+
+    // Try parsing as phpcma settings
+    var settings = config.parsePhpcmaSettings(alloc, parsed.value) catch return;
+    settings.deinit(alloc);
 }
