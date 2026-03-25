@@ -211,7 +211,12 @@ pub fn parallelSymbolCollect(
 
         var src_it = r.file_sources.iterator();
         while (src_it.next()) |entry| {
-            try file_sources.put(entry.key_ptr.*, entry.value_ptr.*);
+            // Normalize ownership: thread-local parsing buffers come from
+            // per-thread arenas, but callers may free file_sources values with
+            // their allocator during cleanup. Duplicate here so exported
+            // buffers are always owned by the caller allocator.
+            const owned_source = try allocator.dupe(u8, entry.value_ptr.*);
+            try file_sources.put(entry.key_ptr.*, owned_source);
         }
     }
 }
