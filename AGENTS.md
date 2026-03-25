@@ -4,13 +4,18 @@ PHPCMA is a Zig-based PHP Call Map Analyzer using tree-sitter. Built with **Zig 
 
 ## Commit Gate
 
-**Before committing ANY changes, `zig build test` MUST pass.** This is non-negotiable.
+**Before committing ANY changes, ALL test pipelines MUST pass.** This is non-negotiable.
 
 ```bash
-zig build test   # MUST pass before every commit
+zig build test                                                    # Unit + generative tests
+zig build fuzz                                                    # Fuzz tests
+zig build diff-test                                               # Differential tests
+PHPCMA_CORPUS_ROOT=/path/to/corpora zig build corpus-test         # Corpus tests (if env var set)
+zig build bench                                                   # Benchmarks
+zig build                                                         # Full build
 ```
 
-If tests fail, fix the failures before committing. Do not skip, ignore, or comment out failing tests.
+If any pipeline fails, fix the failures before committing. Do not skip, ignore, or comment out failing tests.
 
 ## Test Pipelines
 
