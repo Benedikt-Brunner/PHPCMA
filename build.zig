@@ -96,6 +96,32 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("cli", cli_dep.module("cli"));
     // Link LibC (Required by Tree-sitter)
     exe.linkLibC();
+
+    const symbol_dump_exe = b.addExecutable(.{
+        .name = "phpcma-symbol-dump",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/symbol_dump.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    symbol_dump_exe.root_module.addImport("tree-sitter", ts_dep.module("tree_sitter"));
+    symbol_dump_exe.root_module.addImport("cli", cli_dep.module("cli"));
+    symbol_dump_exe.addIncludePath(php_src_root);
+    symbol_dump_exe.addCSourceFile(.{
+        .file = php_src_root.path(b, "parser.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    symbol_dump_exe.addCSourceFile(.{
+        .file = php_src_root.path(b, "scanner.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    symbol_dump_exe.linkLibC();
+
+    const symbol_dump_step = b.step("symbol-dump", "Build the PHPCMA symbol dump helper");
+    const install_symbol_dump = b.addInstallArtifact(symbol_dump_exe, .{});
+    symbol_dump_step.dependOn(&install_symbol_dump.step);
+
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
     // step). By default the install prefix is `zig-out/` but can be overridden

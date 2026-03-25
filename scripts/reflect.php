@@ -7,27 +7,116 @@ declare(strict_types=1);
  * PHP Reflection extraction script.
  *
  * Loads PHP source files and extracts ground truth via the Reflection API.
- * Usage: php scripts/reflect.php [--format=compact] file1.php file2.php ...
+ * Usage: php scripts/reflect.php [--format=compact] [--autoload=vendor/autoload.php] [--file-list=files.txt] file1.php file2.php ...
  */
 
 // --- CLI argument parsing ---
 
 $format = 'full';
 $files = [];
+$autoloadFiles = [];
 
-foreach (array_slice($argv, 1) as $arg) {
+/**
+ * Load newline-delimited file paths from a text file.
+ * Empty lines are ignored.
+ *
+ * @return list<string>
+ */
+function loadFileList(string $path): array
+{
+    if (!is_file($path)) {
+        throw new RuntimeException("File list not found: $path");
+    }
+
+    $lines = file($path, FILE_IGNORE_NEW_LINES);
+    if ($lines === false) {
+        throw new RuntimeException("Failed to read file list: $path");
+    }
+
+    $result = [];
+    foreach ($lines as $line) {
+        $line = trim($line);
+        if ($line === '') {
+            continue;
+        }
+        $result[] = $line;
+    }
+
+    return $result;
+}
+
+for ($i = 1; $i < count($argv); $i++) {
+    $arg = $argv[$i];
+
     if ($arg === '--format=compact') {
         $format = 'compact';
-    } elseif (str_starts_with($arg, '--')) {
+        continue;
+    }
+
+    if ($arg === '--file-list') {
+        if (!isset($argv[$i + 1])) {
+            fwrite(STDERR, "Missing value for --file-list\n");
+            exit(1);
+        }
+        $i++;
+        try {
+            $files = [...$files, ...loadFileList($argv[$i])];
+        } catch (RuntimeException $e) {
+            fwrite(STDERR, $e->getMessage() . "\n");
+            exit(1);
+        }
+        continue;
+    }
+
+    if (str_starts_with($arg, '--file-list=')) {
+        $path = substr($arg, strlen('--file-list='));
+        try {
+            $files = [...$files, ...loadFileList($path)];
+        } catch (RuntimeException $e) {
+            fwrite(STDERR, $e->getMessage() . "\n");
+            exit(1);
+        }
+        continue;
+    }
+
+    if ($arg === '--autoload') {
+        if (!isset($argv[$i + 1])) {
+            fwrite(STDERR, "Missing value for --autoload\n");
+            exit(1);
+        }
+        $i++;
+        $autoloadFiles[] = $argv[$i];
+        continue;
+    }
+
+    if (str_starts_with($arg, '--autoload=')) {
+        $autoloadFiles[] = substr($arg, strlen('--autoload='));
+        continue;
+    }
+
+    if (str_starts_with($arg, '--')) {
         fwrite(STDERR, "Unknown option: $arg\n");
         exit(1);
-    } else {
-        $files[] = $arg;
     }
+
+    $files[] = $arg;
 }
 
 if (empty($files)) {
-    fwrite(STDERR, "Usage: php scripts/reflect.php [--format=compact] <file1.php> [file2.php ...]\n");
+    fwrite(STDERR, "Usage: php scripts/reflect.php [--format=compact] [--autoload=vendor/autoload.php] [--file-list=files.txt] <file1.php> [file2.php ...]\n");
+    exit(1);
+}
+
+$targetFiles = [];
+foreach ($files as $file) {
+    $abs = realpath($file);
+    if ($abs !== false) {
+        $targetFiles[$abs] = true;
+    }
+}
+
+if (empty($targetFiles)) {
+    fwrite(STDERR, "No valid files provided\n");
     exit(1);
 }
 
@@ -60,18 +149,25 @@ spl_autoload_register(function (string $class) use ($registeredDirs): void {
             require_once $candidate;
             return;
         }
-        // Also try just the short class name (no namespace path)
-        $short = $dir . DIRECTORY_SEPARATOR . basename($relative);
-        if (file_exists($short)) {
-            require_once $short;
-            return;
-        }
     }
 });
 
 // --- Load files ---
 
 $errors = [];
+foreach ($autoloadFiles as $autoloadFile) {
+    $absAutoload = realpath($autoloadFile);
+    if ($absAutoload === false) {
+        $errors[] = ['autoload' => $autoloadFile, 'error' => 'Autoload file not found'];
+        continue;
+    }
+    try {
+        require_once $absAutoload;
+    } catch (\Throwable $e) {
+        $errors[] = ['autoload' => $absAutoload, 'error' => $e->getMessage()];
+    }
+}
+
 foreach ($files as $file) {
     $absFile = realpath($file);
     if ($absFile === false) {
@@ -306,6 +402,10 @@ $output = [
 foreach ($userClasses as $className) {
     try {
         $ref = new \ReflectionClass($className);
+        $classFile = $ref->getFileName();
+        if ($classFile === false || !isset($targetFiles[realpath($classFile) ?: ''])) {
+            continue;
+        }
         if ($ref->isEnum()) {
             // Enums go in classes with is_enum flag
             $output['classes'][] = extractClassLike($ref, $format);
@@ -320,6 +420,10 @@ foreach ($userClasses as $className) {
 foreach ($userInterfaces as $ifaceName) {
     try {
         $ref = new \ReflectionClass($ifaceName);
+        $interfaceFile = $ref->getFileName();
+        if ($interfaceFile === false || !isset($targetFiles[realpath($interfaceFile) ?: ''])) {
+            continue;
+        }
         $output['interfaces'][] = extractClassLike($ref, $format);
     } catch (\ReflectionException $e) {
         $errors[] = ['interface' => $ifaceName, 'error' => $e->getMessage()];
@@ -329,6 +433,10 @@ foreach ($userInterfaces as $ifaceName) {
 foreach ($userTraits as $traitName) {
     try {
         $ref = new \ReflectionClass($traitName);
+        $traitFile = $ref->getFileName();
+        if ($traitFile === false || !isset($targetFiles[realpath($traitFile) ?: ''])) {
+            continue;
+        }
         $output['traits'][] = extractClassLike($ref, $format);
     } catch (\ReflectionException $e) {
         $errors[] = ['trait' => $traitName, 'error' => $e->getMessage()];
