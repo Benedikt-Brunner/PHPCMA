@@ -5,6 +5,7 @@ const symbol_table = @import("symbol_table.zig");
 const type_resolver = @import("type_resolver.zig");
 const phpdoc = @import("phpdoc.zig");
 const NodeKindIds = @import("node_kind_ids.zig").NodeKindIds;
+const json_util = @import("json_util.zig");
 
 const TypeInfo = types.TypeInfo;
 const ClassSymbol = types.ClassSymbol;
@@ -798,17 +799,23 @@ pub const ProjectCallGraph = struct {
         for (self.calls.items, 0..) |call, i| {
             if (i > 0) try writer.writeAll(",");
             try writer.writeAll("\n    {\n");
-            try writer.print("      \"caller\": \"{s}\",\n", .{call.caller_fqn});
-            try writer.print("      \"callee\": \"{s}\",\n", .{call.callee_name});
+            try writer.writeAll("      \"caller\": ");
+            try json_util.writeJsonString(writer, call.caller_fqn);
+            try writer.writeAll(",\n      \"callee\": ");
+            try json_util.writeJsonString(writer, call.callee_name);
+            try writer.writeAll(",\n");
             if (call.resolved_target) |target| {
-                try writer.print("      \"resolved_target\": \"{s}\",\n", .{target});
+                try writer.writeAll("      \"resolved_target\": ");
+                try json_util.writeJsonString(writer, target);
+                try writer.writeAll(",\n");
             } else {
                 try writer.writeAll("      \"resolved_target\": null,\n");
             }
             try writer.print("      \"confidence\": {d:.2},\n", .{call.resolution_confidence});
             try writer.print("      \"line\": {d},\n", .{call.line});
-            try writer.print("      \"file\": \"{s}\"\n", .{call.file_path});
-            try writer.writeAll("    }");
+            try writer.writeAll("      \"file\": ");
+            try json_util.writeJsonString(writer, call.file_path);
+            try writer.writeAll("\n    }");
         }
         if (self.calls.items.len > 0) {
             try writer.writeAll("\n  ");
@@ -1722,9 +1729,11 @@ pub const CalledBeforeAnalyzer = struct {
 
         try writer.writeAll("{\n");
         try writer.writeAll("  \"constraint\": {\n");
-        try writer.print("    \"before\": \"{s}\",\n", .{before_fn});
-        try writer.print("    \"after\": \"{s}\"\n", .{after_fn});
-        try writer.writeAll("  },\n");
+        try writer.writeAll("    \"before\": ");
+        try json_util.writeJsonString(writer, before_fn);
+        try writer.writeAll(",\n    \"after\": ");
+        try json_util.writeJsonString(writer, after_fn);
+        try writer.writeAll("\n  },\n");
         try writer.print("  \"satisfied\": {s},\n", .{if (result.satisfied) "true" else "false"});
 
         // Violations
@@ -1732,9 +1741,11 @@ pub const CalledBeforeAnalyzer = struct {
         for (result.violations, 0..) |violation, i| {
             if (i > 0) try writer.writeAll(",");
             try writer.writeAll("\n    {\n");
-            try writer.print("      \"context_function\": \"{s}\",\n", .{violation.context_function});
-            try writer.print("      \"file\": \"{s}\",\n", .{violation.file_path});
-            try writer.print("      \"after_line\": {d},\n", .{violation.after_line});
+            try writer.writeAll("      \"context_function\": ");
+            try json_util.writeJsonString(writer, violation.context_function);
+            try writer.writeAll(",\n      \"file\": ");
+            try json_util.writeJsonString(writer, violation.file_path);
+            try writer.print(",\n      \"after_line\": {d},\n", .{violation.after_line});
             if (violation.before_line) |bl| {
                 try writer.print("      \"before_line\": {d},\n", .{bl});
             } else {
@@ -1758,13 +1769,17 @@ pub const CalledBeforeAnalyzer = struct {
         for (result.matches, 0..) |match, i| {
             if (i > 0) try writer.writeAll(",");
             try writer.writeAll("\n    {\n");
-            try writer.print("      \"context_function\": \"{s}\",\n", .{match.context_function});
-            try writer.print("      \"file\": \"{s}\",\n", .{match.file_path});
-            try writer.print("      \"after_line\": {d},\n", .{match.after_line});
-            try writer.print("      \"after_callee\": \"{s}\",\n", .{match.after_callee});
-            try writer.print("      \"before_line\": {d},\n", .{match.before_line});
-            try writer.print("      \"before_callee\": \"{s}\"\n", .{match.before_callee});
-            try writer.writeAll("    }");
+            try writer.writeAll("      \"context_function\": ");
+            try json_util.writeJsonString(writer, match.context_function);
+            try writer.writeAll(",\n      \"file\": ");
+            try json_util.writeJsonString(writer, match.file_path);
+            try writer.print(",\n      \"after_line\": {d},\n", .{match.after_line});
+            try writer.writeAll("      \"after_callee\": ");
+            try json_util.writeJsonString(writer, match.after_callee);
+            try writer.print(",\n      \"before_line\": {d},\n", .{match.before_line});
+            try writer.writeAll("      \"before_callee\": ");
+            try json_util.writeJsonString(writer, match.before_callee);
+            try writer.writeAll("\n    }");
         }
         if (result.matches.len > 0) {
             try writer.writeAll("\n  ");

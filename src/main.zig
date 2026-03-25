@@ -24,6 +24,9 @@ const report = @import("report.zig");
 // Dead code analysis
 const dead_code = @import("dead_code.zig");
 
+// JSON utility
+const json_util = @import("json_util.zig");
+
 // Framework stubs
 const framework_stubs = @import("framework_stubs.zig");
 
@@ -2260,11 +2263,13 @@ fn writeDeadCodeJson(
             .method => "method",
             .property => "property",
         };
-        try writer.writeAll("\n      {");
-        try writer.print("\"fqn\": \"{s}\", ", .{d.fqn});
-        try writer.print("\"kind\": \"{s}\", ", .{kind_str});
-        try writer.print("\"file\": \"{s}\", ", .{d.file_path});
-        try writer.print("\"line\": {d}", .{d.line});
+        try writer.writeAll("\n      {\"fqn\": ");
+        try json_util.writeJsonString(writer, d.fqn);
+        try writer.writeAll(", \"kind\": ");
+        try json_util.writeJsonString(writer, kind_str);
+        try writer.writeAll(", \"file\": ");
+        try json_util.writeJsonString(writer, d.file_path);
+        try writer.print(", \"line\": {d}", .{d.line});
         try writer.writeAll("}");
     }
     if (results.len > 0) {
@@ -2319,13 +2324,34 @@ fn writeDeadCodeSarif(file: std.fs.File, results: []const dead_code.DeadSymbol) 
         try writer.writeAll("        \"ruleId\": \"phpcma/dead-code\",\n");
         try writer.writeAll("        \"level\": \"warning\",\n");
         try writer.writeAll("        \"message\": {\n");
-        try writer.print("          \"text\": \"Dead {s}: {s}\"\n", .{ kind_str, d.fqn });
-        try writer.writeAll("        },\n");
+        try writer.writeAll("          \"text\": ");
+        // Build escaped message: "Dead <kind>: <fqn>"
+        try writer.writeByte('"');
+        try writer.print("Dead {s}: ", .{kind_str});
+        for (d.fqn) |c| {
+            switch (c) {
+                '"' => try writer.writeAll("\\\""),
+                '\\' => try writer.writeAll("\\\\"),
+                '\n' => try writer.writeAll("\\n"),
+                '\r' => try writer.writeAll("\\r"),
+                '\t' => try writer.writeAll("\\t"),
+                else => {
+                    if (c < 0x20) {
+                        try writer.print("\\u{X:0>4}", .{c});
+                    } else {
+                        try writer.writeByte(c);
+                    }
+                },
+            }
+        }
+        try writer.writeByte('"');
+        try writer.writeAll("\n        },\n");
         try writer.writeAll("        \"locations\": [{\n");
         try writer.writeAll("          \"physicalLocation\": {\n");
         try writer.writeAll("            \"artifactLocation\": {\n");
-        try writer.print("              \"uri\": \"{s}\"\n", .{d.file_path});
-        try writer.writeAll("            },\n");
+        try writer.writeAll("              \"uri\": ");
+        try json_util.writeJsonString(writer, d.file_path);
+        try writer.writeAll("\n            },\n");
         try writer.writeAll("            \"region\": {\n");
         try writer.print("              \"startLine\": {d}\n", .{d.line});
         try writer.writeAll("            }\n");

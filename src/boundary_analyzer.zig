@@ -2,6 +2,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const call_analyzer = @import("call_analyzer.zig");
 const symbol_table = @import("symbol_table.zig");
+const json_util = @import("json_util.zig");
 
 const EnhancedFunctionCall = types.EnhancedFunctionCall;
 const ProjectConfig = types.ProjectConfig;
@@ -436,9 +437,11 @@ pub const BoundaryAnalyzer = struct {
         try writer.writeAll("  \"dependencies\": [\n");
         for (result.dependencies, 0..) |dep, i| {
             try writer.writeAll("    {\n");
-            try writer.print("      \"from\": \"{s}\",\n", .{shortProjectName(dep.from_project)});
-            try writer.print("      \"to\": \"{s}\",\n", .{shortProjectName(dep.to_project)});
-            try writer.print("      \"call_count\": {d}\n", .{dep.call_count});
+            try writer.writeAll("      \"from\": ");
+            try json_util.writeJsonString(writer, shortProjectName(dep.from_project));
+            try writer.writeAll(",\n      \"to\": ");
+            try json_util.writeJsonString(writer, shortProjectName(dep.to_project));
+            try writer.print(",\n      \"call_count\": {d}\n", .{dep.call_count});
             if (i < result.dependencies.len - 1) {
                 try writer.writeAll("    },\n");
             } else {
@@ -451,13 +454,16 @@ pub const BoundaryAnalyzer = struct {
         try writer.writeAll("  \"api_surface\": [\n");
         for (result.api_surface, 0..) |api, i| {
             try writer.writeAll("    {\n");
-            try writer.print("      \"fqn\": \"{s}\",\n", .{api.fqn});
-            try writer.print("      \"class\": \"{s}\",\n", .{api.class_fqcn});
-            try writer.print("      \"method\": \"{s}\",\n", .{api.method_name});
-            try writer.writeAll("      \"used_by\": [");
+            try writer.writeAll("      \"fqn\": ");
+            try json_util.writeJsonString(writer, api.fqn);
+            try writer.writeAll(",\n      \"class\": ");
+            try json_util.writeJsonString(writer, api.class_fqcn);
+            try writer.writeAll(",\n      \"method\": ");
+            try json_util.writeJsonString(writer, api.method_name);
+            try writer.writeAll(",\n      \"used_by\": [");
             for (api.used_by_projects, 0..) |proj, j| {
                 if (j > 0) try writer.writeAll(", ");
-                try writer.print("\"{s}\"", .{shortProjectName(proj)});
+                try json_util.writeJsonString(writer, shortProjectName(proj));
             }
             try writer.writeAll("]\n");
             if (i < result.api_surface.len - 1) {
@@ -472,11 +478,15 @@ pub const BoundaryAnalyzer = struct {
         try writer.writeAll("  \"boundary_calls\": [\n");
         for (result.boundary_calls, 0..) |bc, i| {
             try writer.writeAll("    {\n");
-            try writer.print("      \"caller\": \"{s}\",\n", .{bc.caller_fqn});
-            try writer.print("      \"callee\": \"{s}\",\n", .{bc.callee_fqn});
-            try writer.print("      \"from_project\": \"{s}\",\n", .{shortProjectName(bc.caller_project)});
-            try writer.print("      \"to_project\": \"{s}\",\n", .{shortProjectName(bc.callee_project)});
-            try writer.print("      \"line\": {d}\n", .{bc.line});
+            try writer.writeAll("      \"caller\": ");
+            try json_util.writeJsonString(writer, bc.caller_fqn);
+            try writer.writeAll(",\n      \"callee\": ");
+            try json_util.writeJsonString(writer, bc.callee_fqn);
+            try writer.writeAll(",\n      \"from_project\": ");
+            try json_util.writeJsonString(writer, shortProjectName(bc.caller_project));
+            try writer.writeAll(",\n      \"to_project\": ");
+            try json_util.writeJsonString(writer, shortProjectName(bc.callee_project));
+            try writer.print(",\n      \"line\": {d}\n", .{bc.line});
             if (i < result.boundary_calls.len - 1) {
                 try writer.writeAll("    },\n");
             } else {
