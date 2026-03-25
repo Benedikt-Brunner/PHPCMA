@@ -856,6 +856,7 @@ var check_dead_config = struct {
     output: []const u8 = "",
     format: []const u8 = "text",
     verbose: bool = false,
+    fail_on_dead: bool = false,
     include_public_methods: bool = false,
     include_public_properties: bool = false,
     show_reasons: bool = false,
@@ -1142,6 +1143,11 @@ pub fn main() !void {
                                 .short_alias = 'v',
                                 .help = "Verbose output",
                                 .value_ref = r.mkRef(&check_dead_config.verbose),
+                            },
+                            .{
+                                .long_name = "fail-on-dead",
+                                .help = "Exit with code 1 when dead code is found (default: exit 0 unless there is an analysis error)",
+                                .value_ref = r.mkRef(&check_dead_config.fail_on_dead),
                             },
                             .{
                                 .long_name = "include-public-methods",
@@ -2162,6 +2168,14 @@ fn analyzeCheckDead() !void {
         const msg = try std.fmt.allocPrint(allocator, "Output written to: {s}\n", .{check_dead_config.output});
         try stdout.writeAll(msg);
     }
+
+    if (shouldFailOnDead(check_dead_config.fail_on_dead, filtered_dead.items.len)) {
+        std.process.exit(1);
+    }
+}
+
+fn shouldFailOnDead(fail_on_dead: bool, dead_count: usize) bool {
+    return fail_on_dead and dead_count > 0;
 }
 
 fn writeDeadCodeText(
@@ -2804,6 +2818,13 @@ fn collectFromSource(allocator: std.mem.Allocator, source: []const u8) !struct {
     try collector.collect(tree);
 
     return .{ sym_table, file_ctx };
+}
+
+test "check-dead fail-on-dead exit semantics" {
+    try std.testing.expect(!shouldFailOnDead(false, 0));
+    try std.testing.expect(!shouldFailOnDead(false, 5));
+    try std.testing.expect(!shouldFailOnDead(true, 0));
+    try std.testing.expect(shouldFailOnDead(true, 1));
 }
 
 test "SymbolCollector: class extraction" {
