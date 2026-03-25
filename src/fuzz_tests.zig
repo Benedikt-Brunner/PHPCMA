@@ -56,7 +56,7 @@ pub fn runPipelineOnFuzzInput(alloc: std.mem.Allocator, source: []const u8, tree
 }
 
 // ============================================================================
-// Fuzz Test Entry Point
+// Fuzz Test Entry Points
 // ============================================================================
 
 test "fuzz_php_pipeline" {
@@ -74,4 +74,31 @@ fn fuzzPhpPipeline(_: void, input: []const u8) anyerror!void {
     defer tree.destroy();
 
     try runPipelineOnFuzzInput(alloc, source, tree);
+}
+
+test "fuzz: symbol collector never crashes" {
+    try std.testing.fuzz({}, fuzzSymbolCollector, .{});
+}
+
+fn fuzzSymbolCollector(_: void, input: []const u8) anyerror!void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source = prepareFuzzPhpSource(alloc, input) catch return;
+
+    const tree = parseFuzzTree(source) orelse return;
+    defer tree.destroy();
+
+    const language = tree_sitter_php();
+
+    var sym_table = SymbolTable.init(alloc);
+    defer sym_table.deinit();
+
+    var file_ctx = FileContext.init(alloc, "fuzz_input.php");
+    defer file_ctx.deinit();
+
+    // This must not panic or segfault regardless of input.
+    // OOM and other errors are expected — only crashes are bugs.
+    main_mod.collectSymbolsFromSource(alloc, &sym_table, &file_ctx, source, language, tree) catch return;
 }
