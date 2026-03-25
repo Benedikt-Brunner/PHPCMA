@@ -133,7 +133,7 @@ fn runPipeline() !PipelineResult {
 // Test: Symbol table minimum counts
 // ============================================================================
 
-test "corpus: shopware-plugins symbol table minimum counts" {
+test "corpus: symbol table minimum counts" {
     if (!corpusAvailable()) {
         std.debug.print("SKIP: corpus not found. Set PHPCMA_CORPUS_ROOT env var.\n", .{});
         return;
@@ -172,7 +172,7 @@ test "corpus: shopware-plugins symbol table minimum counts" {
 // Test: Resolution rate floor
 // ============================================================================
 
-test "corpus: shopware-plugins resolution rate floor" {
+test "corpus: resolution rate floor" {
     if (!corpusAvailable()) {
         std.debug.print("SKIP: corpus not found. Set PHPCMA_CORPUS_ROOT env var.\n", .{});
         return;
@@ -193,7 +193,7 @@ test "corpus: shopware-plugins resolution rate floor" {
 // Test: No crashes (pipeline completes without error/panic)
 // ============================================================================
 
-test "corpus: shopware-plugins no crashes" {
+test "corpus: no crashes" {
     if (!corpusAvailable()) {
         std.debug.print("SKIP: corpus not found. Set PHPCMA_CORPUS_ROOT env var.\n", .{});
         return;
@@ -212,7 +212,7 @@ test "corpus: shopware-plugins no crashes" {
 // Test: Performance ceiling
 // ============================================================================
 
-test "corpus: shopware-plugins performance ceiling" {
+test "corpus: performance ceiling" {
     if (!corpusAvailable()) {
         std.debug.print("SKIP: corpus not found. Set PHPCMA_CORPUS_ROOT env var.\n", .{});
         return;
@@ -236,7 +236,7 @@ test "corpus: shopware-plugins performance ceiling" {
 // Test: check-types violation count consistency
 // ============================================================================
 
-test "corpus: shopware-plugins check-types produces consistent violation count" {
+test "corpus: check-types produces consistent violation count" {
     if (!corpusAvailable()) {
         std.debug.print("SKIP: corpus not found. Set PHPCMA_CORPUS_ROOT env var.\n", .{});
         return;

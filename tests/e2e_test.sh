@@ -356,11 +356,11 @@ fi
 echo ""
 
 # ============================================================================
-# Test 12: Resolution rate on shopware-plugins (if available)
+# Test 12: Resolution rate on corpus (if available)
 # ============================================================================
 SHOPWARE_CONFIG="${PHPCMA_CORPUS_ROOT:-.}/.phpcma.json"
 if [ -f "$SHOPWARE_CONFIG" ]; then
-    echo "Test 12: Resolution rate on shopware-plugins (vs baseline 31.4%)"
+    echo "Test 12: Resolution rate on corpus (vs baseline 31.4%)"
     OUTPUT=$("$PHPCMA" report --config="$SHOPWARE_CONFIG" --format=text 2>&1) || true
     EXIT_CODE=$?
 
@@ -388,7 +388,7 @@ if [ -f "$SHOPWARE_CONFIG" ]; then
     fi
     echo ""
 else
-    echo "Test 12: SKIPPED (shopware-plugins not available at $SHOPWARE_CONFIG)"
+    echo "Test 12: SKIPPED (corpus not available, set PHPCMA_CORPUS_ROOT)"
     echo ""
 fi
 

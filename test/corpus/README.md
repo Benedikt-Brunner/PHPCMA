@@ -54,7 +54,7 @@ The CI workflow uses [monolog/monolog](https://github.com/Seldaek/monolog) becau
 - Well-typed — exercises type resolution
 - Open source — free to download via Composer
 
-The shopware-plugins corpus is too large and private for CI use.
+Large private corpora are too large for CI use.
 
 ## Golden file format
 

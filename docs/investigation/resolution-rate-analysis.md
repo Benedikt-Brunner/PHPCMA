@@ -1,4 +1,4 @@
-# Resolution Rate Analysis: `shopware-plugins`
+# Resolution Rate Analysis
 
 ## Baseline
 
@@ -6,7 +6,7 @@ Ran:
 
 ```bash
 ./zig-out/bin/PHPCMA report \
-  --config=/path/to/shopware-plugins/.phpcma.json \
+  --config=/path/to/project/.phpcma.json \
   --format=text \
   --output=/tmp/shopware-report.txt
 ```

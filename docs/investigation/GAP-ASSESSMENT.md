@@ -5,7 +5,7 @@
 PHPCMA is a Zig-based static analysis engine for PHP codebases. It provides
 call-graph resolution, type checking, interface compliance verification, return
 type checking, and null safety analysis. When run against a real-world monorepo
-(shopware-plugins, 4096 files, 16 290 methods), several gaps emerge:
+(a real-world monorepo with 4096 files, 16 290 methods), several gaps emerge:
 
 - **Call resolution rate is 31.4%** — 68.6% of calls are unresolved, dominated by
   untyped variable methods (48.9%) and missing framework API stubs (35.8%).
