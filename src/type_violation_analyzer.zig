@@ -3,6 +3,7 @@ const types = @import("types.zig");
 const call_analyzer = @import("call_analyzer.zig");
 const symbol_table = @import("symbol_table.zig");
 const boundary_analyzer = @import("boundary_analyzer.zig");
+const json_util = @import("json_util.zig");
 
 const EnhancedFunctionCall = types.EnhancedFunctionCall;
 const ProjectConfig = types.ProjectConfig;
@@ -1104,12 +1105,17 @@ pub const TypeViolationAnalyzer = struct {
             try writer.writeAll("    {\n");
             try writer.print("      \"kind\": \"{s}\",\n", .{@tagName(v.kind)});
             try writer.print("      \"severity\": \"{s}\",\n", .{@tagName(v.severity)});
-            try writer.print("      \"caller\": \"{s}\",\n", .{v.caller_fqn});
-            try writer.print("      \"callee\": \"{s}\",\n", .{v.callee_fqn});
-            try writer.print("      \"from_project\": \"{s}\",\n", .{shortProjectName(v.caller_project)});
-            try writer.print("      \"to_project\": \"{s}\",\n", .{shortProjectName(v.callee_project)});
-            try writer.print("      \"message\": \"{s}\",\n", .{v.message});
-            try writer.print("      \"line\": {d}\n", .{v.line});
+            try writer.writeAll("      \"caller\": ");
+            try json_util.writeJsonString(writer, v.caller_fqn);
+            try writer.writeAll(",\n      \"callee\": ");
+            try json_util.writeJsonString(writer, v.callee_fqn);
+            try writer.writeAll(",\n      \"from_project\": ");
+            try json_util.writeJsonString(writer, shortProjectName(v.caller_project));
+            try writer.writeAll(",\n      \"to_project\": ");
+            try json_util.writeJsonString(writer, shortProjectName(v.callee_project));
+            try writer.writeAll(",\n      \"message\": ");
+            try json_util.writeJsonString(writer, v.message);
+            try writer.print(",\n      \"line\": {d}\n", .{v.line});
             if (i < result.violations.len - 1) {
                 try writer.writeAll("    },\n");
             } else {
@@ -1122,10 +1128,15 @@ pub const TypeViolationAnalyzer = struct {
         try writer.writeAll("  \"breaking_changes\": [\n");
         for (result.breaking_changes, 0..) |bc, i| {
             try writer.writeAll("    {\n");
-            try writer.print("      \"fqn\": \"{s}\",\n", .{bc.fqn});
+            try writer.writeAll("      \"fqn\": ");
+            try json_util.writeJsonString(writer, bc.fqn);
+            try writer.writeAll(",\n");
             try writer.print("      \"kind\": \"{s}\",\n", .{@tagName(bc.kind)});
-            try writer.print("      \"message\": \"{s}\",\n", .{bc.message});
-            try writer.print("      \"project\": \"{s}\"\n", .{bc.project});
+            try writer.writeAll("      \"message\": ");
+            try json_util.writeJsonString(writer, bc.message);
+            try writer.writeAll(",\n      \"project\": ");
+            try json_util.writeJsonString(writer, bc.project);
+            try writer.writeAll("\n");
             if (i < result.breaking_changes.len - 1) {
                 try writer.writeAll("    },\n");
             } else {
@@ -1138,8 +1149,11 @@ pub const TypeViolationAnalyzer = struct {
         try writer.writeAll("  \"stability_scores\": [\n");
         for (result.stability_scores, 0..) |score, i| {
             try writer.writeAll("    {\n");
-            try writer.print("      \"from\": \"{s}\",\n", .{shortProjectName(score.from_project)});
-            try writer.print("      \"to\": \"{s}\",\n", .{shortProjectName(score.to_project)});
+            try writer.writeAll("      \"from\": ");
+            try json_util.writeJsonString(writer, shortProjectName(score.from_project));
+            try writer.writeAll(",\n      \"to\": ");
+            try json_util.writeJsonString(writer, shortProjectName(score.to_project));
+            try writer.writeAll(",\n");
             try writer.print("      \"methods\": {d},\n", .{score.total_api_methods});
             try writer.print("      \"violations\": {d},\n", .{score.violations});
             try writer.print("      \"breaking_changes\": {d},\n", .{score.breaking_changes});
@@ -1159,10 +1173,12 @@ pub const TypeViolationAnalyzer = struct {
         try writer.writeAll("  \"api_signatures\": [\n");
         for (result.api_signatures, 0..) |sig, i| {
             try writer.writeAll("    {\n");
-            try writer.print("      \"fqn\": \"{s}\",\n", .{sig.fqn});
-            try writer.print("      \"return_type\": ", .{});
+            try writer.writeAll("      \"fqn\": ");
+            try json_util.writeJsonString(writer, sig.fqn);
+            try writer.writeAll(",\n      \"return_type\": ");
             if (sig.return_type) |rt| {
-                try writer.print("\"{s}\",\n", .{rt});
+                try json_util.writeJsonString(writer, rt);
+                try writer.writeAll(",\n");
             } else {
                 try writer.writeAll("null,\n");
             }

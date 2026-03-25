@@ -3,6 +3,7 @@ const ts = @import("tree-sitter");
 const types = @import("types.zig");
 const symbol_table = @import("symbol_table.zig");
 const main_mod = @import("main.zig");
+const json_util = @import("json_util.zig");
 
 const SymbolTable = symbol_table.SymbolTable;
 const FileContext = types.FileContext;
@@ -161,26 +162,7 @@ fn writeKey(writer: anytype, key: []const u8) !void {
     try writer.writeAll(": ");
 }
 
-fn writeJsonString(writer: anytype, value: []const u8) !void {
-    try writer.writeByte('"');
-    for (value) |c| {
-        switch (c) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
-            else => {
-                if (c < 0x20) {
-                    try writer.print("\\u{X:0>4}", .{c});
-                } else {
-                    try writer.writeByte(c);
-                }
-            },
-        }
-    }
-    try writer.writeByte('"');
-}
+const writeJsonString = json_util.writeJsonString;
 
 fn writeJsonBool(writer: anytype, value: bool) !void {
     if (value) {

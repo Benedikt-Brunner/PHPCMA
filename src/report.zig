@@ -2,6 +2,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const symbol_table = @import("symbol_table.zig");
 const call_analyzer = @import("call_analyzer.zig");
+const json_util = @import("json_util.zig");
 
 const SymbolTable = symbol_table.SymbolTable;
 const ProjectCallGraph = call_analyzer.ProjectCallGraph;
@@ -297,11 +298,13 @@ pub const UnifiedReport = struct {
         try writer.writeAll("    \"top_dead_candidates\": [");
         for (self.dead_code.top_dead_candidates.items, 0..) |c, i| {
             if (i > 0) try writer.writeAll(",");
-            try writer.writeAll("\n      {");
-            try writer.print("\"fqn\": \"{s}\", ", .{c.fqn});
-            try writer.print("\"kind\": \"{s}\", ", .{c.kind});
-            try writer.print("\"file\": \"{s}\", ", .{c.file_path});
-            try writer.print("\"line\": {d}", .{c.line});
+            try writer.writeAll("\n      {\"fqn\": ");
+            try json_util.writeJsonString(writer, c.fqn);
+            try writer.writeAll(", \"kind\": ");
+            try json_util.writeJsonString(writer, c.kind);
+            try writer.writeAll(", \"file\": ");
+            try json_util.writeJsonString(writer, c.file_path);
+            try writer.print(", \"line\": {d}", .{c.line});
             try writer.writeAll("}");
         }
         if (self.dead_code.top_dead_candidates.items.len > 0) {
@@ -322,11 +325,12 @@ pub const UnifiedReport = struct {
         try writer.writeAll("  \"violations\": [");
         for (self.violations.items, 0..) |v, i| {
             if (i > 0) try writer.writeAll(",");
-            try writer.writeAll("\n    {");
-            try writer.print("\"severity\": \"{s}\", ", .{v.severityLabel()});
-            try writer.print("\"file\": \"{s}\", ", .{v.file_path});
-            try writer.print("\"line\": {d}, ", .{v.line});
-            try writer.print("\"message\": \"{s}\"", .{v.message});
+            try writer.writeAll("\n    {\"severity\": ");
+            try json_util.writeJsonString(writer, v.severityLabel());
+            try writer.writeAll(", \"file\": ");
+            try json_util.writeJsonString(writer, v.file_path);
+            try writer.print(", \"line\": {d}, \"message\": ", .{v.line});
+            try json_util.writeJsonString(writer, v.message);
             try writer.writeAll("}");
         }
         if (self.violations.items.len > 0) {
@@ -388,10 +392,12 @@ pub const UnifiedReport = struct {
 
             if (rule_count > 0) try writer.writeAll(",");
             try writer.writeAll("\n          {\n");
-            try writer.print("            \"id\": \"phpcma/{s}\",\n", .{v.category});
-            try writer.writeAll("            \"shortDescription\": {\n");
-            try writer.print("              \"text\": \"{s}\"\n", .{v.category});
-            try writer.writeAll("            },\n");
+            try writer.writeAll("            \"id\": \"phpcma/");
+            try json_util.writeJsonStringContent(writer, v.category);
+            try writer.writeAll("\",\n            \"shortDescription\": {\n");
+            try writer.writeAll("              \"text\": ");
+            try json_util.writeJsonString(writer, v.category);
+            try writer.writeAll("\n            },\n");
             try writer.writeAll("            \"defaultConfiguration\": {\n");
             try writer.print("              \"level\": \"{s}\"\n", .{sarifLevel(v.severity)});
             try writer.writeAll("            }\n");
@@ -411,16 +417,20 @@ pub const UnifiedReport = struct {
         for (self.violations.items, 0..) |v, i| {
             if (i > 0) try writer.writeAll(",");
             try writer.writeAll("\n      {\n");
-            try writer.print("        \"ruleId\": \"phpcma/{s}\",\n", .{v.category});
+            try writer.writeAll("        \"ruleId\": \"phpcma/");
+            try json_util.writeJsonStringContent(writer, v.category);
+            try writer.writeAll("\",\n");
             try writer.print("        \"level\": \"{s}\",\n", .{sarifLevel(v.severity)});
             try writer.writeAll("        \"message\": {\n");
-            try writer.print("          \"text\": \"{s}\"\n", .{v.message});
-            try writer.writeAll("        },\n");
+            try writer.writeAll("          \"text\": ");
+            try json_util.writeJsonString(writer, v.message);
+            try writer.writeAll("\n        },\n");
             try writer.writeAll("        \"locations\": [{\n");
             try writer.writeAll("          \"physicalLocation\": {\n");
             try writer.writeAll("            \"artifactLocation\": {\n");
-            try writer.print("              \"uri\": \"{s}\"\n", .{v.file_path});
-            try writer.writeAll("            },\n");
+            try writer.writeAll("              \"uri\": ");
+            try json_util.writeJsonString(writer, v.file_path);
+            try writer.writeAll("\n            },\n");
             try writer.writeAll("            \"region\": {\n");
             try writer.print("              \"startLine\": {d}\n", .{v.line});
             try writer.writeAll("            }\n");
@@ -1599,7 +1609,7 @@ test "dead code section: JSON output includes dead_code counts and candidates" {
     try std.testing.expect(std.mem.indexOf(u8, output, "\"dead_classes\": 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"dead_methods\": 10") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"kept_alive_by_unresolved\": 42") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "App\\OldService") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "App\\\\OldService") != null);
 }
 
 test "dead code section: text output includes dead code header" {
