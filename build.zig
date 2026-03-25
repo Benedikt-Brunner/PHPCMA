@@ -297,6 +297,17 @@ pub fn build(b: *std.Build) void {
     const run_dead_code_tests = b.addRunArtifact(dead_code_tests);
     test_step.dependOn(&run_dead_code_tests.step);
 
+    const test_gen_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_gen.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const run_test_gen_tests = b.addRunArtifact(test_gen_tests);
+    test_step.dependOn(&run_test_gen_tests.step);
+
     // ----------------------------------------------------------------
     // Fuzz Testing
     // ----------------------------------------------------------------
