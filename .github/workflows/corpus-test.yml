@@ -1,0 +1,92 @@
+name: Corpus Regression Tests
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  corpus-regression:
+    name: Golden file comparison
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build PHPCMA (ReleaseFast)
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Cache monolog corpus
+        id: cache-monolog
+        uses: actions/cache@v4
+        with:
+          path: /tmp/corpus/monolog
+          key: corpus-monolog-3.x
+
+      - name: Download monolog corpus
+        if: steps.cache-monolog.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/corpus
+          git clone --depth 1 https://github.com/Seldaek/monolog.git /tmp/corpus/monolog
+
+      - name: Run PHPCMA report on monolog
+        run: |
+          START=$(date +%s%N)
+          ./zig-out/bin/PHPCMA report \
+            --composer="/tmp/corpus/monolog/composer.json" \
+            --format=json > /tmp/actual.json
+          END=$(date +%s%N)
+          DURATION=$(python3 -c "print(f'{($END - $START) / 1e9:.2f}')")
+          echo "DURATION=$DURATION" >> "$GITHUB_ENV"
+          echo "Analysis completed in ${DURATION}s"
+
+      - name: Compare against golden file
+        run: |
+          python3 scripts/corpus-compare.py \
+            /tmp/actual.json \
+            test/corpus/monolog.golden.json \
+            --duration="$DURATION"
+
+      - name: Post comparison summary
+        if: always()
+        run: |
+          {
+            echo "## Corpus Regression Test Results"
+            echo ""
+            echo '```'
+            python3 scripts/corpus-compare.py \
+              /tmp/actual.json \
+              test/corpus/monolog.golden.json \
+              --duration="$DURATION" 2>&1 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  fuzz-smoke:
+    name: Fuzz smoke test (60s)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Run fuzz tests (60s smoke)
+        run: |
+          timeout 60 zig build fuzz || EXIT=$?
+          if [ "${EXIT:-0}" -eq 124 ]; then
+            echo "Fuzz test completed (60s timeout reached — no crashes found)"
+            exit 0
+          elif [ "${EXIT:-0}" -eq 0 ]; then
+            echo "Fuzz tests passed"
+            exit 0
+          else
+            echo "Fuzz test found a crash!"
+            exit 1
+          fi
