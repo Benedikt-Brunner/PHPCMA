@@ -21,11 +21,15 @@ extern fn tree_sitter_php() callconv(.c) *ts.Language;
 // Corpus path — skips gracefully if not present
 // ============================================================================
 
-const corpus_root = "/Users/benediktbrunner/PhpstormProjects/shopware-plugins";
-const corpus_config = corpus_root ++ "/.phpcma.json";
+fn getCorpusConfig(alloc: std.mem.Allocator) ?[]const u8 {
+    const root = std.posix.getenv("PHPCMA_CORPUS_ROOT") orelse return null;
+    return std.fmt.allocPrint(alloc, "{s}/.phpcma.json", .{root}) catch return null;
+}
 
 fn corpusAvailable() bool {
-    std.fs.accessAbsolute(corpus_config, .{}) catch return false;
+    const config_path = getCorpusConfig(std.heap.c_allocator) orelse return false;
+    defer std.heap.c_allocator.free(config_path);
+    std.fs.accessAbsolute(config_path, .{}) catch return false;
     return true;
 }
 
@@ -67,7 +71,8 @@ fn runPipeline() !PipelineResult {
     const allocator = arena.allocator();
 
     // Pass 1: Parse .phpcma.json and discover files
-    var phpcma_config = try config_parser.parseConfigFile(allocator, corpus_config);
+    const config_path = getCorpusConfig(allocator) orelse return error.CorpusNotConfigured;
+    var phpcma_config = try config_parser.parseConfigFile(allocator, config_path);
     _ = &phpcma_config;
 
     const project_configs = try config_parser.parseDiscoveredProjects(allocator, &phpcma_config);
@@ -130,7 +135,7 @@ fn runPipeline() !PipelineResult {
 
 test "corpus: shopware-plugins symbol table minimum counts" {
     if (!corpusAvailable()) {
-        std.debug.print("SKIP: shopware-plugins corpus not found at {s}\n", .{corpus_root});
+        std.debug.print("SKIP: corpus not found. Set PHPCMA_CORPUS_ROOT env var.\n", .{});
         return;
     }
 
@@ -169,7 +174,7 @@ test "corpus: shopware-plugins symbol table minimum counts" {
 
 test "corpus: shopware-plugins resolution rate floor" {
     if (!corpusAvailable()) {
-        std.debug.print("SKIP: shopware-plugins corpus not found at {s}\n", .{corpus_root});
+        std.debug.print("SKIP: corpus not found. Set PHPCMA_CORPUS_ROOT env var.\n", .{});
         return;
     }
 
@@ -190,7 +195,7 @@ test "corpus: shopware-plugins resolution rate floor" {
 
 test "corpus: shopware-plugins no crashes" {
     if (!corpusAvailable()) {
-        std.debug.print("SKIP: shopware-plugins corpus not found at {s}\n", .{corpus_root});
+        std.debug.print("SKIP: corpus not found. Set PHPCMA_CORPUS_ROOT env var.\n", .{});
         return;
     }
 
@@ -209,7 +214,7 @@ test "corpus: shopware-plugins no crashes" {
 
 test "corpus: shopware-plugins performance ceiling" {
     if (!corpusAvailable()) {
-        std.debug.print("SKIP: shopware-plugins corpus not found at {s}\n", .{corpus_root});
+        std.debug.print("SKIP: corpus not found. Set PHPCMA_CORPUS_ROOT env var.\n", .{});
         return;
     }
 
@@ -233,7 +238,7 @@ test "corpus: shopware-plugins performance ceiling" {
 
 test "corpus: shopware-plugins check-types produces consistent violation count" {
     if (!corpusAvailable()) {
-        std.debug.print("SKIP: shopware-plugins corpus not found at {s}\n", .{corpus_root});
+        std.debug.print("SKIP: corpus not found. Set PHPCMA_CORPUS_ROOT env var.\n", .{});
         return;
     }
 

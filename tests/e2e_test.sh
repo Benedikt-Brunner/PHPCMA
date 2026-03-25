@@ -358,7 +358,7 @@ echo ""
 # ============================================================================
 # Test 12: Resolution rate on shopware-plugins (if available)
 # ============================================================================
-SHOPWARE_CONFIG="/Users/benediktbrunner/PhpstormProjects/shopware-plugins/.phpcma.json"
+SHOPWARE_CONFIG="${PHPCMA_CORPUS_ROOT:-.}/.phpcma.json"
 if [ -f "$SHOPWARE_CONFIG" ]; then
     echo "Test 12: Resolution rate on shopware-plugins (vs baseline 31.4%)"
     OUTPUT=$("$PHPCMA" report --config="$SHOPWARE_CONFIG" --format=text 2>&1) || true

@@ -6,7 +6,7 @@ Ran:
 
 ```bash
 ./zig-out/bin/PHPCMA report \
-  --config=/Users/benediktbrunner/PhpstormProjects/shopware-plugins/.phpcma.json \
+  --config=/path/to/shopware-plugins/.phpcma.json \
   --format=text \
   --output=/tmp/shopware-report.txt
 ```
