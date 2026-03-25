@@ -355,6 +355,34 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_gen_tests.step);
 
     // ----------------------------------------------------------------
+    // Corpus Tests (requires shopware-plugins corpus on disk)
+    // ----------------------------------------------------------------
+    const corpus_step = b.step("corpus-test", "Run corpus integration tests (requires shopware-plugins)");
+
+    const corpus_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/corpus_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    corpus_tests.root_module.addImport("tree-sitter", ts_dep.module("tree_sitter"));
+    corpus_tests.root_module.addImport("cli", cli_dep.module("cli"));
+    corpus_tests.addIncludePath(php_src_root);
+    corpus_tests.addCSourceFile(.{
+        .file = php_src_root.path(b, "parser.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    corpus_tests.addCSourceFile(.{
+        .file = php_src_root.path(b, "scanner.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    corpus_tests.linkLibC();
+
+    const run_corpus_tests = b.addRunArtifact(corpus_tests);
+    corpus_step.dependOn(&run_corpus_tests.step);
+
+    // ----------------------------------------------------------------
     // Fuzz Testing
     // ----------------------------------------------------------------
     const fuzz_step = b.step("fuzz", "Run fuzz tests against the PHP analysis pipeline");
