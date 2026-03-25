@@ -273,13 +273,16 @@ pub const BoundaryAnalyzer = struct {
             try project_set.put(cfg.root_path, {});
         }
 
+        const cross_project_calls = boundary_calls.items.len;
+        const total_calls = same_project_count + cross_project_calls;
+
         return BoundaryResult{
             .boundary_calls = try boundary_calls.toOwnedSlice(self.allocator),
             .api_surface = try api_surface.toOwnedSlice(self.allocator),
             .dependencies = try dependencies.toOwnedSlice(self.allocator),
             .summaries = try summaries.toOwnedSlice(self.allocator),
-            .total_calls = same_project_count + boundary_calls.items.len,
-            .cross_project_calls = boundary_calls.items.len,
+            .total_calls = total_calls,
+            .cross_project_calls = cross_project_calls,
             .same_project_calls = same_project_count,
             .project_count = project_set.count(),
         };

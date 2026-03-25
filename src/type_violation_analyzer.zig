@@ -1272,6 +1272,8 @@ test "cross-project correct types - no violations" {
     try sym_table.addClass(plugin_class);
 
     var call_graph = ProjectCallGraph.init(alloc, &sym_table);
+    const arg_types = try alloc.alloc(?TypeInfo, 1);
+    arg_types[0] = try TypeInfo.simple(alloc, "string");
     try call_graph.calls.append(alloc, .{
         .caller_fqn = "Plugin\\Consumer::run",
         .callee_name = "process",
@@ -1282,6 +1284,8 @@ test "cross-project correct types - no violations" {
         .resolved_target = "Bundle\\Service::process",
         .resolution_confidence = 1.0,
         .resolution_method = .native_type,
+        .argument_types = arg_types,
+        .argument_count = 1,
     });
 
     var configs = try alloc.alloc(ProjectConfig, 2);

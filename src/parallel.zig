@@ -143,14 +143,10 @@ pub fn parallelSymbolCollect(
     defer allocator.free(results);
 
     // Each thread gets its own ArenaAllocator backed by c_allocator.
-    // These arenas are intentionally NEVER freed — the merged data (strings,
-    // HashMap entries, ClassSymbol fields, etc.) is referenced by the caller's
-    // global structures for the rest of the program. The parent arena in main
-    // does not own this memory; the per-thread arenas do, and they live until
-    // process exit. This avoids both mutex contention (ThreadSafeAllocator)
-    // and use-after-free (freeing per-thread arenas after merge).
+    // We free only the bookkeeping array here; arena allocations intentionally
+    // outlive this function because merged symbols/sources point into them.
     const thread_arenas = try allocator.alloc(std.heap.ArenaAllocator, num_threads);
-    // NOT deferred — intentionally leaked
+    defer allocator.free(thread_arenas);
 
     for (results, thread_arenas) |*r, *arena| {
         arena.* = std.heap.ArenaAllocator.init(std.heap.c_allocator);
@@ -265,6 +261,7 @@ fn sequentialSymbolCollect(
 // ============================================================================
 
 const CallAnalysisContext = struct {
+    allocator: std.mem.Allocator,
     files: []const []const u8,
     file_sources: *std.StringHashMap([]const u8),
     file_contexts: *std.StringHashMap(FileContext),
@@ -296,7 +293,52 @@ fn callAnalysisWorker(ctx: *const CallAnalysisContext, thread_idx: usize, chunk_
         analyzer.analyzeFile(tree, source, file_path) catch continue;
 
         for (analyzer.getCalls()) |call| {
-            result.calls.append(result.allocator, call) catch continue;
+            var owned_call = call;
+            owned_call.caller_fqn = ctx.allocator.dupe(u8, call.caller_fqn) catch continue;
+            owned_call.owns_caller_fqn = true;
+            owned_call.callee_name = ctx.allocator.dupe(u8, call.callee_name) catch {
+                ctx.allocator.free(owned_call.caller_fqn);
+                continue;
+            };
+            owned_call.owns_callee_name = true;
+
+            if (call.resolved_target) |target| {
+                owned_call.resolved_target = ctx.allocator.dupe(u8, target) catch {
+                    ctx.allocator.free(owned_call.caller_fqn);
+                    ctx.allocator.free(owned_call.callee_name);
+                    continue;
+                };
+                owned_call.owns_resolved_target = true;
+            }
+
+            var copied_argument_types = false;
+            if (call.argument_types.len > 0) {
+                owned_call.argument_types = ctx.allocator.dupe(?types.TypeInfo, call.argument_types) catch {
+                    ctx.allocator.free(owned_call.caller_fqn);
+                    ctx.allocator.free(owned_call.callee_name);
+                    if (owned_call.owns_resolved_target and owned_call.resolved_target != null) {
+                        ctx.allocator.free(owned_call.resolved_target.?);
+                    }
+                    continue;
+                };
+                copied_argument_types = true;
+            }
+
+            result.calls.append(result.allocator, owned_call) catch {
+                if (owned_call.owns_caller_fqn) {
+                    ctx.allocator.free(owned_call.caller_fqn);
+                }
+                if (owned_call.owns_callee_name) {
+                    ctx.allocator.free(owned_call.callee_name);
+                }
+                if (owned_call.owns_resolved_target and owned_call.resolved_target != null) {
+                    ctx.allocator.free(owned_call.resolved_target.?);
+                }
+                if (copied_argument_types) {
+                    ctx.allocator.free(owned_call.argument_types);
+                }
+                continue;
+            };
         }
     }
 }
@@ -321,9 +363,10 @@ pub fn parallelCallAnalysis(
     var results = try allocator.alloc(CallAnalysisResult, num_threads);
     defer allocator.free(results);
 
-    // Per-thread arenas for call analysis — intentionally never freed (same
-    // rationale as parallelSymbolCollect above).
+    // Per-thread arenas for call analysis. We free only the bookkeeping array;
+    // arena allocations intentionally outlive this function after merge.
     const thread_arenas = try allocator.alloc(std.heap.ArenaAllocator, num_threads);
+    defer allocator.free(thread_arenas);
 
     for (results, thread_arenas) |*r, *arena| {
         arena.* = std.heap.ArenaAllocator.init(std.heap.c_allocator);
@@ -333,6 +376,7 @@ pub fn parallelCallAnalysis(
     const chunk_size = (files.len + num_threads - 1) / num_threads;
 
     var ctx = CallAnalysisContext{
+        .allocator = allocator,
         .files = files,
         .file_sources = file_sources,
         .file_contexts = file_contexts,
@@ -414,8 +458,8 @@ fn testCollectFn(
 ) error{OutOfMemory}!void {
     _ = file_ctx;
     const root = tree.rootNode();
-    const class_decl_id = language.idForNodeKind("class_declaration", false);
-    const name_id = language.idForNodeKind("name", false);
+    const class_decl_id = language.idForNodeKind("class_declaration", true);
+    const name_id = language.idForNodeKind("name", true);
     try walkForClasses(allocator, sym_table, root, source, class_decl_id, name_id);
 }
 
@@ -434,8 +478,7 @@ fn walkForClasses(
                 const end = name_node.endByte();
                 if (start < source.len and end <= source.len and start < end) {
                     const class_name = source[start..end];
-                    const duped = try allocator.dupe(u8, class_name);
-                    var class = types.ClassSymbol.init(allocator, duped);
+                    var class = types.ClassSymbol.init(allocator, class_name);
                     class.file_path = "";
                     try sym_table.addClass(class);
                 }
