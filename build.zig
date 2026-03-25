@@ -382,6 +382,33 @@ pub fn build(b: *std.Build) void {
     const run_corpus_tests = b.addRunArtifact(corpus_tests);
     corpus_step.dependOn(&run_corpus_tests.step);
 
+    // Differential tests (PHPCMA vs PHP reflection)
+    const diff_step = b.step("diff-test", "Run differential tests comparing PHPCMA against PHP reflection");
+
+    const diff_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/differential_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    diff_tests.root_module.addImport("tree-sitter", ts_dep.module("tree_sitter"));
+    diff_tests.root_module.addImport("cli", cli_dep.module("cli"));
+    diff_tests.addIncludePath(php_src_root);
+    diff_tests.addCSourceFile(.{
+        .file = php_src_root.path(b, "parser.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    diff_tests.addCSourceFile(.{
+        .file = php_src_root.path(b, "scanner.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    diff_tests.linkLibC();
+
+    const run_diff_tests = b.addRunArtifact(diff_tests);
+    diff_step.dependOn(&run_diff_tests.step);
+    test_step.dependOn(&run_diff_tests.step);
+
     // ----------------------------------------------------------------
     // Fuzz Testing
     // ----------------------------------------------------------------
