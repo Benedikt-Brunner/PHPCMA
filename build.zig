@@ -331,6 +331,29 @@ pub fn build(b: *std.Build) void {
     const run_call_graph_tests = b.addRunArtifact(call_graph_tests);
     test_step.dependOn(&run_call_graph_tests.step);
 
+    const gen_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gen_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    gen_tests.root_module.addImport("tree-sitter", ts_dep.module("tree_sitter"));
+    gen_tests.root_module.addImport("cli", cli_dep.module("cli"));
+    gen_tests.addIncludePath(php_src_root);
+    gen_tests.addCSourceFile(.{
+        .file = php_src_root.path(b, "parser.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    gen_tests.addCSourceFile(.{
+        .file = php_src_root.path(b, "scanner.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    gen_tests.linkLibC();
+
+    const run_gen_tests = b.addRunArtifact(gen_tests);
+    test_step.dependOn(&run_gen_tests.step);
+
     // ----------------------------------------------------------------
     // Fuzz Testing
     // ----------------------------------------------------------------
