@@ -41,18 +41,20 @@ pub const TypeInfo = struct {
     }
 
     pub fn simple(allocator: std.mem.Allocator, type_name: []const u8) !TypeInfo {
+        _ = allocator;
         return .{
             .kind = .simple,
-            .base_type = try allocator.dupe(u8, type_name),
+            .base_type = type_name,
             .type_parts = &.{},
             .is_builtin = isBuiltin(type_name),
         };
     }
 
     pub fn nullable(allocator: std.mem.Allocator, type_name: []const u8) !TypeInfo {
+        _ = allocator;
         return .{
             .kind = .nullable,
-            .base_type = try allocator.dupe(u8, type_name),
+            .base_type = type_name,
             .type_parts = &.{},
             .is_builtin = isBuiltin(type_name),
         };
@@ -583,7 +585,9 @@ pub const ResolutionMethod = enum {
 pub const EnhancedFunctionCall = struct {
     // Original call info
     caller_fqn: []const u8, // FQN of the calling function/method
+    owns_caller_fqn: bool = false,
     callee_name: []const u8, // Name of the called function/method
+    owns_callee_name: bool = false,
     call_type: CallType,
     line: u32,
     column: u32,
@@ -591,6 +595,7 @@ pub const EnhancedFunctionCall = struct {
 
     // Resolution info
     resolved_target: ?[]const u8, // FQCN of resolved method
+    owns_resolved_target: bool = false,
     resolution_confidence: f32,
     resolution_method: ResolutionMethod,
 

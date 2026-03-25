@@ -16,6 +16,28 @@ const ResolutionMethod = types.ResolutionMethod;
 const SymbolTable = symbol_table.SymbolTable;
 const TypeResolver = type_resolver.TypeResolver;
 
+fn freeCallArgumentTypes(allocator: std.mem.Allocator, calls: []const EnhancedFunctionCall) void {
+    for (calls) |call| {
+        if (call.owns_caller_fqn) {
+            allocator.free(call.caller_fqn);
+        }
+        if (call.owns_callee_name) {
+            allocator.free(call.callee_name);
+        }
+        if (call.owns_resolved_target and call.resolved_target != null) {
+            allocator.free(call.resolved_target.?);
+        }
+        if (call.argument_types.len > 0) {
+            allocator.free(call.argument_types);
+        }
+    }
+}
+
+const CallerFqn = struct {
+    value: []const u8,
+    owned: bool,
+};
+
 // ============================================================================
 // Call Analyzer - Enhanced call graph building with type resolution
 // ============================================================================
@@ -54,6 +76,7 @@ pub const CallAnalyzer = struct {
 
     pub fn deinit(self: *CallAnalyzer) void {
         self.type_resolver.deinit();
+        freeCallArgumentTypes(self.allocator, self.calls.items);
         self.calls.deinit(self.allocator);
     }
 
@@ -243,9 +266,12 @@ pub const CallAnalyzer = struct {
         // Try to resolve object type
         const object_type = try self.type_resolver.resolveExpressionType(object_node, source);
 
+        const caller_fqn = self.buildCallerFQN();
         var call = EnhancedFunctionCall{
-            .caller_fqn = self.buildCallerFQN(),
+            .caller_fqn = caller_fqn.value,
+            .owns_caller_fqn = caller_fqn.owned,
             .callee_name = try self.allocator.dupe(u8, method_name),
+            .owns_callee_name = true,
             .call_type = .method,
             .line = node.startPoint().row + 1,
             .column = node.startPoint().column + 1,
@@ -263,6 +289,7 @@ pub const CallAnalyzer = struct {
                     "{s}::{s}",
                     .{ method.containing_class, method.name },
                 );
+                call.owns_resolved_target = true;
                 call.resolution_confidence = self.calculateConfidence(obj_type);
                 call.resolution_method = self.determineResolutionMethod(object_node, source);
             }
@@ -319,9 +346,12 @@ pub const CallAnalyzer = struct {
             fqcn = try self.type_resolver.file_context.resolveFQCN(class_name);
         }
 
+        const caller_fqn = self.buildCallerFQN();
         var call = EnhancedFunctionCall{
-            .caller_fqn = self.buildCallerFQN(),
+            .caller_fqn = caller_fqn.value,
+            .owns_caller_fqn = caller_fqn.owned,
             .callee_name = try self.allocator.dupe(u8, method_name),
+            .owns_callee_name = true,
             .call_type = .static_method,
             .line = node.startPoint().row + 1,
             .column = node.startPoint().column + 1,
@@ -338,6 +368,7 @@ pub const CallAnalyzer = struct {
                 "{s}::{s}",
                 .{ method.containing_class, method.name },
             );
+            call.owns_resolved_target = true;
         } else {
             // External class - can't resolve but we know the target
             call.resolved_target = try std.fmt.allocPrint(
@@ -345,6 +376,7 @@ pub const CallAnalyzer = struct {
                 "{s}::{s}",
                 .{ fqcn, method_name },
             );
+            call.owns_resolved_target = true;
             call.resolution_confidence = 0.5; // Known class but not in symbol table
         }
 
@@ -371,17 +403,22 @@ pub const CallAnalyzer = struct {
 
         // Build FQN
         var fqn: []const u8 = undefined;
+        var owns_fqn = false;
         if (std.mem.indexOf(u8, func_name, "\\") != null) {
             fqn = func_name;
         } else if (self.type_resolver.file_context.namespace) |ns| {
             fqn = try std.fmt.allocPrint(self.allocator, "{s}\\{s}", .{ ns, func_name });
+            owns_fqn = true;
         } else {
             fqn = func_name;
         }
 
+        const caller_fqn = self.buildCallerFQN();
         var call = EnhancedFunctionCall{
-            .caller_fqn = self.buildCallerFQN(),
+            .caller_fqn = caller_fqn.value,
+            .owns_caller_fqn = caller_fqn.owned,
             .callee_name = try self.allocator.dupe(u8, func_name),
+            .owns_callee_name = true,
             .call_type = .function,
             .line = node.startPoint().row + 1,
             .column = node.startPoint().column + 1,
@@ -393,13 +430,25 @@ pub const CallAnalyzer = struct {
 
         // Try to resolve
         if (self.symbol_table.getFunction(fqn)) |_| {
-            call.resolved_target = try self.allocator.dupe(u8, fqn);
+            if (owns_fqn) {
+                call.resolved_target = fqn;
+                call.owns_resolved_target = true;
+                owns_fqn = false;
+            } else {
+                call.resolved_target = try self.allocator.dupe(u8, fqn);
+                call.owns_resolved_target = true;
+            }
             call.resolution_confidence = 1.0;
             call.resolution_method = .explicit_type;
         } else if (isBuiltinFunction(func_name)) {
             call.resolved_target = try self.allocator.dupe(u8, func_name);
+            call.owns_resolved_target = true;
             call.resolution_confidence = 1.0;
             call.resolution_method = .explicit_type;
+        }
+
+        if (owns_fqn) {
+            self.allocator.free(fqn);
         }
 
         // Resolve argument types
@@ -455,17 +504,18 @@ pub const CallAnalyzer = struct {
     // Helper Methods
     // ========================================================================
 
-    fn buildCallerFQN(self: *CallAnalyzer) []const u8 {
+    fn buildCallerFQN(self: *CallAnalyzer) CallerFqn {
         if (self.current_class) |class| {
             if (self.current_method) |method| {
-                return std.fmt.allocPrint(self.allocator, "{s}::{s}", .{ class, method }) catch class;
+                const combined = std.fmt.allocPrint(self.allocator, "{s}::{s}", .{ class, method }) catch return .{ .value = class, .owned = false };
+                return .{ .value = combined, .owned = true };
             }
-            return class;
+            return .{ .value = class, .owned = false };
         }
         if (self.current_method) |method| {
-            return method;
+            return .{ .value = method, .owned = false };
         }
-        return "<global>";
+        return .{ .value = "<global>", .owned = false };
     }
 
     fn calculateConfidence(self: *CallAnalyzer, type_info: TypeInfo) f32 {
@@ -565,13 +615,33 @@ pub const ProjectCallGraph = struct {
     }
 
     pub fn deinit(self: *ProjectCallGraph) void {
+        freeCallArgumentTypes(self.allocator, self.calls.items);
         self.calls.deinit(self.allocator);
     }
 
     /// Add calls from a file analyzer
     pub fn addCalls(self: *ProjectCallGraph, analyzer: *const CallAnalyzer) !void {
         for (analyzer.getCalls()) |call| {
-            try self.calls.append(self.allocator, call);
+            var owned_call = call;
+            owned_call.caller_fqn = try self.allocator.dupe(u8, call.caller_fqn);
+            owned_call.owns_caller_fqn = true;
+            owned_call.callee_name = try self.allocator.dupe(u8, call.callee_name);
+            owned_call.owns_callee_name = true;
+
+            if (call.resolved_target) |target| {
+                owned_call.resolved_target = try self.allocator.dupe(u8, target);
+                owned_call.owns_resolved_target = true;
+            }
+
+            if (call.argument_types.len > 0) {
+                owned_call.argument_types = try self.allocator.dupe(?TypeInfo, call.argument_types);
+            }
+
+            self.calls.append(self.allocator, owned_call) catch |err| {
+                freeCallArgumentTypes(self.allocator, &.{owned_call});
+                return err;
+            };
+
             self.total_calls += 1;
             if (call.resolved_target != null) {
                 self.resolved_calls += 1;

@@ -211,7 +211,7 @@ pub const TypeResolver = struct {
 
                 return TypeInfo{
                     .kind = .simple,
-                    .base_type = try self.allocator.dupe(u8, fqcn),
+                    .base_type = fqcn,
                     .type_parts = &.{},
                     .is_builtin = false,
                 };
