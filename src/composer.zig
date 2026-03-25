@@ -656,7 +656,7 @@ test "file not found returns error" {
     try std.testing.expectError(ComposerError.FileNotFound, result);
 }
 
-test "file discovery on test-project finds all 8 PHP files" {
+test "file discovery on test-project finds all 10 PHP files" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -666,7 +666,7 @@ test "file discovery on test-project finds all 8 PHP files" {
 
     const files = try discoverFiles(allocator, &config);
 
-    try std.testing.expectEqual(@as(usize, 8), files.len);
+    try std.testing.expectEqual(@as(usize, 10), files.len);
 
     for (files) |f| {
         try std.testing.expect(std.mem.endsWith(u8, f, ".php"));
