@@ -358,7 +358,7 @@ echo ""
 # ============================================================================
 # Test 12: Resolution rate on the corpus (if available)
 # ============================================================================
-CORPUS_CONFIG="/path/to/corpus/.phpcma.json"
+CORPUS_CONFIG="${PHPCMA_CORPUS_ROOT:-.}/.phpcma.json"
 if [ -f "$CORPUS_CONFIG" ]; then
     echo "Test 12: Resolution rate on the corpus (vs baseline 31.4%)"
     OUTPUT=$("$PHPCMA" report --config="$CORPUS_CONFIG" --format=text 2>&1) || true
