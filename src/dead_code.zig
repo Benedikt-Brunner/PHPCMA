@@ -475,8 +475,10 @@ pub const ProjectLivenessGraph = struct {
             }
         }
 
-        while (queue.items.len > 0) {
-            const id = queue.orderedRemove(0);
+        var cursor: usize = 0;
+        while (cursor < queue.items.len) {
+            const id = queue.items[cursor];
+            cursor += 1;
             const key = self.index.getKey(id);
 
             switch (key.kind) {
@@ -567,6 +569,8 @@ pub const ProjectLivenessGraph = struct {
     // ====================================================================
 
     pub fn expandUnresolved(self: *ProjectLivenessGraph, refs: []const LivenessRef, sym: *const SymbolTable) !void {
+        var needs_propagation = false;
+
         for (refs) |ref| {
             if (ref.reason != .unresolved_call) continue;
 
@@ -576,7 +580,11 @@ pub const ProjectLivenessGraph = struct {
                     const short = shortName(ref.target_fqn);
                     if (self.index.functions_by_short_name.get(short)) |candidates| {
                         for (candidates.items) |fid| {
-                            self.alive.set(fid);
+                            const was_alive = self.isAlive(fid);
+                            if (!self.alive.isSet(fid)) {
+                                self.alive.set(fid);
+                                if (!was_alive) needs_propagation = true;
+                            }
                         }
                     }
                 },
@@ -588,8 +596,10 @@ pub const ProjectLivenessGraph = struct {
                             const key = self.index.getKey(mid);
                             // Check if method is non-private
                             const method_vis = getMethodVisibility(key.fqn, sym);
-                            if (method_vis != .private) {
+                            if (method_vis != .private and !self.weak_alive.isSet(mid)) {
+                                const was_alive = self.isAlive(mid);
                                 self.weak_alive.set(mid);
+                                if (!was_alive) needs_propagation = true;
                             }
                         }
                     }
@@ -599,7 +609,9 @@ pub const ProjectLivenessGraph = struct {
         }
 
         // Re-propagate: anything newly alive (strong or weak) propagates
-        try self.propagate(sym);
+        if (needs_propagation) {
+            try self.propagate(sym);
+        }
     }
 
     // ====================================================================
