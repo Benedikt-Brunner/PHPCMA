@@ -17,6 +17,23 @@ const ProjectCallGraph = call_analyzer.ProjectCallGraph;
 
 extern fn tree_sitter_php() callconv(.c) *ts.Language;
 
+fn printElapsedLimit(label: []const u8, elapsed: f64, threshold: f64, unit: []const u8) void {
+    if (elapsed <= threshold) {
+        std.debug.print("[PASS] {s}: {d:.3}{s} (target: {d:.3}{s})\n", .{ label, elapsed, unit, threshold, unit });
+        return;
+    }
+
+    std.debug.print("[FAIL] {s}: {d:.3}{s}, exceeded {d:.3}{s} target by {d:.3}{s}\n", .{
+        label,
+        elapsed,
+        unit,
+        threshold,
+        unit,
+        elapsed - threshold,
+        unit,
+    });
+}
+
 // ============================================================================
 // Corpus path — skips gracefully if not present
 // ============================================================================
@@ -227,9 +244,11 @@ test "corpus: performance ceiling" {
     const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
 
     // In ReleaseFast ~0.3s; in Debug mode ~5s. Ceiling accounts for Debug builds.
-    try std.testing.expect(elapsed_s < 30.0);
-
-    std.debug.print("Pipeline time: {d:.3}s\n", .{elapsed_s});
+    const threshold_s = 30.0;
+    printElapsedLimit("corpus pipeline", elapsed_s, threshold_s, "s");
+    if (elapsed_s >= threshold_s) {
+        return error.TestUnexpectedResult;
+    }
 }
 
 // ============================================================================
