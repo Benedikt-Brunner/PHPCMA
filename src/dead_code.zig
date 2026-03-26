@@ -13,6 +13,23 @@ const ProjectCallGraph = call_analyzer.ProjectCallGraph;
 const EnhancedFunctionCall = types.EnhancedFunctionCall;
 const ResolutionMethod = types.ResolutionMethod;
 
+fn printElapsedLimit(label: []const u8, elapsed: f64, threshold: f64, unit: []const u8) void {
+    if (elapsed <= threshold) {
+        std.debug.print("[PASS] {s}: {d:.2}{s} (target: {d:.2}{s})\n", .{ label, elapsed, unit, threshold, unit });
+        return;
+    }
+
+    std.debug.print("[FAIL] {s}: {d:.2}{s}, exceeded {d:.2}{s} target by {d:.2}{s}\n", .{
+        label,
+        elapsed,
+        unit,
+        threshold,
+        unit,
+        elapsed - threshold,
+        unit,
+    });
+}
+
 // ============================================================================
 // Symbol Identification
 // ============================================================================
@@ -2439,5 +2456,9 @@ test "performance: dead code analysis scales with many symbols" {
 
     // Performance: analysis should complete in <500ms even in Debug mode
     // (in Release mode this typically runs in <10ms)
-    try std.testing.expect(elapsed_ms < 500.0);
+    const threshold_ms = 500.0;
+    printElapsedLimit("dead code analysis", elapsed_ms, threshold_ms, "ms");
+    if (elapsed_ms >= threshold_ms) {
+        return error.TestUnexpectedResult;
+    }
 }

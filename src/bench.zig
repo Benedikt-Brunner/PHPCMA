@@ -118,16 +118,37 @@ fn formatDuration(ns: u64) struct { f64, []const u8 } {
 }
 
 fn printResult(label: []const u8, elapsed_ns: u64, threshold_ns: u64) void {
-    const formatted = formatDuration(elapsed_ns);
-    const status: []const u8 = if (elapsed_ns <= threshold_ns) "PASS" else "FAIL";
-    std.debug.print("[{s}] {s}: {d:.2}{s} (threshold: {d:.2}{s})\n", .{
-        status,
+    const elapsed = formatDuration(elapsed_ns);
+    const threshold = formatDuration(threshold_ns);
+
+    if (elapsed_ns <= threshold_ns) {
+        std.debug.print("[PASS] {s}: {d:.2}{s} (target: {d:.2}{s})\n", .{
+            label,
+            elapsed[0],
+            elapsed[1],
+            threshold[0],
+            threshold[1],
+        });
+        return;
+    }
+
+    const overage = formatDuration(elapsed_ns - threshold_ns);
+    std.debug.print("[FAIL] {s}: {d:.2}{s}, exceeded {d:.2}{s} target by {d:.2}{s}\n", .{
         label,
-        formatted[0],
-        formatted[1],
-        formatDuration(threshold_ns)[0],
-        formatDuration(threshold_ns)[1],
+        elapsed[0],
+        elapsed[1],
+        threshold[0],
+        threshold[1],
+        overage[0],
+        overage[1],
     });
+}
+
+fn expectDurationWithinTarget(label: []const u8, elapsed_ns: u64, threshold_ns: u64) !void {
+    printResult(label, elapsed_ns, threshold_ns);
+    if (elapsed_ns > threshold_ns) {
+        return error.TestUnexpectedResult;
+    }
 }
 
 // ============================================================================
@@ -192,8 +213,7 @@ test "bench: small project 50 files < 500ms" {
 
     const elapsed = timer.read();
     const threshold: u64 = 500 * std.time.ns_per_ms;
-    printResult("small project 50 files", elapsed, threshold);
-    try std.testing.expect(elapsed <= threshold);
+    try expectDurationWithinTarget("small project 50 files", elapsed, threshold);
 }
 
 // ============================================================================
@@ -257,8 +277,7 @@ test "bench: medium project 500 files < 3s" {
 
     const elapsed = timer.read();
     const threshold: u64 = 3 * std.time.ns_per_s;
-    printResult("medium project 500 files", elapsed, threshold);
-    try std.testing.expect(elapsed <= threshold);
+    try expectDurationWithinTarget("medium project 500 files", elapsed, threshold);
 }
 
 // ============================================================================
@@ -322,8 +341,7 @@ test "bench: large project 2000 files < 10s" {
 
     const elapsed = timer.read();
     const threshold: u64 = 10 * std.time.ns_per_s;
-    printResult("large project 2000 files", elapsed, threshold);
-    try std.testing.expect(elapsed <= threshold);
+    try expectDurationWithinTarget("large project 2000 files", elapsed, threshold);
 }
 
 // ============================================================================
@@ -733,15 +751,10 @@ test "bench: incremental parse single file" {
     const elapsed = timer.read();
     const per_parse = elapsed / iterations;
 
-    const formatted = formatDuration(per_parse);
-    std.debug.print("[PASS] Incremental parse: {d:.2}{s} per parse ({d} iterations)\n", .{
-        formatted[0],
-        formatted[1],
-        iterations,
-    });
-
     // Sanity: each parse should be < 1ms for a single file
-    try std.testing.expect(per_parse < 1 * std.time.ns_per_ms);
+    const threshold = 1 * std.time.ns_per_ms;
+    try expectDurationWithinTarget("incremental parse single file", per_parse, threshold);
+    std.debug.print("  Samples: {d} iterations\n", .{iterations});
 }
 
 // ============================================================================
