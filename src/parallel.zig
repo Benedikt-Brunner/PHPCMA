@@ -143,10 +143,9 @@ pub fn parallelSymbolCollect(
     defer allocator.free(results);
 
     // Each thread gets its own ArenaAllocator backed by c_allocator.
-    // We free only the bookkeeping array here; arena allocations intentionally
-    // outlive this function because merged symbols/sources point into them.
-    const thread_arenas = try allocator.alloc(std.heap.ArenaAllocator, num_threads);
-    defer allocator.free(thread_arenas);
+    // The merged symbol/file-context maps retain these allocators internally,
+    // so the ArenaAllocator structs themselves must outlive this function.
+    const thread_arenas = try std.heap.c_allocator.alloc(std.heap.ArenaAllocator, num_threads);
 
     for (results, thread_arenas) |*r, *arena| {
         arena.* = std.heap.ArenaAllocator.init(std.heap.c_allocator);
@@ -182,17 +181,26 @@ pub fn parallelSymbolCollect(
     for (results[0..spawned]) |*r| {
         var class_it = r.sym_table.classes.iterator();
         while (class_it.next()) |entry| {
-            try sym_table.classes.put(entry.key_ptr.*, entry.value_ptr.*);
+            var class = entry.value_ptr.*;
+            // After merge, follow-up work like inheritance resolution runs on
+            // the caller side, so allocator-backed helpers must use the
+            // caller allocator rather than the thread-local arena.
+            class.allocator = allocator;
+            try sym_table.classes.put(entry.key_ptr.*, class);
         }
 
         var iface_it = r.sym_table.interfaces.iterator();
         while (iface_it.next()) |entry| {
-            try sym_table.interfaces.put(entry.key_ptr.*, entry.value_ptr.*);
+            var iface = entry.value_ptr.*;
+            iface.allocator = allocator;
+            try sym_table.interfaces.put(entry.key_ptr.*, iface);
         }
 
         var trait_it = r.sym_table.traits.iterator();
         while (trait_it.next()) |entry| {
-            try sym_table.traits.put(entry.key_ptr.*, entry.value_ptr.*);
+            var trait = entry.value_ptr.*;
+            trait.allocator = allocator;
+            try sym_table.traits.put(entry.key_ptr.*, trait);
         }
 
         var func_it = r.sym_table.functions.iterator();
