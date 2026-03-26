@@ -249,6 +249,7 @@ pub const ProjectLivenessGraph = struct {
 
     // Temporary allocations used during the algorithm
     alloc_buf: std.ArrayListUnmanaged([]const u8),
+    scratch_fqn: std.ArrayListUnmanaged(u8),
 
     pub fn init(allocator: std.mem.Allocator) ProjectLivenessGraph {
         return .{
@@ -258,6 +259,7 @@ pub const ProjectLivenessGraph = struct {
             .weak_alive = .{},
             .allocator = allocator,
             .alloc_buf = .empty,
+            .scratch_fqn = .empty,
         };
     }
 
@@ -268,19 +270,60 @@ pub const ProjectLivenessGraph = struct {
         self.weak_alive.deinit(self.allocator);
         for (self.alloc_buf.items) |buf| self.allocator.free(buf);
         self.alloc_buf.deinit(self.allocator);
+        self.scratch_fqn.deinit(self.allocator);
     }
 
-    /// Helper: allocate a formatted string that lives as long as the graph.
-    fn dupeStr(self: *ProjectLivenessGraph, s: []const u8) ![]const u8 {
-        const d = try self.allocator.dupe(u8, s);
+    fn allocOwnedFqn(self: *ProjectLivenessGraph, owner_fqn: []const u8, member_name: []const u8, comptime is_property: bool) ![]const u8 {
+        const extra_len: usize = if (is_property) 3 else 2;
+        const total_len = owner_fqn.len + extra_len + member_name.len;
+        const d = try self.allocator.alloc(u8, total_len);
+        var cursor: usize = 0;
+
+        @memcpy(d[cursor .. cursor + owner_fqn.len], owner_fqn);
+        cursor += owner_fqn.len;
+        d[cursor] = ':';
+        d[cursor + 1] = ':';
+        cursor += 2;
+        if (is_property) {
+            d[cursor] = '$';
+            cursor += 1;
+        }
+        @memcpy(d[cursor .. cursor + member_name.len], member_name);
+
         try self.alloc_buf.append(self.allocator, d);
         return d;
     }
 
-    fn fmtStr(self: *ProjectLivenessGraph, comptime fmt: []const u8, args: anytype) ![]const u8 {
-        const d = try std.fmt.allocPrint(self.allocator, fmt, args);
-        try self.alloc_buf.append(self.allocator, d);
-        return d;
+    fn scratchMemberFqn(self: *ProjectLivenessGraph, owner_fqn: []const u8, member_name: []const u8, comptime is_property: bool) ![]const u8 {
+        const extra_len: usize = if (is_property) 3 else 2;
+        const total_len = owner_fqn.len + extra_len + member_name.len;
+        try self.scratch_fqn.ensureTotalCapacity(self.allocator, total_len);
+        self.scratch_fqn.items.len = total_len;
+
+        var cursor: usize = 0;
+        @memcpy(self.scratch_fqn.items[cursor .. cursor + owner_fqn.len], owner_fqn);
+        cursor += owner_fqn.len;
+        self.scratch_fqn.items[cursor] = ':';
+        self.scratch_fqn.items[cursor + 1] = ':';
+        cursor += 2;
+        if (is_property) {
+            self.scratch_fqn.items[cursor] = '$';
+            cursor += 1;
+        }
+        @memcpy(self.scratch_fqn.items[cursor .. cursor + member_name.len], member_name);
+
+        return self.scratch_fqn.items;
+    }
+
+    fn lookupMethodFqn(self: *ProjectLivenessGraph, owner_fqn: []const u8, method_name: []const u8) !?[]const u8 {
+        const scratch = try self.scratchMemberFqn(owner_fqn, method_name, false);
+        const id = self.index.lookup(scratch) orelse return null;
+        return self.index.getKey(id).fqn;
+    }
+
+    fn lookupMethodId(self: *ProjectLivenessGraph, owner_fqn: []const u8, method_name: []const u8) !?SymbolId {
+        const scratch = try self.scratchMemberFqn(owner_fqn, method_name, false);
+        return self.index.lookup(scratch);
     }
 
     // ====================================================================
@@ -298,7 +341,7 @@ pub const ProjectLivenessGraph = struct {
             // Register methods
             var method_it = class.methods.iterator();
             while (method_it.next()) |m| {
-                const mfqn = try self.fmtStr("{s}::{s}", .{ fqcn, m.key_ptr.* });
+                const mfqn = try self.allocOwnedFqn(fqcn, m.key_ptr.*, false);
                 const mid = try self.index.register(.method, mfqn);
                 try self.index.addMethodShortName(m.key_ptr.*, mid);
             }
@@ -306,7 +349,7 @@ pub const ProjectLivenessGraph = struct {
             // Register properties
             var prop_it = class.properties.iterator();
             while (prop_it.next()) |p| {
-                const pfqn = try self.fmtStr("{s}::${s}", .{ fqcn, p.key_ptr.* });
+                const pfqn = try self.allocOwnedFqn(fqcn, p.key_ptr.*, true);
                 _ = try self.index.register(.property, pfqn);
             }
 
@@ -335,7 +378,7 @@ pub const ProjectLivenessGraph = struct {
 
             var method_it = iface.methods.iterator();
             while (method_it.next()) |m| {
-                const mfqn = try self.fmtStr("{s}::{s}", .{ fqcn, m.key_ptr.* });
+                const mfqn = try self.allocOwnedFqn(fqcn, m.key_ptr.*, false);
                 const mid = try self.index.register(.method, mfqn);
                 try self.index.addMethodShortName(m.key_ptr.*, mid);
             }
@@ -350,14 +393,14 @@ pub const ProjectLivenessGraph = struct {
 
             var method_it = t.methods.iterator();
             while (method_it.next()) |m| {
-                const mfqn = try self.fmtStr("{s}::{s}", .{ fqcn, m.key_ptr.* });
+                const mfqn = try self.allocOwnedFqn(fqcn, m.key_ptr.*, false);
                 const mid = try self.index.register(.method, mfqn);
                 try self.index.addMethodShortName(m.key_ptr.*, mid);
             }
 
             var prop_it = t.properties.iterator();
             while (prop_it.next()) |p| {
-                const pfqn = try self.fmtStr("{s}::${s}", .{ fqcn, p.key_ptr.* });
+                const pfqn = try self.allocOwnedFqn(fqcn, p.key_ptr.*, true);
                 _ = try self.index.register(.property, pfqn);
             }
         }
@@ -393,14 +436,19 @@ pub const ProjectLivenessGraph = struct {
             var method_it = class.methods.iterator();
             while (method_it.next()) |m| {
                 const method_name = m.key_ptr.*;
-                const child_fqn = try self.fmtStr("{s}::{s}", .{ fqcn, method_name });
+                var child_fqn: ?[]const u8 = null;
 
                 // Check parent chain
                 for (class.parent_chain) |parent_fqcn| {
                     if (sym.classes.get(parent_fqcn)) |parent| {
                         if (parent.methods.contains(method_name)) {
-                            const parent_fqn = try self.fmtStr("{s}::{s}", .{ parent_fqcn, method_name });
-                            try HierarchyIndex.appendToList(&self.hierarchy.method_overrides, self.allocator, parent_fqn, child_fqn);
+                            const override_fqn = child_fqn orelse blk: {
+                                const resolved = (try self.lookupMethodFqn(fqcn, method_name)).?;
+                                child_fqn = resolved;
+                                break :blk resolved;
+                            };
+                            const parent_fqn = (try self.lookupMethodFqn(parent_fqcn, method_name)).?;
+                            try HierarchyIndex.appendToList(&self.hierarchy.method_overrides, self.allocator, parent_fqn, override_fqn);
                         }
                     }
                 }
@@ -409,8 +457,13 @@ pub const ProjectLivenessGraph = struct {
                 for (class.implements) |iface_fqcn| {
                     if (sym.interfaces.get(iface_fqcn)) |iface| {
                         if (iface.methods.contains(method_name)) {
-                            const iface_method_fqn = try self.fmtStr("{s}::{s}", .{ iface_fqcn, method_name });
-                            try HierarchyIndex.appendToList(&self.hierarchy.method_overrides, self.allocator, iface_method_fqn, child_fqn);
+                            const override_fqn = child_fqn orelse blk: {
+                                const resolved = (try self.lookupMethodFqn(fqcn, method_name)).?;
+                                child_fqn = resolved;
+                                break :blk resolved;
+                            };
+                            const iface_method_fqn = (try self.lookupMethodFqn(iface_fqcn, method_name)).?;
+                            try HierarchyIndex.appendToList(&self.hierarchy.method_overrides, self.allocator, iface_method_fqn, override_fqn);
                         }
                     }
                 }
@@ -419,8 +472,13 @@ pub const ProjectLivenessGraph = struct {
                 for (class.uses) |trait_fqcn| {
                     if (sym.traits.get(trait_fqcn)) |t| {
                         if (t.methods.contains(method_name)) {
-                            const trait_method_fqn = try self.fmtStr("{s}::{s}", .{ trait_fqcn, method_name });
-                            try HierarchyIndex.appendToList(&self.hierarchy.method_overrides, self.allocator, trait_method_fqn, child_fqn);
+                            const override_fqn = child_fqn orelse blk: {
+                                const resolved = (try self.lookupMethodFqn(fqcn, method_name)).?;
+                                child_fqn = resolved;
+                                break :blk resolved;
+                            };
+                            const trait_method_fqn = (try self.lookupMethodFqn(trait_fqcn, method_name)).?;
+                            try HierarchyIndex.appendToList(&self.hierarchy.method_overrides, self.allocator, trait_method_fqn, override_fqn);
                         }
                     }
                 }
@@ -463,13 +521,9 @@ pub const ProjectLivenessGraph = struct {
             const class_id = self.index.lookup(fqcn) orelse continue;
             if (!self.isAlive(class_id)) continue;
 
-            const class = entry.value_ptr;
             for (&magic_methods) |magic| {
-                if (class.methods.contains(magic)) {
-                    const mfqn = try self.fmtStr("{s}::{s}", .{ fqcn, magic });
-                    if (self.index.lookup(mfqn)) |mid| {
-                        self.alive.set(mid);
-                    }
+                if (try self.lookupMethodId(fqcn, magic)) |mid| {
+                    self.alive.set(mid);
                 }
             }
         }
@@ -514,8 +568,9 @@ pub const ProjectLivenessGraph = struct {
                     if (sym.interfaces.get(key.fqn)) |iface| {
                         var method_it = iface.methods.iterator();
                         while (method_it.next()) |m| {
-                            const mfqn = try self.fmtStr("{s}::{s}", .{ key.fqn, m.key_ptr.* });
-                            try self.markAndEnqueue(mfqn, &queue);
+                            if (try self.lookupMethodFqn(key.fqn, m.key_ptr.*)) |mfqn| {
+                                try self.markAndEnqueue(mfqn, &queue);
+                            }
                         }
                     }
                 },
@@ -557,8 +612,7 @@ pub const ProjectLivenessGraph = struct {
 
         // Mark magic methods on this class as alive
         for (&magic_methods) |magic| {
-            if (class.methods.contains(magic)) {
-                const mfqn = try self.fmtStr("{s}::{s}", .{ fqcn, magic });
+            if (try self.lookupMethodFqn(fqcn, magic)) |mfqn| {
                 try self.markAndEnqueue(mfqn, queue);
             }
         }
