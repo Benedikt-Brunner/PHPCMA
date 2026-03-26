@@ -1,5 +1,5 @@
 {
-    "name": "pickware/phpcma",
+    "name": "benedikt-brunner/phpcma",
     "description": "Composer plugin that auto-installs the PHPCMA binary into vendor/bin",
     "type": "composer-plugin",
     "license": "MIT",
@@ -13,16 +13,16 @@
     },
     "autoload": {
         "psr-4": {
-            "Pickware\\Phpcma\\": "src/"
+            "BenediktBrunner\\Phpcma\\": "src/"
         }
     },
     "autoload-dev": {
         "psr-4": {
-            "Pickware\\Phpcma\\Tests\\": "tests/"
+            "BenediktBrunner\\Phpcma\\Tests\\": "tests/"
         }
     },
     "extra": {
-        "class": "Pickware\\Phpcma\\PhpcmaPlugin"
+        "class": "BenediktBrunner\\Phpcma\\PhpcmaPlugin"
     },
     "config": {
         "sort-packages": true

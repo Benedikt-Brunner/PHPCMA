@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Pickware\Phpcma;
+namespace BenediktBrunner\Phpcma;
 
 use Composer\Composer;
 use Composer\EventDispatcher\EventSubscriberInterface;
@@ -67,7 +67,7 @@ class PhpcmaPlugin implements PluginInterface, EventSubscriberInterface
             ->getPackages();
 
         foreach ($packages as $package) {
-            if ($package->getName() === 'pickware/phpcma') {
+            if ($package->getName() === 'benedikt-brunner/phpcma') {
                 $version = $package->getPrettyVersion();
                 // Ensure the version has a 'v' prefix for GitHub release tags
                 if (!str_starts_with($version, 'v')) {
@@ -84,7 +84,7 @@ class PhpcmaPlugin implements PluginInterface, EventSubscriberInterface
         }
 
         throw new \RuntimeException(
-            'Could not determine phpcma version. Ensure pickware/phpcma is properly installed.',
+            'Could not determine phpcma version. Ensure benedikt-brunner/phpcma is properly installed.',
         );
     }
 

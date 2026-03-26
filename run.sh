@@ -1,2 +1,2 @@
 zig build
-./zig-out/bin/PHPCMA --file="/Users/benediktbrunner/PhpstormProjects/shopware-plugins/plugins/pickware-shopify-integration/src/StockImport/UpdateUnavailableQuantitiesMessageHandler.php"
+./zig-out/bin/PHPCMA --file="${1:?Usage: ./run.sh <path-to-php-file>}"

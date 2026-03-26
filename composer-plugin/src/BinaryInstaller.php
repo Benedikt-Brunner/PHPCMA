@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Pickware\Phpcma;
+namespace BenediktBrunner\Phpcma;
 
 use Composer\IO\IOInterface;
 use RuntimeException;
@@ -212,7 +212,7 @@ class BinaryInstaller
             'http' => [
                 'follow_location' => true,
                 'timeout' => 120,
-                'header' => 'User-Agent: pickware/phpcma-composer-plugin',
+                'header' => 'User-Agent: benedikt-brunner/phpcma-composer-plugin',
             ],
         ]);
 

@@ -2,11 +2,11 @@
 
 declare(strict_types=1);
 
-namespace Pickware\Phpcma\Tests;
+namespace BenediktBrunner\Phpcma\Tests;
 
 use Composer\IO\NullIO;
 use PHPUnit\Framework\TestCase;
-use Pickware\Phpcma\BinaryInstaller;
+use BenediktBrunner\Phpcma\BinaryInstaller;
 use RuntimeException;
 
 class BinaryInstallerTest extends TestCase
