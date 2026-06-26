@@ -75,16 +75,16 @@ pub fn build(b: *std.Build) void {
     // Note: We use .path("php/src") relative to the repo root.
     const php_src_root = php_dep.path("php/src");
 
-    exe.addIncludePath(php_src_root);
+    exe.root_module.addIncludePath(php_src_root);
 
     // Compile parser.c
-    exe.addCSourceFile(.{
+    exe.root_module.addCSourceFile(.{
         .file = php_src_root.path(b, "parser.c"),
         .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
     });
 
     // Compile scanner.c (Handles Heredocs etc)
-    exe.addCSourceFile(.{
+    exe.root_module.addCSourceFile(.{
         .file = php_src_root.path(b, "scanner.c"),
         .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
     });
@@ -94,8 +94,18 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     exe.root_module.addImport("cli", cli_dep.module("cli"));
+
+    // ----------------------------------------------------------------
+    // 4. Setup the MCP server library (muhammad-fiaz/mcp.zig)
+    // ----------------------------------------------------------------
+    const mcp_dep = b.dependency("mcp", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    exe.root_module.addImport("mcp", mcp_dep.module("mcp"));
+
     // Link LibC (Required by Tree-sitter)
-    exe.linkLibC();
+    exe.root_module.link_libc = true;
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
     // step). By default the install prefix is `zig-out/` but can be overridden
@@ -117,6 +127,33 @@ pub fn build(b: *std.Build) void {
     // the user runs `zig build run`, so we create a dependency link.
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
+
+    // ----------------------------------------------------------------
+    // Unit tests
+    // ----------------------------------------------------------------
+    const test_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_mod.addImport("tree-sitter", ts_dep.module("tree_sitter"));
+    test_mod.addImport("cli", cli_dep.module("cli"));
+    test_mod.addImport("mcp", mcp_dep.module("mcp"));
+    test_mod.addIncludePath(php_src_root);
+    test_mod.addCSourceFile(.{
+        .file = php_src_root.path(b, "parser.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    test_mod.addCSourceFile(.{
+        .file = php_src_root.path(b, "scanner.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    test_mod.link_libc = true;
+
+    const unit_tests = b.addTest(.{ .root_module = test_mod });
+    const run_unit_tests = b.addRunArtifact(unit_tests);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_unit_tests.step);
 
     // By making the run step depend on the default step, it will be run from the
     // installation directory rather than directly from within the cache directory.

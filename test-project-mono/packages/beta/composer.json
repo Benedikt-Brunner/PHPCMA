@@ -1,0 +1,11 @@
+{
+    "name": "mono/beta",
+    "require": {
+        "mono/alpha": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "Beta\\": "src/"
+        }
+    }
+}

@@ -1,6 +1,16 @@
 const std = @import("std");
 
 // ============================================================================
+// Global I/O handle (Zig 0.16 std.Io model)
+// ============================================================================
+
+/// Process-wide I/O handle, set once in `main` from `std.process.Init`.
+/// Used by filesystem and stream operations across modules so that the
+/// zero-argument CLI action callbacks (and other helpers) can perform I/O
+/// without threading `io` through every signature.
+pub var io: std.Io = undefined;
+
+// ============================================================================
 // Type Information
 // ============================================================================
 
@@ -60,26 +70,54 @@ pub const TypeInfo = struct {
         return switch (self.kind) {
             .nullable => std.fmt.allocPrint(allocator, "?{s}", .{self.base_type}),
             .union_type => blk: {
-                var result = std.ArrayList(u8).init(allocator);
+                var result: std.ArrayListUnmanaged(u8) = .empty;
                 for (self.type_parts, 0..) |part, i| {
-                    if (i > 0) try result.appendSlice("|");
-                    try result.appendSlice(part);
+                    if (i > 0) try result.appendSlice(allocator, "|");
+                    try result.appendSlice(allocator, part);
                 }
-                break :blk try result.toOwnedSlice();
+                break :blk try result.toOwnedSlice(allocator);
             },
             .intersection => blk: {
-                var result = std.ArrayList(u8).init(allocator);
+                var result: std.ArrayListUnmanaged(u8) = .empty;
                 for (self.type_parts, 0..) |part, i| {
-                    if (i > 0) try result.appendSlice("&");
-                    try result.appendSlice(part);
+                    if (i > 0) try result.appendSlice(allocator, "&");
+                    try result.appendSlice(allocator, part);
                 }
-                break :blk try result.toOwnedSlice();
+                break :blk try result.toOwnedSlice(allocator);
             },
             .array_type => std.fmt.allocPrint(allocator, "{s}[]", .{self.base_type}),
             else => allocator.dupe(u8, self.base_type),
         };
     }
 };
+
+/// True for a bare `array`/`iterable` type that carries no element information.
+fn isBareCollection(t: TypeInfo) bool {
+    return (t.kind == .simple or t.kind == .array_type) and
+        (std.mem.eql(u8, t.base_type, "array") or std.mem.eql(u8, t.base_type, "iterable"));
+}
+
+/// True for a native `mixed` type. Generic methods commonly declare `: mixed`
+/// natively while the PHPDoc carries the precise (often template) type, so we
+/// defer to the docblock in that case.
+fn isMixedType(t: TypeInfo) bool {
+    return t.kind == .mixed or std.mem.eql(u8, t.base_type, "mixed");
+}
+
+/// Choose the effective return type, preferring the native hint but deferring to
+/// the PHPDoc type when the native one carries no useful information: a bare
+/// `array`/`iterable` (e.g. `: array` alongside `@return Foo[]`) so the element
+/// type survives, or a bare `mixed` (e.g. `: mixed` alongside `@return TElement`)
+/// so generic/template return types survive.
+fn effectiveReturn(native: ?TypeInfo, doc: ?TypeInfo) ?TypeInfo {
+    if (native) |n| {
+        if (isBareCollection(n) or isMixedType(n)) {
+            if (doc) |d| return d;
+        }
+        return n;
+    }
+    return doc;
+}
 
 // ============================================================================
 // Visibility
@@ -159,7 +197,7 @@ pub const MethodSymbol = struct {
 
     /// Get the effective return type (prefers native, falls back to PHPDoc)
     pub fn effectiveReturnType(self: *const MethodSymbol) ?TypeInfo {
-        return self.return_type orelse self.phpdoc_return;
+        return effectiveReturn(self.return_type, self.phpdoc_return);
     }
 
     /// Get the qualified name (Class::method)
@@ -182,6 +220,15 @@ pub const MethodSymbol = struct {
 // Class Symbol
 // ============================================================================
 
+/// A generic type parameter declared via `@template Name [of Bound] [= Default]`.
+/// `fallback` is the FQCN to use when no subclass binds the parameter — the
+/// default if present, otherwise the bound — already resolved against the
+/// declaring file's imports. Null when the parameter is unconstrained.
+pub const TemplateParam = struct {
+    name: []const u8,
+    fallback: ?[]const u8,
+};
+
 pub const ClassSymbol = struct {
     fqcn: []const u8, // Fully qualified class name
     name: []const u8, // Short name
@@ -200,14 +247,15 @@ pub const ClassSymbol = struct {
     implements: []const []const u8, // Interface FQCNs
     uses: []const []const u8, // Trait FQCNs
 
-    // Members (directly declared)
+    // Generics (from class-level PHPDoc)
+    template_params: []const TemplateParam, // @template names declared on this class, in order
+    extends_type_args: []const []const u8, // concrete/template args bound to the parent via @extends Base<...>
+
+    // Members (directly declared). This is immutable Tier-1 (raw) data; the
+    // inherited/resolved view lives in the Tier-2 `ResolvedView`, keyed by FQCN,
+    // and never mutates these raw symbols.
     methods: std.StringHashMap(MethodSymbol),
     properties: std.StringHashMap(PropertySymbol),
-
-    // Resolved (computed after inheritance resolution)
-    all_methods: std.StringHashMap(*const MethodSymbol), // Including inherited
-    all_properties: std.StringHashMap(*const PropertySymbol),
-    parent_chain: []const []const u8, // Ordered list of ancestors
 
     allocator: std.mem.Allocator,
 
@@ -234,11 +282,10 @@ pub const ClassSymbol = struct {
             .extends = null,
             .implements = &.{},
             .uses = &.{},
+            .template_params = &.{},
+            .extends_type_args = &.{},
             .methods = std.StringHashMap(MethodSymbol).init(allocator),
             .properties = std.StringHashMap(PropertySymbol).init(allocator),
-            .all_methods = std.StringHashMap(*const MethodSymbol).init(allocator),
-            .all_properties = std.StringHashMap(*const PropertySymbol).init(allocator),
-            .parent_chain = &.{},
             .allocator = allocator,
         };
     }
@@ -246,8 +293,6 @@ pub const ClassSymbol = struct {
     pub fn deinit(self: *ClassSymbol) void {
         self.methods.deinit();
         self.properties.deinit();
-        self.all_methods.deinit();
-        self.all_properties.deinit();
     }
 
     pub fn addMethod(self: *ClassSymbol, method: MethodSymbol) !void {
@@ -258,14 +303,25 @@ pub const ClassSymbol = struct {
         try self.properties.put(property.name, property);
     }
 
-    /// Get a method (including inherited)
+    /// Get a directly-declared method (raw, not inherited). For the inherited
+    /// view use `ResolvedView.resolveMethod`.
     pub fn getMethod(self: *const ClassSymbol, name: []const u8) ?*const MethodSymbol {
-        return self.all_methods.get(name);
+        return self.methods.getPtr(name);
     }
 
-    /// Get a property (including inherited)
+    /// Get a directly-declared property (raw, not inherited). For the inherited
+    /// view use `ResolvedView.resolveProperty`.
     pub fn getProperty(self: *const ClassSymbol, name: []const u8) ?*const PropertySymbol {
-        return self.all_properties.get(name);
+        return self.properties.getPtr(name);
+    }
+
+    /// Index of the template parameter named `name`, or null if this class
+    /// declares no such `@template`.
+    pub fn templateIndexOf(self: *const ClassSymbol, name: []const u8) ?usize {
+        for (self.template_params, 0..) |tp, i| {
+            if (std.mem.eql(u8, tp.name, name)) return i;
+        }
+        return null;
     }
 };
 
@@ -389,7 +445,7 @@ pub const FunctionSymbol = struct {
     phpdoc_return: ?TypeInfo,
 
     pub fn effectiveReturnType(self: *const FunctionSymbol) ?TypeInfo {
-        return self.return_type orelse self.phpdoc_return;
+        return effectiveReturn(self.return_type, self.phpdoc_return);
     }
 };
 
@@ -461,21 +517,39 @@ pub const FileContext = struct {
             return use_stmt.fqcn;
         }
 
-        // Check for qualified name like Foo\Bar where Foo is imported
+        // Check for qualified name like Foo\Bar where Foo is imported.
         if (std.mem.indexOf(u8, type_name, "\\")) |sep| {
             const first_part = type_name[0..sep];
             if (self.use_statements.get(first_part)) |use_stmt| {
-                // Combine imported namespace with rest of path
-                // TODO: allocate and combine
-                _ = use_stmt;
+                // Combine the imported namespace with the rest of the path:
+                // `use App\Foo;` + `Foo\Bar` -> `App\Foo\Bar`.
+                return std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}{s}",
+                    .{ use_stmt.fqcn, type_name[sep..] },
+                ) catch type_name;
             }
+            // A qualified name with no matching import is relative to the current
+            // namespace (PHP: `Sub\Bar` in namespace `App` -> `App\Sub\Bar`).
+            if (self.namespace) |ns| {
+                return std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}\\{s}",
+                    .{ ns, type_name },
+                ) catch type_name;
+            }
+            return type_name;
         }
 
-        // Default: prepend current namespace
+        // Unqualified name with no import: resolve against the current namespace.
+        // (PHP resolves unqualified class names to the current namespace; global
+        // classes must be referenced as `\Foo` or imported — both handled above.)
         if (self.namespace) |ns| {
-            // Would need allocation to combine
-            // For now, just return as-is (caller should handle)
-            _ = ns;
+            return std.fmt.allocPrint(
+                self.allocator,
+                "{s}\\{s}",
+                .{ ns, type_name },
+            ) catch type_name;
         }
 
         return type_name;
@@ -545,9 +619,32 @@ pub const ResolutionMethod = enum {
     parent_reference, // parent:: reference
     static_call, // Foo::method()
     property_type, // From property type declaration
+    interface_single_impl, // DI-bound: interface-typed property with exactly one in-project implementor
+    di_config_binding, // DI-bound via services.yaml interface->concrete binding (Phase B)
+    interface_contract, // resolved to an interface's own (abstract) method declaration; runtime implementor unknown
     return_type_chain, // From return type of previous call
     plugin_generated, // Synthetic edge from plugin (e.g., event dispatch -> handler)
     unresolved,
+};
+
+/// Why an instance-method call stayed unresolved, captured at analysis time
+/// (the post-hoc name bridge can only count name collisions, not causes). Lets
+/// "low resolution rate" be attributed to concrete, fixable receiver shapes vs.
+/// genuinely external receivers. `.none` means the call resolved.
+pub const UnresolvedReason = enum {
+    none, // resolved (or not an instance call)
+    recv_param_untyped, // receiver is a parameter of the current method with no type hint
+    recv_local, // receiver is a local var (not a param) we couldn't track
+    recv_var, // receiver is a variable we couldn't type (no method context)
+    recv_property, // $obj->prop->m(): property type unknown
+    recv_chain, // $a->b()->m(): previous instance-call return type unknown
+    recv_static_chain, // Foo::bar()->m(): static-call return type unknown
+    recv_func_chain, // helper()->m(): function return type unknown
+    recv_subscript, // $arr[..]->m(): element type unknown
+    recv_other, // some other receiver node kind
+    recv_type_external, // receiver type RESOLVED but not in-project (e.g. vendor/core)
+    method_not_found_external_ancestor, // in-project receiver, but extends/uses an external base/trait (method likely inherited from core)
+    method_not_found_pure, // in-project receiver with no external ancestor, method still missing (genuine engine gap or magic __call)
 };
 
 pub const EnhancedFunctionCall = struct {
@@ -559,15 +656,37 @@ pub const EnhancedFunctionCall = struct {
     column: u32,
     file_path: []const u8,
 
+    // Call-site shape
+    arg_count: u32 = 0, // Number of arguments passed at the call site
+    /// Per-positional-argument resolved type, in source order; an element is
+    /// null where the argument expression's type could not be resolved (same
+    /// partiality as receiver resolution). Empty when no arguments. Used by the
+    /// type-aware `impact` breaking-change analysis.
+    arg_types: []const ?TypeInfo = &.{},
+    /// How the call's *result* is consumed at this site. Drives return-type
+    /// narrowing analysis (dereferencing a now-nullable result is breaking).
+    result_used: ResultUse = .ignored,
+
     // Resolution info
     resolved_target: ?[]const u8, // FQCN of resolved method
     resolution_confidence: f32,
     resolution_method: ResolutionMethod,
+    unresolved_reason: UnresolvedReason = .none, // diagnostic: why an unresolved instance call failed
+    receiver_type: ?[]const u8 = null, // diagnostic: resolved receiver FQCN, when known (for method-not-found samples)
+    unresolved_detail: ?[]const u8 = null, // diagnostic: fine-grained sub-reason (e.g. recv_local RHS shape, recv_chain inner status)
 
     pub const CallType = enum {
         function,
         method,
         static_method,
+    };
+
+    /// How a call expression's result is consumed at the call site.
+    pub const ResultUse = enum {
+        ignored, // result discarded (statement-level call)
+        assigned, // result stored in a variable / property
+        member_access, // result immediately dereferenced (->m, ::m, [i]) — null-narrowing risk
+        passed, // result passed as an argument or returned upward
     };
 
     pub fn qualifiedCallName(self: *const EnhancedFunctionCall, allocator: std.mem.Allocator) ![]const u8 {
@@ -589,6 +708,7 @@ pub const ProjectConfig = struct {
     autoload_psr0: std.StringHashMap([]const []const u8),
     autoload_classmap: []const []const u8,
     autoload_files: []const []const u8,
+    plugins: []const []const u8, // enabled analysis plugins for this project
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, root_path: []const u8) ProjectConfig {
@@ -599,6 +719,7 @@ pub const ProjectConfig = struct {
             .autoload_psr0 = std.StringHashMap([]const []const u8).init(allocator),
             .autoload_classmap = &.{},
             .autoload_files = &.{},
+            .plugins = &.{},
             .allocator = allocator,
         };
     }

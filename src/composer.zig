@@ -24,12 +24,8 @@ pub fn parseComposerJson(allocator: std.mem.Allocator, composer_path: []const u8
     config.composer_path = composer_path;
 
     // Read the file
-    const file = std.fs.openFileAbsolute(composer_path, .{}) catch {
-        return ComposerError.FileNotFound;
-    };
-    defer file.close();
-
-    const content = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch {
+    const content = std.Io.Dir.cwd().readFileAlloc(types.io, composer_path, allocator, .limited(10 * 1024 * 1024)) catch |err| {
+        if (err == error.FileNotFound) return ComposerError.FileNotFound;
         return ComposerError.OutOfMemory;
     };
     defer allocator.free(content);
@@ -52,7 +48,66 @@ pub fn parseComposerJson(allocator: std.mem.Allocator, composer_path: []const u8
         try parseAutoloadSection(allocator, &config, autoload_dev, root_path);
     }
 
+    // Tool config lives under composer's conventional `extra` key:
+    //   "extra": { "phpcma": { "plugins": ["symfony-events"] } }
+    if (root.object.get("extra")) |extra| {
+        if (extra == .object) {
+            if (extra.object.get("phpcma")) |phpcma| {
+                if (phpcma == .object) {
+                    if (phpcma.object.get("plugins")) |plugins| {
+                        config.plugins = try parseStringArray(allocator, plugins);
+                    }
+                }
+            }
+        }
+    }
+
     return config;
+}
+
+/// Parse a JSON value expected to be an array of strings into an owned slice.
+/// Non-array values and non-string elements are ignored.
+fn parseStringArray(allocator: std.mem.Allocator, value: std.json.Value) ![]const []const u8 {
+    if (value != .array) return &.{};
+    var list: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (list.items) |s| allocator.free(s);
+        list.deinit(allocator);
+    }
+    for (value.array.items) |item| {
+        if (item == .string) {
+            try list.append(allocator, try allocator.dupe(u8, item.string));
+        }
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+/// Insert PSR-4 `new_paths` for `namespace`, merging with any paths already
+/// registered for the same namespace instead of overwriting them. This matters
+/// because `autoload` and `autoload-dev` are parsed in turn and Composer treats
+/// repeated prefixes as additive — e.g. `App\` mapping to both `src/` and
+/// `tests/` — so a plain `put` would silently drop the first mapping.
+fn mergePsr4(
+    allocator: std.mem.Allocator,
+    config: *ProjectConfig,
+    namespace: []const u8,
+    new_paths: []const []const u8,
+) !void {
+    const gop = try config.autoload_psr4.getOrPut(namespace);
+    if (!gop.found_existing) {
+        // First time we see this namespace: own a duped key, keep the paths.
+        gop.key_ptr.* = try allocator.dupe(u8, namespace);
+        gop.value_ptr.* = new_paths;
+        return;
+    }
+    // Existing namespace: concatenate old + new path lists.
+    const old = gop.value_ptr.*;
+    const combined = try allocator.alloc([]const u8, old.len + new_paths.len);
+    @memcpy(combined[0..old.len], old);
+    @memcpy(combined[old.len..], new_paths);
+    allocator.free(old); // the slice header; element strings are kept (reused)
+    allocator.free(new_paths);
+    gop.value_ptr.* = combined;
 }
 
 fn parseAutoloadSection(
@@ -85,10 +140,7 @@ fn parseAutoloadSection(
             }
 
             if (paths.items.len > 0) {
-                try config.autoload_psr4.put(
-                    try allocator.dupe(u8, namespace),
-                    try paths.toOwnedSlice(allocator),
-                );
+                try mergePsr4(allocator, config, namespace, try paths.toOwnedSlice(allocator));
             }
         }
     }
@@ -184,7 +236,7 @@ pub fn discoverFiles(allocator: std.mem.Allocator, config: *const ProjectConfig)
 
     // Add classmap paths
     for (config.autoload_classmap) |path| {
-        const stat = std.fs.cwd().statFile(path) catch continue;
+        const stat = std.Io.Dir.cwd().statFile(types.io, path, .{}) catch continue;
         if (stat.kind == .directory) {
             try walkDirectory(allocator, path, &files);
         } else if (std.mem.endsWith(u8, path, ".php")) {
@@ -231,23 +283,19 @@ fn walkDirectoryInternal(
     // Limit recursion depth to prevent runaway traversal
     if (depth > 50) return;
 
-    // Get real path to handle symlinks properly and detect cycles
-    var real_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const real_path = std.fs.cwd().realpath(dir_path, &real_path_buf) catch dir_path;
+    // Cycle detection on the literal path (depth limit above bounds recursion).
+    if (visited.contains(dir_path)) return;
+    try visited.put(try allocator.dupe(u8, dir_path), {});
 
-    // Check if we've already visited this directory (cycle detection)
-    if (visited.contains(real_path)) return;
-    try visited.put(try allocator.dupe(u8, real_path), {});
-
-    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| {
+    var dir = std.Io.Dir.openDirAbsolute(types.io, dir_path, .{ .iterate = true }) catch |err| {
         // Directory might not exist, skip it
         if (err == error.FileNotFound) return;
         return err;
     };
-    defer dir.close();
+    defer dir.close(types.io);
 
     var it = dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(types.io)) |entry| {
         const full_path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
         defer allocator.free(full_path);
 
@@ -268,7 +316,7 @@ fn walkDirectoryInternal(
             },
             .sym_link => {
                 // Follow symlink and check if it's a directory
-                const stat = std.fs.cwd().statFile(full_path) catch continue;
+                const stat = std.Io.Dir.cwd().statFile(types.io, full_path, .{}) catch continue;
                 if (stat.kind == .directory) {
                     try walkDirectoryInternal(allocator, full_path, files, visited, depth + 1);
                 } else if (stat.kind == .file and std.mem.endsWith(u8, entry.name, ".php")) {
@@ -372,12 +420,9 @@ pub const ProjectInfo = struct {
 
 /// Extract basic project information from composer.json
 pub fn getProjectInfo(allocator: std.mem.Allocator, composer_path: []const u8) !ProjectInfo {
-    const file = std.fs.openFileAbsolute(composer_path, .{}) catch {
+    const content = std.Io.Dir.cwd().readFileAlloc(types.io, composer_path, allocator, .limited(10 * 1024 * 1024)) catch {
         return .{ .name = null, .description = null, .php_version = null };
     };
-    defer file.close();
-
-    const content = try file.readToEndAlloc(allocator, 10 * 1024 * 1024);
     defer allocator.free(content);
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch {
@@ -421,58 +466,92 @@ pub fn getProjectInfo(allocator: std.mem.Allocator, composer_path: []const u8) !
 // Printing
 // ============================================================================
 
-pub fn printConfig(config: *const ProjectConfig, file: std.fs.File) !void {
+pub fn printConfig(config: *const ProjectConfig, file: std.Io.File) !void {
     const allocator = config.allocator;
 
-    try file.writeAll("Project Configuration:\n");
+    try file.writeStreamingAll(types.io, "Project Configuration:\n");
 
     const root_msg = try std.fmt.allocPrint(allocator, "  Root: {s}\n", .{config.root_path});
     defer allocator.free(root_msg);
-    try file.writeAll(root_msg);
+    try file.writeStreamingAll(types.io, root_msg);
 
-    try file.writeAll("\n  PSR-4 Autoload:\n");
+    try file.writeStreamingAll(types.io, "\n  PSR-4 Autoload:\n");
     var psr4_it = config.autoload_psr4.iterator();
     while (psr4_it.next()) |entry| {
         const ns_msg = try std.fmt.allocPrint(allocator, "    {s} =>\n", .{entry.key_ptr.*});
         defer allocator.free(ns_msg);
-        try file.writeAll(ns_msg);
+        try file.writeStreamingAll(types.io, ns_msg);
         for (entry.value_ptr.*) |path| {
             const path_msg = try std.fmt.allocPrint(allocator, "      - {s}\n", .{path});
             defer allocator.free(path_msg);
-            try file.writeAll(path_msg);
+            try file.writeStreamingAll(types.io, path_msg);
         }
     }
 
     if (config.autoload_psr0.count() > 0) {
-        try file.writeAll("\n  PSR-0 Autoload:\n");
+        try file.writeStreamingAll(types.io, "\n  PSR-0 Autoload:\n");
         var psr0_it = config.autoload_psr0.iterator();
         while (psr0_it.next()) |entry| {
             const ns_msg = try std.fmt.allocPrint(allocator, "    {s} =>\n", .{entry.key_ptr.*});
             defer allocator.free(ns_msg);
-            try file.writeAll(ns_msg);
+            try file.writeStreamingAll(types.io, ns_msg);
             for (entry.value_ptr.*) |path| {
                 const path_msg = try std.fmt.allocPrint(allocator, "      - {s}\n", .{path});
                 defer allocator.free(path_msg);
-                try file.writeAll(path_msg);
+                try file.writeStreamingAll(types.io, path_msg);
             }
         }
     }
 
     if (config.autoload_classmap.len > 0) {
-        try file.writeAll("\n  Classmap:\n");
+        try file.writeStreamingAll(types.io, "\n  Classmap:\n");
         for (config.autoload_classmap) |path| {
             const path_msg = try std.fmt.allocPrint(allocator, "    - {s}\n", .{path});
             defer allocator.free(path_msg);
-            try file.writeAll(path_msg);
+            try file.writeStreamingAll(types.io, path_msg);
         }
     }
 
     if (config.autoload_files.len > 0) {
-        try file.writeAll("\n  Files:\n");
+        try file.writeStreamingAll(types.io, "\n  Files:\n");
         for (config.autoload_files) |path| {
             const path_msg = try std.fmt.allocPrint(allocator, "    - {s}\n", .{path});
             defer allocator.free(path_msg);
-            try file.writeAll(path_msg);
+            try file.writeStreamingAll(types.io, path_msg);
         }
     }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+const testing = std.testing;
+
+test "mergePsr4: same namespace from autoload + autoload-dev is additive" {
+    const a = testing.allocator;
+    var config = ProjectConfig.init(a, "/root");
+    defer config.autoload_psr4.deinit();
+
+    // First mapping (e.g. from "autoload": {"App\\": "src/"}).
+    const first = try a.alloc([]const u8, 1);
+    first[0] = try a.dupe(u8, "/root/src");
+    try mergePsr4(a, &config, "App\\", first);
+
+    // Second mapping for the SAME prefix (e.g. "autoload-dev": {"App\\": "tests/"}).
+    const second = try a.alloc([]const u8, 1);
+    second[0] = try a.dupe(u8, "/root/tests");
+    try mergePsr4(a, &config, "App\\", second);
+
+    // Both paths must survive (the old code clobbered the first).
+    const paths = config.autoload_psr4.get("App\\").?;
+    try testing.expectEqual(@as(usize, 2), paths.len);
+    try testing.expectEqualStrings("/root/src", paths[0]);
+    try testing.expectEqualStrings("/root/tests", paths[1]);
+
+    // Clean up: free element strings, the combined slice, and the duped key.
+    for (paths) |p| a.free(p);
+    a.free(paths);
+    var it = config.autoload_psr4.keyIterator();
+    while (it.next()) |k| a.free(k.*);
 }

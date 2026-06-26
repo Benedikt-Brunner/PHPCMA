@@ -21,6 +21,7 @@ pub const PhpcmaConfig = struct {
     config_root: []const u8, // Directory containing .phpcma.json
     scan_paths: []const []const u8, // Parent dirs to scan (e.g., "plugins", "bundles")
     discovered_projects: []const []const u8, // Discovered composer.json paths
+    plugins: []const []const u8, // Monorepo-wide default plugins (per-project override wins)
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *PhpcmaConfig) void {
@@ -34,6 +35,11 @@ pub const PhpcmaConfig = struct {
         }
         self.allocator.free(self.discovered_projects);
 
+        for (self.plugins) |p| {
+            self.allocator.free(p);
+        }
+        self.allocator.free(self.plugins);
+
         self.allocator.free(self.config_root);
     }
 };
@@ -44,13 +50,8 @@ pub fn parseConfigFile(allocator: std.mem.Allocator, config_path: []const u8) !P
     const config_root = std.fs.path.dirname(config_path) orelse ".";
 
     // Read the file
-    const file = std.fs.cwd().openFile(config_path, .{}) catch |err| {
+    const content = std.Io.Dir.cwd().readFileAlloc(types.io, config_path, allocator, .limited(10 * 1024 * 1024)) catch |err| {
         if (err == error.FileNotFound) return ConfigError.FileNotFound;
-        return ConfigError.InvalidPath;
-    };
-    defer file.close();
-
-    const content = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch {
         return ConfigError.OutOfMemory;
     };
     defer allocator.free(content);
@@ -102,15 +103,37 @@ pub fn parseConfigFile(allocator: std.mem.Allocator, config_path: []const u8) !P
         }
     }
 
+    // Optional monorepo-wide default plugin list. Each project's own
+    // `extra.phpcma.plugins` (in its composer.json) takes precedence.
+    var plugins: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (plugins.items) |p| allocator.free(p);
+        plugins.deinit(allocator);
+    }
+    if (root.object.get("plugins")) |plugins_json| {
+        if (plugins_json == .array) {
+            for (plugins_json.array.items) |item| {
+                if (item == .string) {
+                    try plugins.append(allocator, try allocator.dupe(u8, item.string));
+                }
+            }
+        }
+    }
+
     return PhpcmaConfig{
         .config_root = try allocator.dupe(u8, config_root),
         .scan_paths = try scan_paths.toOwnedSlice(allocator),
         .discovered_projects = try discovered.toOwnedSlice(allocator),
+        .plugins = try plugins.toOwnedSlice(allocator),
         .allocator = allocator,
     };
 }
 
-/// Scan a directory for subdirectories containing composer.json files
+/// Scan a directory tree for composer.json files. Recurses so nested package
+/// layouts (e.g. `libraries/composer-packages/<pkg>/composer.json`) are found,
+/// not just direct children. Stops descending once a directory yields a
+/// composer.json (a project boundary — its own `vendor/` etc. must not be
+/// indexed) and skips vendor/.git/node_modules and hidden dirs.
 fn discoverComposerProjects(allocator: std.mem.Allocator, scan_path: []const u8) ![]const []const u8 {
     var projects: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer {
@@ -118,35 +141,50 @@ fn discoverComposerProjects(allocator: std.mem.Allocator, scan_path: []const u8)
         projects.deinit(allocator);
     }
 
-    var dir = std.fs.cwd().openDir(scan_path, .{ .iterate = true }) catch |err| {
-        if (err == error.FileNotFound) return try projects.toOwnedSlice(allocator);
-        return err;
-    };
-    defer dir.close();
+    try collectComposerProjects(allocator, scan_path, &projects, 0);
+
+    return try projects.toOwnedSlice(allocator);
+}
+
+/// Recursive worker for `discoverComposerProjects`. Bounded depth guards
+/// against pathological trees / symlink cycles.
+fn collectComposerProjects(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    projects: *std.ArrayListUnmanaged([]const u8),
+    depth: usize,
+) !void {
+    if (depth > 8) return;
+
+    // Skip anything we can't open as a directory (missing paths, symlinks to
+    // files such as `vendor/bin/*`, permission issues). Discovery must be
+    // robust to a messy tree rather than aborting the whole scan.
+    var dir = std.Io.Dir.cwd().openDir(types.io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(types.io);
 
     var it = dir.iterate();
-    while (try it.next()) |entry| {
-        // Only check directories (and symlinks to directories)
+    while (try it.next(types.io)) |entry| {
         const is_dir = entry.kind == .directory or entry.kind == .sym_link;
         if (!is_dir) continue;
+        if (entry.name.len == 0 or entry.name[0] == '.') continue; // .git and other hidden dirs
+        if (std.mem.eql(u8, entry.name, "vendor") or
+            std.mem.eql(u8, entry.name, "node_modules")) continue;
 
-        // Build path to potential composer.json
-        const composer_path = try std.fs.path.join(allocator, &.{
-            scan_path,
-            entry.name,
-            "composer.json",
-        });
+        const child_dir = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+        defer allocator.free(child_dir);
+
+        const composer_path = try std.fs.path.join(allocator, &.{ child_dir, "composer.json" });
         errdefer allocator.free(composer_path);
 
-        // Check if composer.json exists
-        if (std.fs.cwd().access(composer_path, .{})) {
+        if (std.Io.Dir.cwd().access(types.io, composer_path, .{})) {
+            // Project boundary: record it and do NOT descend further so we
+            // never index this project's own vendored dependencies.
             try projects.append(allocator, composer_path);
         } else |_| {
             allocator.free(composer_path);
+            try collectComposerProjects(allocator, child_dir, projects, depth + 1);
         }
     }
-
-    return try projects.toOwnedSlice(allocator);
 }
 
 /// Parse all discovered composer projects and return their configs
@@ -158,10 +196,17 @@ pub fn parseDiscoveredProjects(allocator: std.mem.Allocator, phpcma_config: *con
     }
 
     for (phpcma_config.discovered_projects) |composer_path| {
-        const config = composer.parseComposerJson(allocator, composer_path) catch |err| {
+        var config = composer.parseComposerJson(allocator, composer_path) catch |err| {
             std.debug.print("Warning: Failed to parse {s}: {}\n", .{ composer_path, err });
             continue;
         };
+        // A project that doesn't declare its own plugins inherits the
+        // monorepo-wide default from .phpcma.json.
+        if (config.plugins.len == 0 and phpcma_config.plugins.len > 0) {
+            var inherited = try allocator.alloc([]const u8, phpcma_config.plugins.len);
+            for (phpcma_config.plugins, 0..) |name, i| inherited[i] = try allocator.dupe(u8, name);
+            config.plugins = inherited;
+        }
         try configs.append(allocator, config);
     }
 
@@ -170,7 +215,7 @@ pub fn parseDiscoveredProjects(allocator: std.mem.Allocator, phpcma_config: *con
 
 /// Discover files from all project configs (without vendor directories)
 pub fn discoverFilesFromConfigs(allocator: std.mem.Allocator, configs: []const ProjectConfig) ![]const []const u8 {
-    var all_files = std.ArrayListUnmanaged([]const u8){};
+    var all_files: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer {
         for (all_files.items) |f| allocator.free(f);
         all_files.deinit(allocator);
@@ -193,30 +238,30 @@ pub fn discoverFilesFromConfigs(allocator: std.mem.Allocator, configs: []const P
 // Printing
 // ============================================================================
 
-pub fn printConfig(phpcma_config: *const PhpcmaConfig, file: std.fs.File) !void {
+pub fn printConfig(phpcma_config: *const PhpcmaConfig, file: std.Io.File) !void {
     const allocator = phpcma_config.allocator;
 
-    try file.writeAll("PHPCMA Configuration:\n");
+    try file.writeStreamingAll(types.io, "PHPCMA Configuration:\n");
 
     const root_msg = try std.fmt.allocPrint(allocator, "  Config Root: {s}\n", .{phpcma_config.config_root});
     defer allocator.free(root_msg);
-    try file.writeAll(root_msg);
+    try file.writeStreamingAll(types.io, root_msg);
 
-    try file.writeAll("\n  Scan Paths:\n");
+    try file.writeStreamingAll(types.io, "\n  Scan Paths:\n");
     for (phpcma_config.scan_paths) |path| {
         const path_msg = try std.fmt.allocPrint(allocator, "    - {s}\n", .{path});
         defer allocator.free(path_msg);
-        try file.writeAll(path_msg);
+        try file.writeStreamingAll(types.io, path_msg);
     }
 
-    try file.writeAll("\n  Discovered Projects:\n");
+    try file.writeStreamingAll(types.io, "\n  Discovered Projects:\n");
     for (phpcma_config.discovered_projects) |path| {
         const path_msg = try std.fmt.allocPrint(allocator, "    - {s}\n", .{path});
         defer allocator.free(path_msg);
-        try file.writeAll(path_msg);
+        try file.writeStreamingAll(types.io, path_msg);
     }
 
     const count_msg = try std.fmt.allocPrint(allocator, "\n  Total: {d} projects\n", .{phpcma_config.discovered_projects.len});
     defer allocator.free(count_msg);
-    try file.writeAll(count_msg);
+    try file.writeStreamingAll(types.io, count_msg);
 }

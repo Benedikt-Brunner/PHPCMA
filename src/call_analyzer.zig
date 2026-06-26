@@ -11,6 +11,7 @@ const MethodSymbol = types.MethodSymbol;
 const FileContext = types.FileContext;
 const EnhancedFunctionCall = types.EnhancedFunctionCall;
 const ResolutionMethod = types.ResolutionMethod;
+const UnresolvedReason = types.UnresolvedReason;
 const SymbolTable = symbol_table.SymbolTable;
 const TypeResolver = type_resolver.TypeResolver;
 
@@ -31,6 +32,11 @@ pub const CallAnalyzer = struct {
     current_class: ?[]const u8,
     current_method: ?[]const u8,
 
+    // When set (env PHPCMA_DIAG), record a fine-grained `unresolved_detail`
+    // sub-reason per unresolved instance call. Off by default to avoid the
+    // per-call AST walk on normal loads.
+    diag_enabled: bool,
+
     pub fn init(
         allocator: std.mem.Allocator,
         sym_table: *SymbolTable,
@@ -44,6 +50,7 @@ pub const CallAnalyzer = struct {
             .current_file = "",
             .current_class = null,
             .current_method = null,
+            .diag_enabled = std.c.getenv("PHPCMA_DIAG") != null,
         };
     }
 
@@ -105,6 +112,29 @@ pub const CallAnalyzer = struct {
         // Track assignments for type inference
         if (std.mem.eql(u8, kind, "assignment_expression")) {
             try self.type_resolver.trackAssignment(node, source);
+        }
+
+        // foreach binds its loop variable to the iterable's element type in a
+        // pushed scope; handle it explicitly (and skip default recursion).
+        if (std.mem.eql(u8, kind, "foreach_statement")) {
+            try self.enterForeach(node, source);
+            return;
+        }
+
+        // catch (FooException $e) binds `$e` to the caught type in a pushed
+        // scope so `$e->...()` calls resolve (or attribute to the real type).
+        if (std.mem.eql(u8, kind, "catch_clause")) {
+            try self.enterCatch(node, source);
+            return;
+        }
+
+        // Closures get their own scope: typed params are bound, and `use`
+        // captures (plus outer locals) resolve via the parent scope chain.
+        if (std.mem.eql(u8, kind, "anonymous_function") or
+            std.mem.eql(u8, kind, "arrow_function"))
+        {
+            try self.enterClosure(node, source);
+            return;
         }
 
         // Recurse into children
@@ -204,6 +234,111 @@ pub const CallAnalyzer = struct {
         self.current_method = null;
     }
 
+    /// Handle `foreach (<iter> as [$k =>] $v)`: bind `$v` to the iterable's
+    /// element type in a pushed scope, then analyze the body so calls on the
+    /// loop variable resolve. Falls back to an untyped binding when the element
+    /// type is unknown (so inner traversal still happens).
+    fn enterForeach(self: *CallAnalyzer, node: ts.Node, source: []const u8) !void {
+        const iter_node = node.namedChild(0);
+
+        // Analyze the iterable expression itself first (it may contain calls,
+        // e.g. `foreach ($this->repo->findAll() as $x)`).
+        if (iter_node) |it| try self.traverseNode(it, source);
+
+        // Resolve the element type from the iterable, if possible.
+        const elem_type: ?TypeInfo = if (iter_node) |it|
+            try self.type_resolver.foreachElementType(it, source)
+        else
+            null;
+
+        const scope = try self.type_resolver.pushScope();
+
+        // Bind the value variable (namedChild(1) is the value, a `pair` for
+        // `$k => $v`, or a `by_ref` wrapper). Destructuring (list_literal) is
+        // skipped.
+        if (elem_type) |et| {
+            if (foreachValueVar(node)) |value_node| {
+                const var_name = getNodeText(source, value_node);
+                try scope.setVariableType(var_name, et);
+            }
+        }
+
+        // Analyze the loop body within the pushed scope.
+        if (node.childByFieldName("body")) |body| {
+            try self.traverseNode(body, source);
+        }
+
+        self.type_resolver.popScope();
+    }
+
+    /// Handle `catch (T $e) { ... }`: bind `$e` to the caught type in a pushed
+    /// scope, then analyze the body. Only single (non-union) catch types are
+    /// bound — a `A|B` catch leaves the receiver ambiguous, so we skip it.
+    fn enterCatch(self: *CallAnalyzer, node: ts.Node, source: []const u8) !void {
+        const scope = try self.type_resolver.pushScope();
+
+        if (node.childByFieldName("name")) |name_node| {
+            if (node.childByFieldName("type")) |type_list| {
+                if (type_list.namedChildCount() == 1) {
+                    if (type_list.namedChild(0)) |type_node| {
+                        const fqcn = self.type_resolver.file_context.resolveFQCN(getNodeText(source, type_node));
+                        const type_info = try TypeInfo.simple(self.allocator, fqcn);
+                        const var_name = getNodeText(source, name_node);
+                        try scope.setVariableType(var_name, type_info);
+                    }
+                }
+            }
+        }
+
+        if (node.childByFieldName("body")) |body| {
+            try self.traverseNode(body, source);
+        }
+
+        self.type_resolver.popScope();
+    }
+
+    /// Handle a closure (`function (...) use (...) {}` or `fn (...) => ...`):
+    /// push a scope whose parent is the current one (so `use` captures and
+    /// outer locals still resolve), bind the closure's own typed parameters,
+    /// then analyze the body.
+    fn enterClosure(self: *CallAnalyzer, node: ts.Node, source: []const u8) !void {
+        const scope = try self.type_resolver.pushScope();
+
+        if (node.childByFieldName("parameters")) |params| {
+            var i: u32 = 0;
+            while (i < params.namedChildCount()) : (i += 1) {
+                const param = params.namedChild(i) orelse continue;
+                const pk = param.kind();
+                if (!std.mem.eql(u8, pk, "simple_parameter") and
+                    !std.mem.eql(u8, pk, "variadic_parameter")) continue;
+                const type_node = param.childByFieldName("type") orelse continue;
+                const name_node = param.childByFieldName("name") orelse continue;
+                const type_info = (try self.typeInfoFromTypeNode(type_node, source)) orelse continue;
+                try scope.setVariableType(getNodeText(source, name_node), type_info);
+            }
+        }
+
+        if (node.childByFieldName("body")) |body| {
+            try self.traverseNode(body, source);
+        }
+
+        self.type_resolver.popScope();
+    }
+
+    /// Build an FQCN-resolved `TypeInfo` from a declared-type node (the `type`
+    /// field of a parameter), mirroring the symbol collector so closure-param
+    /// types match symbol-table keys.
+    fn typeInfoFromTypeNode(self: *CallAnalyzer, type_node: ts.Node, source: []const u8) !?TypeInfo {
+        const text = getNodeText(source, type_node);
+        if (text.len == 0) return null;
+        var info = try phpdoc.parseTypeString(self.allocator, text);
+        if ((info.kind == .simple or info.kind == .nullable) and !info.is_builtin) {
+            const resolved = self.type_resolver.file_context.resolveFQCN(info.base_type);
+            info.base_type = try self.allocator.dupe(u8, resolved);
+        }
+        return info;
+    }
+
     // ========================================================================
     // Call Analysis
     // ========================================================================
@@ -225,6 +360,9 @@ pub const CallAnalyzer = struct {
             .line = node.startPoint().row + 1,
             .column = node.startPoint().column + 1,
             .file_path = self.current_file,
+            .arg_count = countCallArgs(node),
+            .arg_types = try resolveCallArgTypes(self, node, source),
+            .result_used = detectResultUse(node),
             .resolved_target = null,
             .resolution_confidence = 0.0,
             .resolution_method = .unresolved,
@@ -232,18 +370,157 @@ pub const CallAnalyzer = struct {
 
         // Try to resolve target
         if (object_type) |obj_type| {
-            if (self.type_resolver.resolveMethodCall(obj_type, method_name)) |method| {
+            if (self.type_resolver.resolveMethodCall(obj_type, method_name)) |res| {
+                const method = res.method;
                 call.resolved_target = try std.fmt.allocPrint(
                     self.allocator,
                     "{s}::{s}",
                     .{ method.containing_class, method.name },
                 );
-                call.resolution_confidence = self.calculateConfidence(obj_type);
-                call.resolution_method = self.determineResolutionMethod(object_node, source);
+                switch (res.binding) {
+                    .di_config => {
+                        // DI-bound via an explicit services.yaml mapping: not a
+                        // concrete type match but config-authoritative, so high
+                        // (but sub-1.0) confidence and a distinct tag.
+                        call.resolution_confidence = 0.85;
+                        call.resolution_method = .di_config_binding;
+                    },
+                    .single_impl => {
+                        // DI-bound via a single-implementor interface: real but
+                        // inferred, so flag it distinctly with reduced confidence.
+                        call.resolution_confidence = 0.6;
+                        call.resolution_method = .interface_single_impl;
+                    },
+                    .interface_contract => {
+                        // Resolved to the interface's own abstract method. The
+                        // concrete runtime implementor is unknown (several or
+                        // none), so lower confidence than a single-implementor
+                        // bind, but the contract edge is real and navigable.
+                        call.resolution_confidence = 0.5;
+                        call.resolution_method = .interface_contract;
+                    },
+                    .direct => {
+                        call.resolution_confidence = self.calculateConfidence(obj_type);
+                        call.resolution_method = self.determineResolutionMethod(object_node, source);
+                    },
+                }
+            } else if (self.symbol_table.typeExists(obj_type.base_type)) {
+                // Receiver type is in-project but no method bound. Split the
+                // ones that extend/use an external base or trait (method likely
+                // inherited from non-indexed core — not fixable here) from the
+                // pure in-project misses (a genuine inheritance/trait/magic gap).
+                call.receiver_type = try self.allocator.dupe(u8, obj_type.base_type);
+                call.unresolved_reason = if (self.hasExternalAncestor(obj_type.base_type))
+                    .method_not_found_external_ancestor
+                else
+                    .method_not_found_pure;
+            } else {
+                // Receiver type resolved to an external/vendor type (out of
+                // scope without indexing it). Record the FQCN so downstream
+                // metrics can attribute the call to the concrete external class.
+                call.unresolved_reason = .recv_type_external;
+                call.receiver_type = try self.allocator.dupe(u8, obj_type.base_type);
+            }
+        } else {
+            // Receiver type could not be inferred at all: bucket by the receiver
+            // expression shape so the dominant fixable pattern is visible.
+            call.unresolved_reason = self.classifyNullReceiver(object_node, source);
+            if (call.unresolved_reason == .recv_local) {
+                call.receiver_type = try self.allocator.dupe(u8, getNodeText(source, object_node));
+            }
+            if (self.diag_enabled) {
+                call.unresolved_detail = switch (call.unresolved_reason) {
+                    .recv_local => self.localRhsDetail(object_node, source),
+                    .recv_chain => self.chainDetail(object_node, source),
+                    else => null,
+                };
             }
         }
 
         try self.calls.append(self.allocator, call);
+    }
+
+    /// Diagnostic: for a `recv_local` receiver `$v`, find the assignment that
+    /// fed it within the enclosing function and report the RHS node kind, so we
+    /// can see why tracking failed (chain root, alias, external `new`, or no
+    /// local assignment at all — i.e. closure `use`/by-ref/global). Returns a
+    /// static label; never allocates.
+    fn localRhsDetail(self: *CallAnalyzer, object_node: ts.Node, source: []const u8) ?[]const u8 {
+        _ = self;
+        const var_name = getNodeText(source, object_node);
+        const fn_body = enclosingBody(object_node) orelse return "no_enclosing_fn";
+        const call_byte = object_node.startByte();
+
+        var best: ?ts.Node = null;
+        var best_byte: u32 = 0;
+        findLatestAssignment(fn_body, source, var_name, call_byte, &best, &best_byte);
+
+        const rhs = (best orelse return "no_local_assign").childByFieldName("right") orelse return "no_local_assign";
+        return rhsKindLabel(rhs.kind());
+    }
+
+    /// Diagnostic: for a `recv_chain` receiver `$a->b()`, report the shape of
+    /// the *inner* receiver `$a`, so we know where chains bottom out (a local,
+    /// a property, `$this`, another chain, etc.). Static label; no allocation.
+    fn chainDetail(self: *CallAnalyzer, object_node: ts.Node, source: []const u8) ?[]const u8 {
+        _ = self;
+        const inner = object_node.childByFieldName("object") orelse return "chain:unknown";
+        const k = inner.kind();
+        if (std.mem.eql(u8, k, "variable_name")) {
+            const t = getNodeText(source, inner);
+            return if (std.mem.eql(u8, t, "$this")) "chain:this" else "chain:var";
+        }
+        if (std.mem.eql(u8, k, "member_access_expression")) return "chain:property";
+        if (std.mem.eql(u8, k, "member_call_expression") or
+            std.mem.eql(u8, k, "nullsafe_member_call_expression")) return "chain:member_call";
+        if (std.mem.eql(u8, k, "scoped_call_expression")) return "chain:static_call";
+        if (std.mem.eql(u8, k, "function_call_expression")) return "chain:func_call";
+        if (std.mem.eql(u8, k, "subscript_expression")) return "chain:subscript";
+        return "chain:other";
+    }
+
+    /// Classify an unresolved call whose receiver type could not be inferred,
+    /// by the receiver's syntactic shape. A bare `$var` is split into an
+    /// untyped parameter of the current method (needs a type hint upstream) vs.
+    /// a local the resolver failed to track (an assignment-coverage gap).
+    fn classifyNullReceiver(self: *CallAnalyzer, object_node: ts.Node, source: []const u8) UnresolvedReason {
+        const k = object_node.kind();
+        if (std.mem.eql(u8, k, "variable_name")) {
+            const var_text = getNodeText(source, object_node);
+            const name = if (var_text.len > 0 and var_text[0] == '$') var_text[1..] else var_text;
+            if (self.type_resolver.current_method) |m| {
+                for (m.parameters) |p| {
+                    if (std.mem.eql(u8, p.name, name)) return .recv_param_untyped;
+                }
+            }
+            return .recv_local;
+        }
+        if (std.mem.eql(u8, k, "member_access_expression")) return .recv_property;
+        if (std.mem.eql(u8, k, "member_call_expression")) return .recv_chain;
+        if (std.mem.eql(u8, k, "nullsafe_member_call_expression")) return .recv_chain;
+        if (std.mem.eql(u8, k, "scoped_call_expression")) return .recv_static_chain;
+        if (std.mem.eql(u8, k, "function_call_expression")) return .recv_func_chain;
+        if (std.mem.eql(u8, k, "subscript_expression")) return .recv_subscript;
+        return .recv_other;
+    }
+
+    /// True if `fqcn` extends a class or uses a trait that is not in-project
+    /// (i.e. vendor/core), so a missing method is plausibly inherited from
+    /// non-indexed code rather than being a resolver defect.
+    fn hasExternalAncestor(self: *CallAnalyzer, fqcn: []const u8) bool {
+        if (self.symbol_table.resolved) |view| {
+            if (view.getClass(fqcn)) |rc| {
+                for (rc.parent_chain) |anc| {
+                    if (!self.symbol_table.typeExists(anc)) return true;
+                }
+            }
+        }
+        if (self.symbol_table.classes.getPtr(fqcn)) |class| {
+            for (class.uses) |trait_fqcn| {
+                if (!self.symbol_table.traits.contains(trait_fqcn)) return true;
+            }
+        }
+        return false;
     }
 
     /// Analyze Class::method() static call
@@ -294,6 +571,9 @@ pub const CallAnalyzer = struct {
             .line = node.startPoint().row + 1,
             .column = node.startPoint().column + 1,
             .file_path = self.current_file,
+            .arg_count = countCallArgs(node),
+            .arg_types = try resolveCallArgTypes(self, node, source),
+            .result_used = detectResultUse(node),
             .resolved_target = null,
             .resolution_confidence = 1.0, // Static calls are always resolvable
             .resolution_method = resolution_method,
@@ -347,6 +627,9 @@ pub const CallAnalyzer = struct {
             .line = node.startPoint().row + 1,
             .column = node.startPoint().column + 1,
             .file_path = self.current_file,
+            .arg_count = countCallArgs(node),
+            .arg_types = try resolveCallArgTypes(self, node, source),
+            .result_used = detectResultUse(node),
             .resolved_target = null,
             .resolution_confidence = 0.0,
             .resolution_method = .unresolved,
@@ -539,11 +822,11 @@ pub const ProjectCallGraph = struct {
     // ========================================================================
 
     /// Output as DOT graph format
-    pub fn toDot(self: *const ProjectCallGraph, file: std.fs.File) !void {
-        try file.writeAll("digraph CallGraph {\n");
-        try file.writeAll("    rankdir=LR;\n");
-        try file.writeAll("    node [shape=box, fontname=\"Helvetica\"];\n");
-        try file.writeAll("    edge [fontname=\"Helvetica\", fontsize=10];\n\n");
+    pub fn toDot(self: *const ProjectCallGraph, file: std.Io.File) !void {
+        try file.writeStreamingAll(types.io, "digraph CallGraph {\n");
+        try file.writeStreamingAll(types.io, "    rankdir=LR;\n");
+        try file.writeStreamingAll(types.io, "    node [shape=box, fontname=\"Helvetica\"];\n");
+        try file.writeStreamingAll(types.io, "    edge [fontname=\"Helvetica\", fontsize=10];\n\n");
 
         // Collect unique nodes
         var callers = std.StringHashMap(void).init(self.allocator);
@@ -559,18 +842,18 @@ pub const ProjectCallGraph = struct {
         }
 
         // Output caller nodes
-        try file.writeAll("    // Callers\n");
+        try file.writeStreamingAll(types.io, "    // Callers\n");
         var caller_it = callers.keyIterator();
         while (caller_it.next()) |caller| {
             const escaped = try escapeForDot(self.allocator, caller.*);
             defer self.allocator.free(escaped);
             const msg = try std.fmt.allocPrint(self.allocator, "    \"{s}\" [style=filled, fillcolor=\"#e1f5fe\"];\n", .{escaped});
             defer self.allocator.free(msg);
-            try file.writeAll(msg);
+            try file.writeStreamingAll(types.io, msg);
         }
 
         // Output callee nodes
-        try file.writeAll("\n    // Callees\n");
+        try file.writeStreamingAll(types.io, "\n    // Callees\n");
         var callee_it = callees.keyIterator();
         while (callee_it.next()) |callee| {
             if (!callers.contains(callee.*)) {
@@ -578,12 +861,12 @@ pub const ProjectCallGraph = struct {
                 defer self.allocator.free(escaped);
                 const msg = try std.fmt.allocPrint(self.allocator, "    \"{s}\" [style=filled, fillcolor=\"#fff3e0\"];\n", .{escaped});
                 defer self.allocator.free(msg);
-                try file.writeAll(msg);
+                try file.writeStreamingAll(types.io, msg);
             }
         }
 
         // Output edges
-        try file.writeAll("\n    // Calls\n");
+        try file.writeStreamingAll(types.io, "\n    // Calls\n");
         for (self.calls.items) |call| {
             if (call.resolved_target) |target| {
                 const caller_escaped = try escapeForDot(self.allocator, call.caller_fqn);
@@ -605,15 +888,15 @@ pub const ProjectCallGraph = struct {
                     .{ caller_escaped, target_escaped, color },
                 );
                 defer self.allocator.free(msg);
-                try file.writeAll(msg);
+                try file.writeStreamingAll(types.io, msg);
             }
         }
 
-        try file.writeAll("}\n");
+        try file.writeStreamingAll(types.io, "}\n");
     }
 
     /// Output as text summary
-    pub fn toText(self: *const ProjectCallGraph, file: std.fs.File) !void {
+    pub fn toText(self: *const ProjectCallGraph, file: std.Io.File) !void {
         // Header
         const header = try std.fmt.allocPrint(self.allocator,
             \\Call Graph Analysis
@@ -630,7 +913,7 @@ pub const ProjectCallGraph = struct {
             self.unresolved_calls,
         });
         defer self.allocator.free(header);
-        try file.writeAll(header);
+        try file.writeStreamingAll(types.io, header);
 
         // Group by caller
         var by_caller = std.StringHashMap(std.ArrayListUnmanaged(EnhancedFunctionCall)).init(self.allocator);
@@ -668,7 +951,7 @@ pub const ProjectCallGraph = struct {
         for (caller_keys.items) |caller| {
             const caller_msg = try std.fmt.allocPrint(self.allocator, "{s}:\n", .{caller});
             defer self.allocator.free(caller_msg);
-            try file.writeAll(caller_msg);
+            try file.writeStreamingAll(types.io, caller_msg);
 
             if (by_caller.get(caller)) |calls| {
                 for (calls.items) |call| {
@@ -685,10 +968,10 @@ pub const ProjectCallGraph = struct {
                         .{ target, confidence_str, call.line },
                     );
                     defer self.allocator.free(call_msg);
-                    try file.writeAll(call_msg);
+                    try file.writeStreamingAll(types.io, call_msg);
                 }
             }
-            try file.writeAll("\n");
+            try file.writeStreamingAll(types.io, "\n");
         }
     }
 };
@@ -697,6 +980,78 @@ pub const ProjectCallGraph = struct {
 // Helper Functions
 // ============================================================================
 
+/// Count the arguments passed at a call expression node by inspecting its
+/// "arguments" child and counting `argument` nodes (ignoring punctuation and
+/// comments). Returns 0 when no arguments node is present.
+fn countCallArgs(node: ts.Node) u32 {
+    const args_node = node.childByFieldName("arguments") orelse return 0;
+    var count: u32 = 0;
+    var i: u32 = 0;
+    const n = args_node.namedChildCount();
+    while (i < n) : (i += 1) {
+        const child = args_node.namedChild(i) orelse continue;
+        if (std.mem.eql(u8, child.kind(), "argument")) count += 1;
+    }
+    return count;
+}
+
+/// The value expression of an `argument` node (skipping the optional `name:`
+/// label and `reference_modifier`, which always precede the value). Returns null
+/// for spread (`...$x`) and placeholder (first-class callable `...`) args, whose
+/// positional type can't be attributed.
+fn argumentValueNode(arg: ts.Node) ?ts.Node {
+    const cnt = arg.namedChildCount();
+    if (cnt == 0) return null;
+    const c = arg.namedChild(cnt - 1) orelse return null;
+    const k = c.kind();
+    if (std.mem.eql(u8, k, "variadic_unpacking") or std.mem.eql(u8, k, "argument_placeholder")) return null;
+    return c;
+}
+
+/// Resolve the type of each positional argument at a call site, in source order.
+/// Mirrors `countCallArgs` iteration; each element is null where the argument's
+/// type could not be resolved (the same partiality as receiver resolution).
+fn resolveCallArgTypes(self: *CallAnalyzer, node: ts.Node, source: []const u8) ![]const ?TypeInfo {
+    const args_node = node.childByFieldName("arguments") orelse return &.{};
+    var list: std.ArrayListUnmanaged(?TypeInfo) = .empty;
+    var i: u32 = 0;
+    const n = args_node.namedChildCount();
+    while (i < n) : (i += 1) {
+        const child = args_node.namedChild(i) orelse continue;
+        if (!std.mem.eql(u8, child.kind(), "argument")) continue;
+        const expr = argumentValueNode(child) orelse {
+            try list.append(self.allocator, null);
+            continue;
+        };
+        const t = self.type_resolver.resolveExpressionType(expr, source) catch null;
+        try list.append(self.allocator, t);
+    }
+    return list.toOwnedSlice(self.allocator);
+}
+
+/// Classify how a call expression's result is consumed, from its parent node.
+/// `member_access` (the result is immediately dereferenced) is the case that
+/// makes narrowing a return type to nullable a breaking change.
+fn detectResultUse(node: ts.Node) types.EnhancedFunctionCall.ResultUse {
+    const parent = node.parent() orelse return .ignored;
+    const pk = parent.kind();
+    if (std.mem.eql(u8, pk, "member_access_expression") or
+        std.mem.eql(u8, pk, "member_call_expression") or
+        std.mem.eql(u8, pk, "nullsafe_member_access_expression") or
+        std.mem.eql(u8, pk, "nullsafe_member_call_expression") or
+        std.mem.eql(u8, pk, "scoped_call_expression") or
+        std.mem.eql(u8, pk, "scoped_property_access_expression") or
+        std.mem.eql(u8, pk, "class_constant_access_expression") or
+        std.mem.eql(u8, pk, "subscript_expression"))
+    {
+        return .member_access;
+    }
+    if (std.mem.eql(u8, pk, "assignment_expression")) return .assigned;
+    if (std.mem.eql(u8, pk, "argument")) return .passed;
+    if (std.mem.eql(u8, pk, "return_statement")) return .passed;
+    return .ignored;
+}
+
 fn getNodeText(source: []const u8, node: ts.Node) []const u8 {
     const start = node.startByte();
     const end = node.endByte();
@@ -704,6 +1059,99 @@ fn getNodeText(source: []const u8, node: ts.Node) []const u8 {
         return "";
     }
     return source[start..end];
+}
+
+/// Nearest enclosing function/method/closure body (`compound_statement`) of a
+/// node, by walking parents. Used by recv_local diagnostics to scope the
+/// assignment search. Returns null at file scope.
+fn enclosingBody(node: ts.Node) ?ts.Node {
+    var cur: ?ts.Node = node.parent();
+    while (cur) |n| : (cur = n.parent()) {
+        const k = n.kind();
+        if (std.mem.eql(u8, k, "method_declaration") or
+            std.mem.eql(u8, k, "function_definition") or
+            std.mem.eql(u8, k, "anonymous_function") or
+            std.mem.eql(u8, k, "arrow_function"))
+        {
+            return n.childByFieldName("body");
+        }
+    }
+    return null;
+}
+
+/// DFS `scope` for the latest `$var = ...` assignment that lexically precedes
+/// `before_byte`, recording the winning `assignment_expression` node into
+/// `best`. "Latest before the call" approximates the value live at the call.
+fn findLatestAssignment(
+    scope: ts.Node,
+    source: []const u8,
+    var_name: []const u8,
+    before_byte: u32,
+    best: *?ts.Node,
+    best_byte: *u32,
+) void {
+    if (std.mem.eql(u8, scope.kind(), "assignment_expression")) {
+        if (scope.childByFieldName("left")) |lhs| {
+            if (std.mem.eql(u8, lhs.kind(), "variable_name") and
+                std.mem.eql(u8, getNodeText(source, lhs), var_name))
+            {
+                const b = scope.startByte();
+                if (b < before_byte and (best.* == null or b > best_byte.*)) {
+                    best.* = scope;
+                    best_byte.* = b;
+                }
+            }
+        }
+    }
+    var i: u32 = 0;
+    while (i < scope.namedChildCount()) : (i += 1) {
+        if (scope.namedChild(i)) |child| {
+            findLatestAssignment(child, source, var_name, before_byte, best, best_byte);
+        }
+    }
+}
+
+/// Map an assignment RHS node kind to a stable diagnostic label.
+fn rhsKindLabel(kind: []const u8) []const u8 {
+    if (std.mem.eql(u8, kind, "member_call_expression") or
+        std.mem.eql(u8, kind, "nullsafe_member_call_expression")) return "rhs:member_call";
+    if (std.mem.eql(u8, kind, "scoped_call_expression")) return "rhs:static_call";
+    if (std.mem.eql(u8, kind, "function_call_expression")) return "rhs:func_call";
+    if (std.mem.eql(u8, kind, "object_creation_expression")) return "rhs:new";
+    if (std.mem.eql(u8, kind, "variable_name")) return "rhs:var_alias";
+    if (std.mem.eql(u8, kind, "member_access_expression")) return "rhs:property";
+    if (std.mem.eql(u8, kind, "subscript_expression")) return "rhs:subscript";
+    if (std.mem.eql(u8, kind, "conditional_expression")) return "rhs:ternary";
+    if (std.mem.eql(u8, kind, "cast_expression")) return "rhs:cast";
+    if (std.mem.eql(u8, kind, "parenthesized_expression")) return "rhs:paren";
+    if (std.mem.eql(u8, kind, "binary_expression")) return "rhs:binary";
+    if (std.mem.eql(u8, kind, "clone_expression")) return "rhs:clone";
+    if (std.mem.eql(u8, kind, "match_expression")) return "rhs:match";
+    return "rhs:other";
+}
+
+/// The value `variable_name` node of a `foreach_statement`. namedChild(0) is the
+/// iterable; namedChild(1) is the binding: a bare `variable_name` (`as $v`), a
+/// `pair` (`as $k => $v`, value is its 2nd child), or a `by_ref` wrapper
+/// (`as &$v`). Returns null for list destructuring (`as [$a, $b]`).
+fn foreachValueVar(node: ts.Node) ?ts.Node {
+    const bind = node.namedChild(1) orelse return null;
+    const k = bind.kind();
+    if (std.mem.eql(u8, k, "variable_name")) return bind;
+    if (std.mem.eql(u8, k, "by_ref")) {
+        const inner = bind.namedChild(0) orelse return null;
+        return if (std.mem.eql(u8, inner.kind(), "variable_name")) inner else null;
+    }
+    if (std.mem.eql(u8, k, "pair")) {
+        const v = bind.namedChild(1) orelse return null;
+        if (std.mem.eql(u8, v.kind(), "variable_name")) return v;
+        if (std.mem.eql(u8, v.kind(), "by_ref")) {
+            const inner = v.namedChild(0) orelse return null;
+            return if (std.mem.eql(u8, inner.kind(), "variable_name")) inner else null;
+        }
+        return null;
+    }
+    return null;
 }
 
 fn escapeForDot(allocator: std.mem.Allocator, str: []const u8) ![]const u8 {
@@ -1381,37 +1829,37 @@ pub const CalledBeforeAnalyzer = struct {
     }
 
     /// Output analysis result as text
-    pub fn toText(self: *CalledBeforeAnalyzer, result: CalledBeforeResult, before_fn: []const u8, after_fn: []const u8, file: std.fs.File) !void {
+    pub fn toText(self: *CalledBeforeAnalyzer, result: CalledBeforeResult, before_fn: []const u8, after_fn: []const u8, file: std.Io.File) !void {
         // Extract short names for display
         const before_short = extractShortName(before_fn);
         const after_short = extractShortName(after_fn);
 
         // Header with box drawing
-        try file.writeAll("\n");
-        try file.writeAll("╔══════════════════════════════════════════════════════════════════════════════╗\n");
-        try file.writeAll("║                         CALLED-BEFORE ANALYSIS                               ║\n");
-        try file.writeAll("╚══════════════════════════════════════════════════════════════════════════════╝\n\n");
+        try file.writeStreamingAll(types.io, "\n");
+        try file.writeStreamingAll(types.io, "╔══════════════════════════════════════════════════════════════════════════════╗\n");
+        try file.writeStreamingAll(types.io, "║                         CALLED-BEFORE ANALYSIS                               ║\n");
+        try file.writeStreamingAll(types.io, "╚══════════════════════════════════════════════════════════════════════════════╝\n\n");
 
         // Constraint info
-        try file.writeAll("  Constraint:\n");
+        try file.writeStreamingAll(types.io, "  Constraint:\n");
         const before_msg = try std.fmt.allocPrint(self.allocator, "    {s}\n", .{before_fn});
         defer self.allocator.free(before_msg);
-        try file.writeAll(before_msg);
-        try file.writeAll("    must be called before\n");
+        try file.writeStreamingAll(types.io, before_msg);
+        try file.writeStreamingAll(types.io, "    must be called before\n");
         const after_msg = try std.fmt.allocPrint(self.allocator, "    {s}\n\n", .{after_fn});
         defer self.allocator.free(after_msg);
-        try file.writeAll(after_msg);
+        try file.writeStreamingAll(types.io, after_msg);
 
         // Result summary
         if (result.satisfied) {
-            try file.writeAll("  Result: ✓ SATISFIED\n\n");
+            try file.writeStreamingAll(types.io, "  Result: ✓ SATISFIED\n\n");
         } else {
-            try file.writeAll("  Result: ✗ VIOLATED\n\n");
+            try file.writeStreamingAll(types.io, "  Result: ✗ VIOLATED\n\n");
         }
 
         // Violations section
         if (result.violations.len > 0) {
-            try file.writeAll("┌──────────────────────────────────────────────────────────────────────────────┐\n");
+            try file.writeStreamingAll(types.io, "┌──────────────────────────────────────────────────────────────────────────────┐\n");
             const violations_header = try std.fmt.allocPrint(
                 self.allocator,
                 "│  VIOLATIONS ({d})                                                              │\n",
@@ -1419,19 +1867,19 @@ pub const CalledBeforeAnalyzer = struct {
             );
             defer self.allocator.free(violations_header);
             // Truncate and pad to fit
-            try file.writeAll(try self.formatBoxLine(violations_header));
-            try file.writeAll("└──────────────────────────────────────────────────────────────────────────────┘\n\n");
+            try file.writeStreamingAll(types.io, try self.formatBoxLine(violations_header));
+            try file.writeStreamingAll(types.io, "└──────────────────────────────────────────────────────────────────────────────┘\n\n");
 
             for (result.violations, 0..) |violation, i| {
                 // Violation number
                 const num_msg = try std.fmt.allocPrint(self.allocator, "  [{d}] {s}\n", .{ i + 1, violation.context_function });
                 defer self.allocator.free(num_msg);
-                try file.writeAll(num_msg);
+                try file.writeStreamingAll(types.io, num_msg);
 
                 // File location
                 const loc_msg = try std.fmt.allocPrint(self.allocator, "      File: {s}:{d}\n", .{ violation.file_path, violation.after_line });
                 defer self.allocator.free(loc_msg);
-                try file.writeAll(loc_msg);
+                try file.writeStreamingAll(types.io, loc_msg);
 
                 // Issue description
                 switch (violation.kind) {
@@ -1442,7 +1890,7 @@ pub const CalledBeforeAnalyzer = struct {
                             .{ after_short, violation.after_line, before_short, violation.before_line orelse 0 },
                         );
                         defer self.allocator.free(order_msg);
-                        try file.writeAll(order_msg);
+                        try file.writeStreamingAll(types.io, order_msg);
                     },
                     .missing_before => {
                         const missing_msg = try std.fmt.allocPrint(
@@ -1451,16 +1899,16 @@ pub const CalledBeforeAnalyzer = struct {
                             .{ before_short, after_short },
                         );
                         defer self.allocator.free(missing_msg);
-                        try file.writeAll(missing_msg);
+                        try file.writeStreamingAll(types.io, missing_msg);
                     },
                     .conditional_before => {
-                        try file.writeAll("      Issue: Before call may not execute on all paths\n");
+                        try file.writeStreamingAll(types.io, "      Issue: Before call may not execute on all paths\n");
                     },
                 }
 
                 // Show call paths missing the before call
                 if (violation.missing_before_paths.len > 0) {
-                    try file.writeAll("\n      Call paths missing the before call:\n");
+                    try file.writeStreamingAll(types.io, "\n      Call paths missing the before call:\n");
                     for (violation.missing_before_paths) |path| {
                         const path_msg = try std.fmt.allocPrint(
                             self.allocator,
@@ -1468,18 +1916,18 @@ pub const CalledBeforeAnalyzer = struct {
                             .{ path.caller, path.call_line, path.file_path },
                         );
                         defer self.allocator.free(path_msg);
-                        try file.writeAll(path_msg);
+                        try file.writeStreamingAll(types.io, path_msg);
                     }
                 }
 
-                try file.writeAll("\n");
+                try file.writeStreamingAll(types.io, "\n");
             }
         }
 
         // Summary statistics
-        try file.writeAll("┌──────────────────────────────────────────────────────────────────────────────┐\n");
-        try file.writeAll("│  SUMMARY                                                                     │\n");
-        try file.writeAll("└──────────────────────────────────────────────────────────────────────────────┘\n\n");
+        try file.writeStreamingAll(types.io, "┌──────────────────────────────────────────────────────────────────────────────┐\n");
+        try file.writeStreamingAll(types.io, "│  SUMMARY                                                                     │\n");
+        try file.writeStreamingAll(types.io, "└──────────────────────────────────────────────────────────────────────────────┘\n\n");
 
         const summary_msg = try std.fmt.allocPrint(
             self.allocator,
@@ -1487,17 +1935,17 @@ pub const CalledBeforeAnalyzer = struct {
             .{ result.satisfied_in.len, result.matches.len, result.violations.len },
         );
         defer self.allocator.free(summary_msg);
-        try file.writeAll(summary_msg);
+        try file.writeStreamingAll(types.io, summary_msg);
 
         // Satisfied functions list (collapsed by default - just show count)
         if (result.satisfied_in.len > 0) {
-            try file.writeAll("  Satisfied in:\n");
+            try file.writeStreamingAll(types.io, "  Satisfied in:\n");
             for (result.satisfied_in) |fn_name| {
                 const msg = try std.fmt.allocPrint(self.allocator, "    ✓ {s}\n", .{fn_name});
                 defer self.allocator.free(msg);
-                try file.writeAll(msg);
+                try file.writeStreamingAll(types.io, msg);
             }
-            try file.writeAll("\n");
+            try file.writeStreamingAll(types.io, "\n");
         }
     }
 

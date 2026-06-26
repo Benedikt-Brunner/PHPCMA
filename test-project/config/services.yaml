@@ -1,0 +1,11 @@
+# Symfony-style DI config. Exercised by PHPCMA's Phase B DI-aware resolution:
+# the NotifierInterface has two in-project implementors (EmailNotifier and
+# SmsNotifier), so the interface-typed call in SignupService::register is
+# ambiguous to static analysis. This binding tells the analyzer which concrete
+# the container injects, so the call resolves to SmsNotifier::send.
+services:
+    _defaults:
+        autowire: true
+        autoconfigure: true
+
+    Test\Notify\NotifierInterface: '@Test\Notify\SmsNotifier'
