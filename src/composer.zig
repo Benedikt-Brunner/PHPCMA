@@ -283,11 +283,23 @@ fn walkDirectoryInternal(
     // Limit recursion depth to prevent runaway traversal
     if (depth > 50) return;
 
-    // Cycle detection on the literal path (depth limit above bounds recursion).
-    if (visited.contains(dir_path)) return;
-    try visited.put(try allocator.dupe(u8, dir_path), {});
+    // Cycle detection on the canonical (symlink-resolved) path so that symlink
+    // loops (e.g. `src/sub/loop -> src`) are caught even though their literal
+    // paths differ at each level. Falls back to the literal path if the real
+    // path cannot be resolved.
+    var real_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_path = blk: {
+        const n = std.Io.Dir.cwd().realPathFile(types.io, dir_path, &real_path_buf) catch
+            break :blk dir_path;
+        break :blk real_path_buf[0..n];
+    };
+    if (visited.contains(real_path)) return;
+    try visited.put(try allocator.dupe(u8, real_path), {});
 
-    var dir = std.Io.Dir.openDirAbsolute(types.io, dir_path, .{ .iterate = true }) catch |err| {
+    var dir = (if (std.fs.path.isAbsolute(dir_path))
+        std.Io.Dir.openDirAbsolute(types.io, dir_path, .{ .iterate = true })
+    else
+        std.Io.Dir.cwd().openDir(types.io, dir_path, .{ .iterate = true })) catch |err| {
         // Directory might not exist, skip it
         if (err == error.FileNotFound) return;
         return err;
@@ -466,6 +478,13 @@ pub fn getProjectInfo(allocator: std.mem.Allocator, composer_path: []const u8) !
 // Printing
 // ============================================================================
 
+/// Parse a composer.json given a path relative to the current working
+/// directory. `parseComposerJson` already resolves paths cwd-relative, so this
+/// is a thin convenience wrapper used primarily by tests.
+fn parseComposerJsonRelative(allocator: std.mem.Allocator, rel_path: []const u8) ComposerError!ProjectConfig {
+    return parseComposerJson(allocator, rel_path);
+}
+
 pub fn printConfig(config: *const ProjectConfig, file: std.Io.File) !void {
     const allocator = config.allocator;
 
@@ -520,6 +539,260 @@ pub fn printConfig(config: *const ProjectConfig, file: std.Io.File) !void {
             try file.writeStreamingAll(types.io, path_msg);
         }
     }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn writeFile(dir: std.Io.Dir, sub_path: []const u8, content: []const u8) !void {
+    if (std.fs.path.dirname(sub_path)) |parent| {
+        dir.createDirPath(types.io, parent) catch |err| {
+            if (err != error.PathAlreadyExists) return err;
+        };
+    }
+    const f = try dir.createFile(types.io, sub_path, .{});
+    defer f.close(types.io);
+    try f.writeStreamingAll(types.io, content);
+}
+
+fn tmpDirAbsPath(tmp: *std.testing.TmpDir, allocator: std.mem.Allocator) ![]const u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(types.io, &buf);
+    return allocator.dupe(u8, buf[0..n]);
+}
+
+test "PSR-4 single path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(tmp.dir, "composer.json",
+        \\{"autoload":{"psr-4":{"App\\":"src/"}}}
+    );
+
+    const abs = try tmpDirAbsPath(&tmp, allocator);
+    const composer_path = try std.fs.path.join(allocator, &.{ abs, "composer.json" });
+
+    var config = try parseComposerJson(allocator, composer_path);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), config.autoload_psr4.count());
+    const paths = config.autoload_psr4.get("App\\").?;
+    try std.testing.expectEqual(@as(usize, 1), paths.len);
+    try std.testing.expect(std.mem.endsWith(u8, paths[0], "src/"));
+}
+
+test "PSR-4 array paths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(tmp.dir, "composer.json",
+        \\{"autoload":{"psr-4":{"App\\":["src/","lib/"]}}}
+    );
+
+    const abs = try tmpDirAbsPath(&tmp, allocator);
+    const composer_path = try std.fs.path.join(allocator, &.{ abs, "composer.json" });
+
+    var config = try parseComposerJson(allocator, composer_path);
+    defer config.deinit();
+
+    const paths = config.autoload_psr4.get("App\\").?;
+    try std.testing.expectEqual(@as(usize, 2), paths.len);
+    try std.testing.expect(std.mem.endsWith(u8, paths[0], "src/"));
+    try std.testing.expect(std.mem.endsWith(u8, paths[1], "lib/"));
+}
+
+test "PSR-4 with autoload-dev" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(tmp.dir, "composer.json",
+        \\{"autoload":{"psr-4":{"App\\":"src/"}},"autoload-dev":{"psr-4":{"Tests\\":"tests/"}}}
+    );
+
+    const abs = try tmpDirAbsPath(&tmp, allocator);
+    const composer_path = try std.fs.path.join(allocator, &.{ abs, "composer.json" });
+
+    var config = try parseComposerJson(allocator, composer_path);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), config.autoload_psr4.count());
+    try std.testing.expect(config.autoload_psr4.get("App\\") != null);
+    try std.testing.expect(config.autoload_psr4.get("Tests\\") != null);
+}
+
+test "classmap autoload" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(tmp.dir, "composer.json",
+        \\{"autoload":{"classmap":["database/","legacy/"]}}
+    );
+
+    const abs = try tmpDirAbsPath(&tmp, allocator);
+    const composer_path = try std.fs.path.join(allocator, &.{ abs, "composer.json" });
+
+    var config = try parseComposerJson(allocator, composer_path);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), config.autoload_classmap.len);
+    try std.testing.expect(std.mem.endsWith(u8, config.autoload_classmap[0], "database/"));
+    try std.testing.expect(std.mem.endsWith(u8, config.autoload_classmap[1], "legacy/"));
+}
+
+test "files autoload" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(tmp.dir, "composer.json",
+        \\{"autoload":{"files":["helpers.php","bootstrap.php"]}}
+    );
+
+    const abs = try tmpDirAbsPath(&tmp, allocator);
+    const composer_path = try std.fs.path.join(allocator, &.{ abs, "composer.json" });
+
+    var config = try parseComposerJson(allocator, composer_path);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), config.autoload_files.len);
+    try std.testing.expect(std.mem.endsWith(u8, config.autoload_files[0], "helpers.php"));
+    try std.testing.expect(std.mem.endsWith(u8, config.autoload_files[1], "bootstrap.php"));
+}
+
+test "missing autoload does not crash" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(tmp.dir, "composer.json",
+        \\{"name":"vendor/pkg","description":"no autoload"}
+    );
+
+    const abs = try tmpDirAbsPath(&tmp, allocator);
+    const composer_path = try std.fs.path.join(allocator, &.{ abs, "composer.json" });
+
+    var config = try parseComposerJson(allocator, composer_path);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), config.autoload_psr4.count());
+    try std.testing.expectEqual(@as(usize, 0), config.autoload_files.len);
+    try std.testing.expectEqual(@as(usize, 0), config.autoload_classmap.len);
+}
+
+test "invalid JSON returns error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(tmp.dir, "composer.json", "{ not valid json !!!");
+
+    const abs = try tmpDirAbsPath(&tmp, allocator);
+    const composer_path = try std.fs.path.join(allocator, &.{ abs, "composer.json" });
+
+    const result = parseComposerJson(allocator, composer_path);
+    try std.testing.expectError(ComposerError.InvalidJson, result);
+}
+
+test "file not found returns error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const result = parseComposerJson(allocator, "/nonexistent/path/composer.json");
+    try std.testing.expectError(ComposerError.FileNotFound, result);
+}
+
+test "file discovery on test-project finds all 15 PHP files" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var config = try parseComposerJsonRelative(allocator, "test-project/composer.json");
+    defer config.deinit();
+
+    const files = try discoverFiles(allocator, &config);
+
+    try std.testing.expectEqual(@as(usize, 15), files.len);
+
+    for (files) |f| {
+        try std.testing.expect(std.mem.endsWith(u8, f, ".php"));
+    }
+}
+
+test "skip .unit.php and .integration.php files" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(tmp.dir, "composer.json",
+        \\{"autoload":{"psr-4":{"App\\":"src/"}}}
+    );
+    try tmp.dir.createDirPath(types.io, "src");
+    try writeFile(tmp.dir, "src/Service.php", "<?php class Service {}");
+    try writeFile(tmp.dir, "src/Service.unit.php", "<?php // unit test");
+    try writeFile(tmp.dir, "src/Service.integration.php", "<?php // integration test");
+
+    const abs = try tmpDirAbsPath(&tmp, allocator);
+    const composer_path = try std.fs.path.join(allocator, &.{ abs, "composer.json" });
+
+    var config = try parseComposerJson(allocator, composer_path);
+    defer config.deinit();
+
+    const files = try discoverFiles(allocator, &config);
+
+    try std.testing.expectEqual(@as(usize, 1), files.len);
+    try std.testing.expect(std.mem.endsWith(u8, files[0], "Service.php"));
+    try std.testing.expect(!std.mem.endsWith(u8, files[0], ".unit.php"));
+}
+
+test "symlink cycle handling" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(tmp.dir, "composer.json",
+        \\{"autoload":{"psr-4":{"App\\":"src/"}}}
+    );
+    try tmp.dir.createDirPath(types.io, "src/sub");
+    try writeFile(tmp.dir, "src/Foo.php", "<?php class Foo {}");
+    try writeFile(tmp.dir, "src/sub/Bar.php", "<?php class Bar {}");
+
+    const abs = try tmpDirAbsPath(&tmp, allocator);
+    const src_abs = try std.fs.path.join(allocator, &.{ abs, "src" });
+    tmp.dir.symLink(types.io, src_abs, "src/sub/loop", .{ .is_directory = true }) catch {
+        return;
+    };
+
+    const composer_path = try std.fs.path.join(allocator, &.{ abs, "composer.json" });
+
+    var config = try parseComposerJson(allocator, composer_path);
+    defer config.deinit();
+
+    const files = try discoverFiles(allocator, &config);
+
+    try std.testing.expectEqual(@as(usize, 2), files.len);
 }
 
 // ============================================================================

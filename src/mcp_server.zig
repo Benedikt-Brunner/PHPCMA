@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const mcp = @import("mcp");
+const tree_sitter = @import("tree-sitter");
 
 const types = @import("types.zig");
 const composer = @import("composer.zig");
@@ -30,6 +31,13 @@ const call_analyzer = @import("call_analyzer.zig");
 const boundary_analyzer = @import("boundary_analyzer.zig");
 const references_mod = @import("references.zig");
 const symbol_table_mod = @import("symbol_table.zig");
+const dead_code = @import("dead_code.zig");
+const return_type_checker = @import("return_type_checker.zig");
+const null_safety = @import("null_safety.zig");
+const type_violation_analyzer = @import("type_violation_analyzer.zig");
+const report_mod = @import("report.zig");
+
+extern fn tree_sitter_php() callconv(.c) *tree_sitter.Language;
 
 const ProjectConfig = types.ProjectConfig;
 const ProjectIndex = project_index.ProjectIndex;
@@ -299,6 +307,90 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, default_project: []const u8) !voi
             .openWorldHint = false,
         },
         .handler = checkConformanceHandler,
+        .user_data = &state,
+    });
+
+    try server.addTool(.{
+        .name = "check_dead",
+        .description = check_dead_tool_description,
+        .inputSchema = try buildCheckDeadSchema(sa),
+        .annotations = .{
+            .readOnlyHint = true,
+            .destructiveHint = false,
+            .idempotentHint = true,
+            .openWorldHint = false,
+        },
+        .handler = checkDeadHandler,
+        .user_data = &state,
+    });
+
+    try server.addTool(.{
+        .name = "check_types",
+        .description = check_types_tool_description,
+        .inputSchema = try buildCheckTypesSchema(sa),
+        .annotations = .{
+            .readOnlyHint = true,
+            .destructiveHint = false,
+            .idempotentHint = true,
+            .openWorldHint = false,
+        },
+        .handler = checkTypesHandler,
+        .user_data = &state,
+    });
+
+    try server.addTool(.{
+        .name = "check_boundaries",
+        .description = check_boundaries_tool_description,
+        .inputSchema = try buildCheckBoundariesSchema(sa),
+        .annotations = .{
+            .readOnlyHint = true,
+            .destructiveHint = false,
+            .idempotentHint = true,
+            .openWorldHint = false,
+        },
+        .handler = checkBoundariesHandler,
+        .user_data = &state,
+    });
+
+    try server.addTool(.{
+        .name = "null_safety",
+        .description = null_safety_tool_description,
+        .inputSchema = try buildNullSafetySchema(sa),
+        .annotations = .{
+            .readOnlyHint = true,
+            .destructiveHint = false,
+            .idempotentHint = true,
+            .openWorldHint = false,
+        },
+        .handler = nullSafetyHandler,
+        .user_data = &state,
+    });
+
+    try server.addTool(.{
+        .name = "return_types",
+        .description = return_types_tool_description,
+        .inputSchema = try buildReturnTypesSchema(sa),
+        .annotations = .{
+            .readOnlyHint = true,
+            .destructiveHint = false,
+            .idempotentHint = true,
+            .openWorldHint = false,
+        },
+        .handler = returnTypesHandler,
+        .user_data = &state,
+    });
+
+    try server.addTool(.{
+        .name = "report",
+        .description = report_tool_description,
+        .inputSchema = try buildReportSchema(sa),
+        .annotations = .{
+            .readOnlyHint = true,
+            .destructiveHint = false,
+            .idempotentHint = true,
+            .openWorldHint = false,
+        },
+        .handler = reportHandler,
         .user_data = &state,
     });
 
@@ -3392,6 +3484,20 @@ fn buildPrimingPayload(allocator: std.mem.Allocator, state: *McpState) ![]const 
         \\  Flags missing methods, arity/param/return type mismatches, return
         \\  nullability widening, and visibility narrowing against the interfaces
         \\  it implements and the abstract methods it inherits.
+        \\- `check_dead`: whole-program dead-code (liveness) sweep from roots over
+        \\  the resolved call graph. Trust-gated: a low resolution_rate inflates
+        \\  false positives (`caveats.kept_alive_by_unresolved`).
+        \\- `check_types`: cross-project type violations at resolved call sites
+        \\  (arg type/count, return, visibility, interface mismatches).
+        \\- `check_boundaries`: monorepo boundary verdict — total/cross/same-project
+        \\  call counts, exposed API surface, per-pair dependency edges.
+        \\- `null_safety`: intraprocedural nullable-dereference check (guarded vs
+        \\  unguarded); heuristic, precision tracks the resolved type graph.
+        \\- `return_types`: verifies returned values against declared return types
+        \\  via each method's CFG; unresolved returns count as uncertain, not failed.
+        \\- `report`: unified project health report (coverage, type-check tallies,
+        \\  dead code, confidence distribution, violations) — same JSON as the
+        \\  `report` CLI command.
         \\
         \\## Query grammar (the `query` tool's `query` argument)
         \\A JSON object: `{start, traverse?, where?, select?, limit?}`
@@ -4738,4 +4844,979 @@ test "check_conformance: __call downgrades missing to info" {
     try testing.expect(std.mem.indexOf(u8, out, "\"missing\":0") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"info\":1") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"severity\":\"info\"") != null);
+}
+
+// ============================================================================
+// Analyzer tools — thin MCP wrappers over the loaded ProjectIndex.
+//
+// Each handler builds the relevant analyzer directly on `lp.index` (no
+// re-parse, no re-collection): the index already carries the symbol table,
+// resolved inheritance view, framework stubs, DI bindings, and call graph that
+// `buildDerived` produced. Results echo the same trust metadata the other MCP
+// tools expose (resolution rate, is_test) so a low-resolution graph is never
+// mistaken for a clean bill of health.
+// ============================================================================
+
+/// Parse an optional `limit` argument, clamped to [1, cb_list_cap].
+fn parseListLimit(arguments: ?std.json.Value) usize {
+    const n = mcp.tools.getInteger(arguments, "limit") orelse return cb_list_cap;
+    if (n < 1) return 1;
+    if (n > cb_list_cap) return cb_list_cap;
+    return @intCast(n);
+}
+
+// ---------------------------------------------------------------------------
+// check_dead
+// ---------------------------------------------------------------------------
+
+const check_dead_tool_description =
+    \\Whole-program dead-code (liveness) analysis: mark-and-sweep from the
+    \\project's roots (entrypoints, public API, framework hooks) over the
+    \\resolved call graph, then report symbols nothing reaches.
+    \\
+    \\By default only *private* dead methods/properties are listed (public ones
+    \\may be called from outside the analyzed set); pass `include_public` to
+    \\widen. Dead classes/interfaces/traits/functions are always listed.
+    \\
+    \\CRITICAL: dead-code is only as trustworthy as the call graph. Unresolved
+    \\calls cannot keep a symbol alive, so a low `caveats.resolution_rate`
+    \\inflates false positives. `caveats.kept_alive_by_unresolved` counts
+    \\symbols conservatively spared because something unresolved might reach
+    \\them. Treat results as candidates to verify, not a delete list.
+    \\
+    \\Args: `exclude_tests` (default true), `include_public` (default false),
+    \\`limit`. Call `load_project` first.
+;
+
+fn buildCheckDeadSchema(a: std.mem.Allocator) !mcp.types.InputSchema {
+    var builder = mcp.schema.InputSchemaBuilder.init(a);
+    _ = try builder.addBooleanWithDefault(a, "exclude_tests", "Drop dead symbols declared in test files (default true).", true, false);
+    _ = try builder.addBooleanWithDefault(a, "include_public", "Also list dead public methods/properties, not just private ones (default false).", false, false);
+    _ = try builder.addInteger(a, "limit", "Cap the dead-symbol list (default 200, max 200).", false);
+    return builder.toInputSchema(a);
+}
+
+fn checkDeadHandler(
+    user_data: ?*anyopaque,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    arguments: ?std.json.Value,
+) mcp.tools.ToolError!mcp.tools.ToolResult {
+    _ = io;
+    const state: *McpState = @ptrCast(@alignCast(user_data.?));
+    const lp = state.loaded orelse return mcp.tools.errorResult(
+        allocator,
+        "No project loaded. Call `load_project` first.",
+    ) catch return error.OutOfMemory;
+
+    const exclude_tests = mcp.tools.getBoolean(arguments, "exclude_tests") orelse true;
+    const include_public = mcp.tools.getBoolean(arguments, "include_public") orelse false;
+    const limit = parseListLimit(arguments);
+
+    const payload = renderCheckDead(allocator, lp.index, exclude_tests, include_public, limit) catch return error.OutOfMemory;
+    return mcp.tools.textResult(allocator, payload) catch return error.OutOfMemory;
+}
+
+fn renderCheckDead(
+    a: std.mem.Allocator,
+    index: *ProjectIndex,
+    exclude_tests: bool,
+    include_public: bool,
+    limit: usize,
+) ![]const u8 {
+    const st = &index.sym_table;
+
+    const refs = try dead_code.extractRefsFromCallGraph(a, &index.call_graph, st);
+    var graph = dead_code.ProjectLivenessGraph.init(a);
+    try graph.analyze(st, refs);
+    const dead = try graph.collectDead(st);
+
+    var counts = [_]usize{0} ** 6; // class, interface, trait, function, method, property
+    for (dead) |d| counts[@intFromEnum(d.kind)] += 1;
+
+    var kept_alive: usize = 0;
+    const total = graph.index.count();
+    var sid: dead_code.SymbolId = 0;
+    while (sid < total) : (sid += 1) {
+        if (graph.isWeaklyAlive(sid)) kept_alive += 1;
+    }
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    const w = &buf;
+
+    try w.appendSlice(a, "{\"summary\":{");
+    try w.print(a, "\"dead_total\":{d},\"dead_classes\":{d},\"dead_interfaces\":{d},\"dead_traits\":{d},\"dead_functions\":{d},\"dead_methods\":{d},\"dead_properties\":{d}", .{
+        dead.len, counts[0], counts[1], counts[2], counts[3], counts[4], counts[5],
+    });
+    try w.appendSlice(a, "},\"caveats\":{");
+    try w.print(a, "\"resolution_rate\":{d:.1},\"kept_alive_by_unresolved\":{d},\"exclude_tests\":{s}", .{
+        index.call_graph.getResolutionRate(),
+        kept_alive,
+        if (exclude_tests) "true" else "false",
+    });
+    try w.appendSlice(a,
+        ",\"note\":\"Dead = unreachable from roots over the RESOLVED call graph. A low resolution_rate inflates false positives; verify before deleting.\"}");
+
+    try w.appendSlice(a, ",\"dead\":[");
+    var shown: usize = 0;
+    var matched: usize = 0;
+    var truncated = false;
+    for (dead) |d| {
+        const is_test = query.isTestFile(d.file_path);
+        if (exclude_tests and is_test) continue;
+        // Visibility filter: by default only private methods/properties surface.
+        if (!include_public) {
+            switch (d.kind) {
+                .method => {
+                    const vis = dead_code.ProjectLivenessGraph.getMethodVisibility(d.fqn, st);
+                    if (vis != .private) continue;
+                },
+                .property => {
+                    const owner = if (std.mem.indexOf(u8, d.fqn, "::")) |sep| d.fqn[0..sep] else continue;
+                    const raw = d.fqn[(std.mem.indexOf(u8, d.fqn, "::") orelse continue) + 2 ..];
+                    const pname = if (raw.len > 0 and raw[0] == '$') raw[1..] else raw;
+                    if (st.classes.get(owner)) |class| {
+                        if (class.properties.get(pname)) |prop| {
+                            if (prop.visibility != .private) continue;
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+        matched += 1;
+        if (shown >= limit or buf.items.len >= response_byte_budget) {
+            truncated = true;
+            continue;
+        }
+        if (shown != 0) try w.appendSlice(a, ",");
+        try w.appendSlice(a, "{\"fqn\":");
+        try appendJson(a, w, d.fqn);
+        try w.appendSlice(a, ",\"kind\":");
+        try appendJson(a, w, @tagName(d.kind));
+        try w.appendSlice(a, ",\"file\":");
+        try appendJson(a, w, d.file_path);
+        try w.print(a, ",\"line\":{d},\"is_test\":{s}", .{ d.line, if (is_test) "true" else "false" });
+        try w.appendSlice(a, "}");
+        shown += 1;
+    }
+    try w.appendSlice(a, "]");
+    try w.print(a, ",\"dead_listed\":{d}", .{matched});
+    if (truncated) try w.appendSlice(a, ",\"dead_truncated\":true");
+    try w.appendSlice(a, "}");
+    return buf.items;
+}
+
+// ---------------------------------------------------------------------------
+// check_types
+// ---------------------------------------------------------------------------
+
+const check_types_tool_description =
+    \\Cross-project type-violation check at resolved call sites: argument
+    \\type/count mismatches, return-type and visibility violations, and
+    \\interface mismatches where one package calls another.
+    \\
+    \\Only *resolved* cross-project calls are inspected; unresolved calls are
+    \\invisible (see `caveats.resolution_rate`). Args:
+    \\  min_confidence: float (default 0.0) — skip call sites whose resolution
+    \\                  confidence is below this.
+    \\  strict: bool (default false) — treat warnings as significant.
+    \\  interface_scope: "all" | "cross-project" (default "all").
+    \\  limit: cap the violations list.
+    \\Call `load_project` first.
+;
+
+fn buildCheckTypesSchema(a: std.mem.Allocator) !mcp.types.InputSchema {
+    var builder = mcp.schema.InputSchemaBuilder.init(a);
+    _ = try builder.addNumberWithDefault(a, "min_confidence", "Skip call sites below this resolution confidence (0.0-1.0, default 0.0).", 0.0, false);
+    _ = try builder.addBooleanWithDefault(a, "strict", "Treat warnings as significant (default false).", false, false);
+    _ = try builder.addEnumWithDefault(a, "interface_scope", "Which interface calls to check.", &.{ "all", "cross-project" }, "all", false);
+    _ = try builder.addInteger(a, "limit", "Cap the violations list (default 200, max 200).", false);
+    return builder.toInputSchema(a);
+}
+
+fn checkTypesHandler(
+    user_data: ?*anyopaque,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    arguments: ?std.json.Value,
+) mcp.tools.ToolError!mcp.tools.ToolResult {
+    _ = io;
+    const state: *McpState = @ptrCast(@alignCast(user_data.?));
+    const lp = state.loaded orelse return mcp.tools.errorResult(
+        allocator,
+        "No project loaded. Call `load_project` first.",
+    ) catch return error.OutOfMemory;
+
+    const min_conf: f32 = @floatCast(mcp.tools.getFloat(arguments, "min_confidence") orelse 0.0);
+    const strict = mcp.tools.getBoolean(arguments, "strict") orelse false;
+    const scope: type_violation_analyzer.InterfaceScope = blk: {
+        const s = mcp.tools.getString(arguments, "interface_scope") orelse break :blk .all;
+        if (std.mem.eql(u8, s, "cross-project")) break :blk .cross_project;
+        break :blk .all;
+    };
+    const limit = parseListLimit(arguments);
+
+    const payload = renderCheckTypes(allocator, lp.index, min_conf, strict, scope, limit) catch return error.OutOfMemory;
+    return mcp.tools.textResult(allocator, payload) catch return error.OutOfMemory;
+}
+
+fn typeViolationKindName(k: type_violation_analyzer.ViolationKind) []const u8 {
+    return switch (k) {
+        .wrong_argument_type => "wrong_argument_type",
+        .wrong_argument_count => "wrong_argument_count",
+        .wrong_return_type => "wrong_return_type",
+        .visibility_violation => "visibility_violation",
+        .interface_mismatch => "interface_mismatch",
+        .breaking_change => "breaking_change",
+    };
+}
+
+fn typeViolationSeverityName(s: type_violation_analyzer.ViolationSeverity) []const u8 {
+    return switch (s) {
+        .error_level => "error",
+        .warning => "warning",
+        .info => "info",
+    };
+}
+
+fn renderCheckTypes(
+    a: std.mem.Allocator,
+    index: *ProjectIndex,
+    min_confidence: f32,
+    strict: bool,
+    scope: type_violation_analyzer.InterfaceScope,
+    limit: usize,
+) ![]const u8 {
+    var analyzer = type_violation_analyzer.TypeViolationAnalyzer.init(
+        a,
+        &index.call_graph,
+        index.project_configs,
+        &index.sym_table,
+    );
+    analyzer.min_confidence = min_confidence;
+    analyzer.strict = strict;
+    analyzer.interface_scope = scope;
+    const result = try analyzer.analyze();
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    const w = &buf;
+
+    try w.appendSlice(a, "{\"summary\":{");
+    try w.print(a, "\"cross_project_calls\":{d},\"violations\":{d},\"errors\":{d},\"warnings\":{d},\"breaking_changes\":{d}", .{
+        result.total_cross_project_calls, result.total_violations, result.error_count, result.warning_count, result.breaking_changes.len,
+    });
+    try w.appendSlice(a, "},\"caveats\":{");
+    try w.print(a, "\"resolution_rate\":{d:.1}", .{index.call_graph.getResolutionRate()});
+    try w.appendSlice(a,
+        ",\"note\":\"Only resolved cross-project calls are checked; unresolved calls are invisible here.\"}");
+
+    try w.appendSlice(a, ",\"violations\":[");
+    var shown: usize = 0;
+    var truncated = false;
+    for (result.violations) |v| {
+        if (shown >= limit or buf.items.len >= response_byte_budget) {
+            truncated = true;
+            break;
+        }
+        if (shown != 0) try w.appendSlice(a, ",");
+        try w.appendSlice(a, "{\"kind\":");
+        try appendJson(a, w, typeViolationKindName(v.kind));
+        try w.appendSlice(a, ",\"severity\":");
+        try appendJson(a, w, typeViolationSeverityName(v.severity));
+        try w.appendSlice(a, ",\"caller\":");
+        try appendJson(a, w, v.caller_fqn);
+        try w.appendSlice(a, ",\"callee\":");
+        try appendJson(a, w, v.callee_fqn);
+        try w.appendSlice(a, ",\"caller_project\":");
+        try appendJson(a, w, v.caller_project);
+        try w.appendSlice(a, ",\"callee_project\":");
+        try appendJson(a, w, v.callee_project);
+        try w.appendSlice(a, ",\"file\":");
+        try appendJson(a, w, v.file_path);
+        try w.print(a, ",\"line\":{d}", .{v.line});
+        try w.appendSlice(a, ",\"message\":");
+        try appendJson(a, w, v.message);
+        if (v.expected_type) |t| {
+            try w.appendSlice(a, ",\"expected\":");
+            try appendJson(a, w, t);
+        }
+        if (v.actual_type) |t| {
+            try w.appendSlice(a, ",\"actual\":");
+            try appendJson(a, w, t);
+        }
+        try w.appendSlice(a, "}");
+        shown += 1;
+    }
+    try w.appendSlice(a, "]");
+    if (truncated) try w.appendSlice(a, ",\"violations_truncated\":true");
+    try w.appendSlice(a, "}");
+    return buf.items;
+}
+
+// ---------------------------------------------------------------------------
+// check_boundaries
+// ---------------------------------------------------------------------------
+
+const check_boundaries_tool_description =
+    \\Cross-project boundary report for a monorepo: total/cross/same-project
+    \\call counts, the number of public API methods one package exposes to
+    \\another, and the per-pair dependency edges. The boundary verdict that
+    \\sits behind the more granular `dependencies` tool.
+    \\
+    \\Only resolved calls are attributed to a callee project, so cross-package
+    \\counts are a LOWER BOUND (see `caveats.unresolved_calls`). `exclude_tests`
+    \\(default true) drops cross-project calls whose caller is a test file.
+    \\Requires a multi-project `.phpcma.json`. Call `load_project` first.
+;
+
+fn buildCheckBoundariesSchema(a: std.mem.Allocator) !mcp.types.InputSchema {
+    var builder = mcp.schema.InputSchemaBuilder.init(a);
+    _ = try builder.addBooleanWithDefault(a, "exclude_tests", "Drop cross-project calls whose caller is a test file (default true).", true, false);
+    _ = try builder.addInteger(a, "limit", "Cap the dependency-edge list (default 200, max 200).", false);
+    return builder.toInputSchema(a);
+}
+
+fn checkBoundariesHandler(
+    user_data: ?*anyopaque,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    arguments: ?std.json.Value,
+) mcp.tools.ToolError!mcp.tools.ToolResult {
+    _ = io;
+    const state: *McpState = @ptrCast(@alignCast(user_data.?));
+    const lp = state.loaded orelse return mcp.tools.errorResult(
+        allocator,
+        "No project loaded. Call `load_project` first.",
+    ) catch return error.OutOfMemory;
+
+    const exclude_tests = mcp.tools.getBoolean(arguments, "exclude_tests") orelse true;
+    const limit = parseListLimit(arguments);
+
+    var analyzer = boundary_analyzer.BoundaryAnalyzer.init(
+        allocator,
+        &lp.index.call_graph,
+        lp.index.project_configs,
+        &lp.index.sym_table,
+    );
+    const result = analyzer.analyze(.{ .exclude_tests = exclude_tests }) catch return error.OutOfMemory;
+
+    const payload = renderCheckBoundaries(allocator, result, exclude_tests, limit, lp.index) catch return error.OutOfMemory;
+    return mcp.tools.textResult(allocator, payload) catch return error.OutOfMemory;
+}
+
+fn renderCheckBoundaries(
+    a: std.mem.Allocator,
+    r: boundary_analyzer.BoundaryResult,
+    exclude_tests: bool,
+    limit: usize,
+    index: *ProjectIndex,
+) ![]const u8 {
+    const ShortName = boundary_analyzer.BoundaryAnalyzer.shortProjectName;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    const w = &buf;
+
+    try w.appendSlice(a, "{\"summary\":{");
+    try w.print(a, "\"projects\":{d},\"total_calls\":{d},\"cross_package_calls\":{d},\"same_project_calls\":{d},\"api_methods_exposed\":{d},\"dependency_edges\":{d}", .{
+        r.project_count, r.total_calls, r.cross_project_calls, r.same_project_calls, r.api_surface.len, r.dependencies.len,
+    });
+    try w.appendSlice(a, "},\"caveats\":{");
+    try w.print(a, "\"unresolved_calls\":{d},\"resolution_rate\":{d:.1},\"exclude_tests\":{s},\"tests_excluded\":{d}", .{
+        r.unresolved_calls,
+        index.call_graph.getResolutionRate(),
+        if (exclude_tests) "true" else "false",
+        r.tests_excluded,
+    });
+    try w.appendSlice(a,
+        ",\"note\":\"Only resolved calls are attributed; cross_package_calls is a lower bound (see caveats.unresolved_calls).\"}");
+
+    try w.appendSlice(a, ",\"dependencies\":[");
+    var shown: usize = 0;
+    var truncated = false;
+    for (r.dependencies) |d| {
+        if (shown >= limit or buf.items.len >= response_byte_budget) {
+            truncated = true;
+            break;
+        }
+        if (shown != 0) try w.appendSlice(a, ",");
+        try w.appendSlice(a, "{\"from\":");
+        try appendJson(a, w, ShortName(d.from_project));
+        try w.appendSlice(a, ",\"to\":");
+        try appendJson(a, w, ShortName(d.to_project));
+        try w.print(a, ",\"call_count\":{d}", .{d.call_count});
+        try w.appendSlice(a, "}");
+        shown += 1;
+    }
+    try w.appendSlice(a, "]");
+    if (truncated) try w.appendSlice(a, ",\"dependencies_truncated\":true");
+    try w.appendSlice(a, "}");
+    return buf.items;
+}
+
+// ---------------------------------------------------------------------------
+// null_safety
+// ---------------------------------------------------------------------------
+
+const null_safety_tool_description =
+    \\Intraprocedural null-safety analysis: flags dereferences (`->`, `[]`) of
+    \\values that may be null without a preceding guard, and counts guarded vs
+    \\unguarded accesses across the project.
+    \\
+    \\This is a heuristic, type-directed pass — its precision depends on the
+    \\resolved type graph, so prefer running it after the project loads cleanly
+    \\(stubs + DI active). `definite` = null on all paths; `possible` = nullable
+    \\with some unguarded path. Args: `exclude_tests` (default true), `limit`.
+    \\Call `load_project` first.
+;
+
+fn buildNullSafetySchema(a: std.mem.Allocator) !mcp.types.InputSchema {
+    var builder = mcp.schema.InputSchemaBuilder.init(a);
+    _ = try builder.addBooleanWithDefault(a, "exclude_tests", "Drop violations in test files (default true).", true, false);
+    _ = try builder.addInteger(a, "limit", "Cap the violations list (default 200, max 200).", false);
+    return builder.toInputSchema(a);
+}
+
+fn nullSafetyHandler(
+    user_data: ?*anyopaque,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    arguments: ?std.json.Value,
+) mcp.tools.ToolError!mcp.tools.ToolResult {
+    _ = io;
+    const state: *McpState = @ptrCast(@alignCast(user_data.?));
+    const lp = state.loaded orelse return mcp.tools.errorResult(
+        allocator,
+        "No project loaded. Call `load_project` first.",
+    ) catch return error.OutOfMemory;
+
+    const exclude_tests = mcp.tools.getBoolean(arguments, "exclude_tests") orelse true;
+    const limit = parseListLimit(arguments);
+
+    const payload = renderNullSafety(allocator, lp.index, exclude_tests, limit) catch return error.OutOfMemory;
+    return mcp.tools.textResult(allocator, payload) catch return error.OutOfMemory;
+}
+
+fn nullSeverityName(s: null_safety.NullSeverity) []const u8 {
+    return switch (s) {
+        .definite => "definite",
+        .possible => "possible",
+        .guarded => "guarded",
+    };
+}
+
+fn nullAccessName(k: null_safety.NullViolation.AccessKind) []const u8 {
+    return switch (k) {
+        .method_call => "method_call",
+        .property_access => "property_access",
+        .array_access => "array_access",
+        .return_use => "return_use",
+    };
+}
+
+const NullViolationRow = struct {
+    file: []const u8,
+    line: u32,
+    severity: null_safety.NullSeverity,
+    access: null_safety.NullViolation.AccessKind,
+    variable: []const u8,
+    message: []const u8,
+    is_test: bool,
+};
+
+fn renderNullSafety(
+    a: std.mem.Allocator,
+    index: *ProjectIndex,
+    exclude_tests: bool,
+    limit: usize,
+) ![]const u8 {
+    const lang = tree_sitter_php();
+    var total_guarded: u32 = 0;
+    var total_unguarded: u32 = 0;
+    var files_analyzed: usize = 0;
+    var rows: std.ArrayListUnmanaged(NullViolationRow) = .empty;
+
+    for (index.file_order) |path| {
+        const unit = index.files.get(path) orelse continue;
+        const file_ctx = index.file_contexts.getPtr(path) orelse continue;
+        const is_test = query.isTestFile(path);
+        if (exclude_tests and is_test) continue;
+
+        var analyzer = null_safety.NullSafetyAnalyzer.init(a, &index.sym_table, file_ctx, lang);
+        const result = analyzer.analyzeFile(unit.tree, unit.source) catch continue;
+        files_analyzed += 1;
+        total_guarded += result.guarded_accesses;
+        total_unguarded += result.unguarded_accesses;
+
+        for (result.violations) |v| {
+            if (v.severity == .guarded) continue;
+            try rows.append(a, .{
+                .file = path,
+                .line = v.line,
+                .severity = v.severity,
+                .access = v.access_kind,
+                .variable = v.variable,
+                .message = v.message,
+                .is_test = is_test,
+            });
+        }
+    }
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    const w = &buf;
+
+    try w.appendSlice(a, "{\"summary\":{");
+    try w.print(a, "\"files_analyzed\":{d},\"guarded_accesses\":{d},\"unguarded_accesses\":{d},\"violations\":{d}", .{
+        files_analyzed, total_guarded, total_unguarded, rows.items.len,
+    });
+    try w.appendSlice(a, "},\"caveats\":{");
+    try w.print(a, "\"resolution_rate\":{d:.1}", .{index.call_graph.getResolutionRate()});
+    try w.appendSlice(a,
+        ",\"note\":\"Heuristic intraprocedural analysis; precision depends on the resolved type graph.\"}");
+
+    try w.appendSlice(a, ",\"violations\":[");
+    var shown: usize = 0;
+    var truncated = false;
+    for (rows.items) |row| {
+        if (shown >= limit or buf.items.len >= response_byte_budget) {
+            truncated = true;
+            break;
+        }
+        if (shown != 0) try w.appendSlice(a, ",");
+        try w.appendSlice(a, "{\"file\":");
+        try appendJson(a, w, row.file);
+        try w.print(a, ",\"line\":{d}", .{row.line});
+        try w.appendSlice(a, ",\"severity\":");
+        try appendJson(a, w, nullSeverityName(row.severity));
+        try w.appendSlice(a, ",\"access\":");
+        try appendJson(a, w, nullAccessName(row.access));
+        try w.appendSlice(a, ",\"variable\":");
+        try appendJson(a, w, row.variable);
+        try w.appendSlice(a, ",\"message\":");
+        try appendJson(a, w, row.message);
+        try w.print(a, ",\"is_test\":{s}", .{if (row.is_test) "true" else "false"});
+        try w.appendSlice(a, "}");
+        shown += 1;
+    }
+    try w.appendSlice(a, "]");
+    if (truncated) try w.appendSlice(a, ",\"violations_truncated\":true");
+    try w.appendSlice(a, "}");
+    return buf.items;
+}
+
+// ---------------------------------------------------------------------------
+// return_types
+// ---------------------------------------------------------------------------
+
+const return_types_tool_description =
+    \\Return-type conformance check: walks each method's control-flow graph and
+    \\verifies returned values against the declared return type — flagging
+    \\mismatches, missing returns, `null` returned from a non-nullable type, and
+    \\values returned from `void`.
+    \\
+    \\Graph-quality sensitive: a return whose type cannot be resolved is counted
+    \\`uncertain`, not failed (so a low resolution rate suppresses, never
+    \\fabricates, findings). Args: `exclude_tests` (default true), `limit`.
+    \\Call `load_project` first.
+;
+
+fn buildReturnTypesSchema(a: std.mem.Allocator) !mcp.types.InputSchema {
+    var builder = mcp.schema.InputSchemaBuilder.init(a);
+    _ = try builder.addBooleanWithDefault(a, "exclude_tests", "Drop diagnostics in test files (default true).", true, false);
+    _ = try builder.addInteger(a, "limit", "Cap the diagnostics list (default 200, max 200).", false);
+    return builder.toInputSchema(a);
+}
+
+fn returnTypesHandler(
+    user_data: ?*anyopaque,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    arguments: ?std.json.Value,
+) mcp.tools.ToolError!mcp.tools.ToolResult {
+    _ = io;
+    const state: *McpState = @ptrCast(@alignCast(user_data.?));
+    const lp = state.loaded orelse return mcp.tools.errorResult(
+        allocator,
+        "No project loaded. Call `load_project` first.",
+    ) catch return error.OutOfMemory;
+
+    const exclude_tests = mcp.tools.getBoolean(arguments, "exclude_tests") orelse true;
+    const limit = parseListLimit(arguments);
+
+    const payload = renderReturnTypes(allocator, lp.index, exclude_tests, limit) catch return error.OutOfMemory;
+    return mcp.tools.textResult(allocator, payload) catch return error.OutOfMemory;
+}
+
+fn returnTypeKindName(k: return_type_checker.Diagnostic.Kind) []const u8 {
+    return switch (k) {
+        .return_type_mismatch => "return_type_mismatch",
+        .missing_return => "missing_return",
+        .return_null_non_nullable => "return_null_non_nullable",
+        .void_with_value => "void_with_value",
+    };
+}
+
+fn runReturnTypeChecker(index: *ProjectIndex, checker: *return_type_checker.ReturnTypeChecker) !void {
+    var class_it = index.sym_table.classes.iterator();
+    while (class_it.next()) |entry| {
+        const class = entry.value_ptr;
+        var method_it = class.methods.iterator();
+        while (method_it.next()) |m_entry| {
+            const method = m_entry.value_ptr;
+            const unit = index.files.get(method.file_path) orelse continue;
+            try checker.analyzeMethod(method, class.fqcn, unit.source, unit.tree);
+        }
+    }
+}
+
+fn renderReturnTypes(
+    a: std.mem.Allocator,
+    index: *ProjectIndex,
+    exclude_tests: bool,
+    limit: usize,
+) ![]const u8 {
+    const lang = tree_sitter_php();
+    var checker = return_type_checker.ReturnTypeChecker.init(a, &index.sym_table, lang);
+    try runReturnTypeChecker(index, &checker);
+    const result = checker.result();
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    const w = &buf;
+
+    try w.appendSlice(a, "{\"summary\":{");
+    try w.print(a, "\"methods_analyzed\":{d},\"methods_verified\":{d},\"methods_uncertain\":{d},\"diagnostics\":{d}", .{
+        result.methods_analyzed, result.methods_verified, result.methods_uncertain, result.diagnostics.len,
+    });
+    try w.appendSlice(a, "},\"caveats\":{");
+    try w.print(a, "\"resolution_rate\":{d:.1}", .{index.call_graph.getResolutionRate()});
+    try w.appendSlice(a,
+        ",\"note\":\"Unresolvable return types count as uncertain, not failed; a low resolution_rate suppresses findings rather than fabricating them.\"}");
+
+    try w.appendSlice(a, ",\"diagnostics\":[");
+    var shown: usize = 0;
+    var truncated = false;
+    for (result.diagnostics) |d| {
+        const is_test = query.isTestFile(d.file_path);
+        if (exclude_tests and is_test) continue;
+        if (shown >= limit or buf.items.len >= response_byte_budget) {
+            truncated = true;
+            continue;
+        }
+        if (shown != 0) try w.appendSlice(a, ",");
+        try w.appendSlice(a, "{\"kind\":");
+        try appendJson(a, w, returnTypeKindName(d.kind));
+        try w.appendSlice(a, ",\"class\":");
+        try appendJson(a, w, d.class_name);
+        try w.appendSlice(a, ",\"method\":");
+        try appendJson(a, w, d.method_name);
+        try w.appendSlice(a, ",\"file\":");
+        try appendJson(a, w, d.file_path);
+        try w.print(a, ",\"line\":{d}", .{d.line});
+        try w.appendSlice(a, ",\"declared\":");
+        try appendJson(a, w, d.declared_type);
+        try w.appendSlice(a, ",\"actual\":");
+        try appendJson(a, w, d.actual_type);
+        try w.print(a, ",\"is_test\":{s}", .{if (is_test) "true" else "false"});
+        try w.appendSlice(a, "}");
+        shown += 1;
+    }
+    try w.appendSlice(a, "]");
+    if (truncated) try w.appendSlice(a, ",\"diagnostics_truncated\":true");
+    try w.appendSlice(a, "}");
+    return buf.items;
+}
+
+// ---------------------------------------------------------------------------
+// report
+// ---------------------------------------------------------------------------
+
+const report_tool_description =
+    \\Unified project health report (the MCP equivalent of the `report` CLI
+    \\command): coverage + resolution rate, type-check tallies (interface
+    \\compliance, call-site args, property/return types, null safety), dead-code
+    \\counts with top candidates, call-confidence distribution, and a violation
+    \\list. JSON output is byte-identical to `phpcma report --format json`.
+    \\
+    \\This rolls up the return-type, null-safety, and dead-code passes in one
+    \\call; read `coverage.resolution_rate` before trusting any tally. Call
+    \\`load_project` first.
+;
+
+fn buildReportSchema(a: std.mem.Allocator) !mcp.types.InputSchema {
+    var builder = mcp.schema.InputSchemaBuilder.init(a);
+    return builder.toInputSchema(a);
+}
+
+fn reportHandler(
+    user_data: ?*anyopaque,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    arguments: ?std.json.Value,
+) mcp.tools.ToolError!mcp.tools.ToolResult {
+    _ = io;
+    _ = arguments;
+    const state: *McpState = @ptrCast(@alignCast(user_data.?));
+    const lp = state.loaded orelse return mcp.tools.errorResult(
+        allocator,
+        "No project loaded. Call `load_project` first.",
+    ) catch return error.OutOfMemory;
+
+    const payload = renderReport(allocator, lp.index) catch return error.OutOfMemory;
+    return mcp.tools.textResult(allocator, payload) catch return error.OutOfMemory;
+}
+
+fn renderReport(a: std.mem.Allocator, index: *ProjectIndex) ![]const u8 {
+    const st = &index.sym_table;
+    const lang = tree_sitter_php();
+
+    var unified = report_mod.UnifiedReport.init(a);
+    unified.populate(st, &index.call_graph);
+    unified.coverage.total_files = index.file_order.len;
+
+    // Return-type pass.
+    var rt_checker = return_type_checker.ReturnTypeChecker.init(a, st, lang);
+    try runReturnTypeChecker(index, &rt_checker);
+    const rt_result = rt_checker.result();
+    unified.type_checks.return_types.pass += rt_result.methods_verified;
+    unified.type_checks.return_types.fail += rt_result.diagnostics.len;
+    unified.type_checks.return_types.unchecked += rt_result.methods_uncertain;
+    for (rt_result.diagnostics) |diag| {
+        try unified.addViolation(.{
+            .severity = .warning,
+            .category = "return-type-mismatch",
+            .file_path = diag.file_path,
+            .line = diag.line,
+            .message = try diag.format(a),
+        });
+    }
+
+    // Null-safety pass.
+    var total_guarded: u32 = 0;
+    var total_unguarded: u32 = 0;
+    for (index.file_order) |path| {
+        const unit = index.files.get(path) orelse continue;
+        const file_ctx = index.file_contexts.getPtr(path) orelse continue;
+        var analyzer = null_safety.NullSafetyAnalyzer.init(a, st, file_ctx, lang);
+        const ns = analyzer.analyzeFile(unit.tree, unit.source) catch continue;
+        total_guarded += ns.guarded_accesses;
+        total_unguarded += ns.unguarded_accesses;
+        for (ns.violations) |v| {
+            const severity: report_mod.Violation.Severity = switch (v.severity) {
+                .definite => .err,
+                .possible => .warning,
+                .guarded => .note,
+            };
+            try unified.addViolation(.{
+                .severity = severity,
+                .category = "null-safety",
+                .file_path = path,
+                .line = v.line,
+                .message = v.message,
+            });
+        }
+    }
+    unified.type_checks.null_safety.pass = total_guarded;
+    unified.type_checks.null_safety.fail = total_unguarded;
+    unified.type_checks.null_safety.unchecked = 0;
+
+    // Dead-code pass.
+    const refs = try dead_code.extractRefsFromCallGraph(a, &index.call_graph, st);
+    var graph = dead_code.ProjectLivenessGraph.init(a);
+    try graph.analyze(st, refs);
+    const dead = try graph.collectDead(st);
+    for (dead) |d| {
+        switch (d.kind) {
+            .class => unified.dead_code.dead_classes += 1,
+            .interface => unified.dead_code.dead_interfaces += 1,
+            .trait => unified.dead_code.dead_traits += 1,
+            .function => unified.dead_code.dead_functions += 1,
+            .method => {
+                unified.dead_code.dead_methods += 1;
+                const vis = dead_code.ProjectLivenessGraph.getMethodVisibility(d.fqn, st);
+                if (vis == .private) {
+                    unified.dead_code.dead_methods_private += 1;
+                } else {
+                    unified.dead_code.dead_methods_public += 1;
+                }
+            },
+            .property => unified.dead_code.dead_properties += 1,
+        }
+        if (unified.dead_code.top_dead_candidates.items.len < 50) {
+            try unified.dead_code.top_dead_candidates.append(a, .{
+                .fqn = d.fqn,
+                .kind = @tagName(d.kind),
+                .file_path = d.file_path,
+                .line = d.line,
+            });
+        }
+    }
+    const dc_total = graph.index.count();
+    var sid: dead_code.SymbolId = 0;
+    while (sid < dc_total) : (sid += 1) {
+        if (graph.isWeaklyAlive(sid)) unified.dead_code.kept_alive_by_unresolved += 1;
+    }
+
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try unified.writeJson(&aw.writer);
+    return aw.written();
+}
+
+// ============================================================================
+// Analyzer tool tests
+// ============================================================================
+
+test "check_dead: unreferenced class surfaces, referenced one does not" {
+    const gpa = testing.allocator;
+    const idx = try project_index.createInMemoryForTest(gpa, &.{
+        .{ "/p/Entry.php",
+            \\<?php
+            \\namespace App;
+            \\class Entry {
+            \\    public function run(): void { (new Used())->go(); }
+            \\}
+        },
+        .{ "/p/Used.php",
+            \\<?php
+            \\namespace App;
+            \\class Used { public function go(): void {} }
+        },
+        .{ "/p/Orphan.php",
+            \\<?php
+            \\namespace App;
+            \\class Orphan { public function lonely(): void {} }
+        },
+    });
+    defer idx.destroy();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const out = try renderCheckDead(a, idx, true, false, 200);
+    try testing.expect(std.mem.indexOf(u8, out, "App\\\\Orphan") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"resolution_rate\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "kept_alive_by_unresolved") != null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, out, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value == .object);
+}
+
+test "check_types: single project has no cross-project violations" {
+    const gpa = testing.allocator;
+    const idx = try project_index.createInMemoryForTest(gpa, &.{
+        .{ "/p/A.php",
+            \\<?php
+            \\namespace App;
+            \\class A { public function m(int $x): void {} }
+        },
+    });
+    defer idx.destroy();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const out = try renderCheckTypes(a, idx, 0.0, false, .all, 200);
+    try testing.expect(std.mem.indexOf(u8, out, "\"cross_project_calls\":0") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"violations\":[]") != null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, out, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value == .object);
+}
+
+test "check_boundaries: cross-package edge is reported" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const idx = try twoProjectIndexForRenderTest(gpa, a);
+    defer idx.destroy();
+
+    var analyzer = boundary_analyzer.BoundaryAnalyzer.init(a, &idx.call_graph, idx.project_configs, &idx.sym_table);
+    const result = try analyzer.analyze(.{ .exclude_tests = true });
+    const out = try renderCheckBoundaries(a, result, true, 200, idx);
+    try testing.expect(std.mem.indexOf(u8, out, "\"projects\":2") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"cross_package_calls\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"from\":\"a\",\"to\":\"b\"") != null or
+        std.mem.indexOf(u8, out, "\"from\":\"b\",\"to\":\"a\"") != null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, out, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value == .object);
+}
+
+test "return_types: missing return is diagnosed" {
+    const gpa = testing.allocator;
+    const idx = try project_index.createInMemoryForTest(gpa, &.{
+        .{ "/p/Bad.php",
+            \\<?php
+            \\namespace App;
+            \\class Bad {
+            \\    public function noReturn(): int { $x = 1; }
+            \\}
+        },
+    });
+    defer idx.destroy();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const out = try renderReturnTypes(a, idx, true, 200);
+    try testing.expect(std.mem.indexOf(u8, out, "\"methods_analyzed\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "App\\\\Bad") != null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, out, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value == .object);
+}
+
+test "null_safety: renders summary and valid JSON" {
+    const gpa = testing.allocator;
+    const idx = try project_index.createInMemoryForTest(gpa, &.{
+        .{ "/p/Svc.php",
+            \\<?php
+            \\namespace App;
+            \\class Svc {
+            \\    public function run(?Svc $s): void { $s->run(null); }
+            \\}
+        },
+    });
+    defer idx.destroy();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const out = try renderNullSafety(a, idx, true, 200);
+    try testing.expect(std.mem.indexOf(u8, out, "\"files_analyzed\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"guarded_accesses\"") != null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, out, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value == .object);
+}
+
+test "report: emits canonical unified report JSON" {
+    const gpa = testing.allocator;
+    const idx = try project_index.createInMemoryForTest(gpa, &.{
+        .{ "/p/A.php",
+            \\<?php
+            \\namespace App;
+            \\class A {
+            \\    public function run(): void { (new A())->run(); }
+            \\}
+        },
+    });
+    defer idx.destroy();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const out = try renderReport(a, idx);
+    try testing.expect(std.mem.indexOf(u8, out, "\"coverage\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"type_checks\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"dead_code\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"resolution_rate\"") != null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, out, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value == .object);
 }

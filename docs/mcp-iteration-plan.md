@@ -372,3 +372,51 @@ the DI container, not the type system. Phase B reads that config.
 Milestone 0 (0.1 → 0.2 → 0.3 → 0.4) first — small, independent, trust-critical.
 Then Milestone 1, then Milestone 2. Each goal: implement → `zig build test` →
 update `scripts/mcp_smoke.sh` where the surface changed.
+
+---
+
+## Post-merge integration (Phase 2–4): analyzer tools over the unified index
+
+After merging the upstream analysis engine into the MCP branch, the index
+pipeline was unified (Phase 2) and the remaining CLI analyzers were exposed as
+MCP tools (Phase 3), then wired into the repo's workflows (Phase 4).
+
+**Phase 2 — one index path.** `ProjectIndex.buildDerived` now injects the
+framework API stub catalog (`framework_stubs.registerFrameworkStubs`) and builds
+the legacy inheritance view (`SymbolTable.resolveInheritance`, populating
+`ClassSymbol.all_methods`/`all_properties`) alongside the Tier‑2 `ResolvedView`.
+One index feeds both the MCP tools and the CLI; MCP gains framework‑stub +
+DI‑aware resolution for free. A `register_stubs` flag keeps the pure in‑memory
+call‑graph unit tests stub‑free for deterministic counts. (Parallelism is *not*
+folded into `ProjectIndex` yet — behavior first, parallelism second.)
+
+**Phase 3 — analyzers as MCP tools.** Six thin handlers were added to
+[`src/mcp_server.zig`](../src/mcp_server.zig), each building its analyzer
+directly on the loaded `ProjectIndex` (no re‑parse) and rendering JSON with the
+same trust metadata the other tools expose (`resolution_rate`, `is_test`,
+explicit caveats):
+
+- `check_dead` — whole‑program liveness sweep (`dead_code`); caveats surface
+  `resolution_rate` and `kept_alive_by_unresolved` so a low‑resolution graph is
+  never mistaken for a delete list.
+- `check_types` — cross‑project type violations at resolved call sites
+  (`type_violation_analyzer`).
+- `check_boundaries` — monorepo boundary verdict (`boundary_analyzer`): totals,
+  exposed API surface, per‑pair dependency edges.
+- `null_safety` — intraprocedural nullable‑dereference check (`null_safety`).
+- `return_types` — CFG‑based return‑type conformance (`return_type_checker`);
+  unresolved returns count as *uncertain*, never *failed*.
+- `report` — unified health report (`report.UnifiedReport`). `report.zig` gained
+  a writer‑based `writeJson` so the MCP payload is **byte‑identical** to
+  `phpcma report --format json` (the Phase‑4 golden check).
+
+The graph‑quality‑sensitive tools (`null_safety`, `return_types`, `report`) are
+deliberately the last to land, after stubs + DI resolution are active, per the
+correctness gate (*a confidently‑wrong answer is the worst outcome*).
+
+**Phase 4 — workflows.** `scripts/mcp_smoke.sh` drives all sixteen tools over a
+stdio session and golden‑checks `report` == CLI `report --format json`. It is in
+the [AGENTS.md](../AGENTS.md) commit gate and runs as the `mcp-smoke` CI job
+(`.github/workflows/ci.yml`). Bug fixed en route: a use‑after‑free in
+`framework_stubs` (stub method `parameters` slices pointed at stack‑temporary
+array literals) — made `comptime` so they get static lifetime.

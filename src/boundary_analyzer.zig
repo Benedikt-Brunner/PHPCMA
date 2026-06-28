@@ -3,6 +3,7 @@ const types = @import("types.zig");
 const call_analyzer = @import("call_analyzer.zig");
 const symbol_table = @import("symbol_table.zig");
 const query = @import("query.zig");
+const json_util = @import("json_util.zig");
 
 const ProjectConfig = types.ProjectConfig;
 const ProjectCallGraph = call_analyzer.ProjectCallGraph;
@@ -53,11 +54,20 @@ pub const ProjectDependency = struct {
     call_count: usize,
 };
 
+/// Per-boundary summary (the API methods one project exposes to another).
+pub const BoundarySummary = struct {
+    from_project: []const u8,
+    to_project: []const u8,
+    call_count: usize,
+    api_methods: []const []const u8,
+};
+
 /// Full result of boundary analysis.
 pub const BoundaryResult = struct {
     boundary_calls: []const BoundaryCall,
     api_surface: []const ApiMethod,
     dependencies: []const ProjectDependency,
+    summaries: []const BoundarySummary,
     total_calls: usize,
     cross_project_calls: usize,
     same_project_calls: usize,
@@ -243,6 +253,41 @@ pub const BoundaryAnalyzer = struct {
             }
         }.lt);
 
+        // Build per-boundary summaries (the API methods grouped by project pair).
+        var summaries: std.ArrayListUnmanaged(BoundarySummary) = .empty;
+        var boundary_apis = std.StringHashMap(std.StringHashMap(void)).init(self.allocator);
+        defer {
+            var it2 = boundary_apis.valueIterator();
+            while (it2.next()) |v| v.deinit();
+            boundary_apis.deinit();
+        }
+
+        for (boundary_calls.items) |bc| {
+            const bkey = try std.fmt.allocPrint(self.allocator, "{s}\x00{s}", .{ bc.caller_project, bc.callee_project });
+            const bresult = try boundary_apis.getOrPut(bkey);
+            if (!bresult.found_existing) {
+                bresult.value_ptr.* = std.StringHashMap(void).init(self.allocator);
+            }
+            try bresult.value_ptr.put(bc.callee_fqn, {});
+        }
+
+        for (dependencies.items) |dep| {
+            const bkey = try std.fmt.allocPrint(self.allocator, "{s}\x00{s}", .{ dep.from_project, dep.to_project });
+            var api_methods: std.ArrayListUnmanaged([]const u8) = .empty;
+            if (boundary_apis.get(bkey)) |methods_map| {
+                var m_it = methods_map.keyIterator();
+                while (m_it.next()) |m| {
+                    try api_methods.append(self.allocator, m.*);
+                }
+            }
+            try summaries.append(self.allocator, .{
+                .from_project = dep.from_project,
+                .to_project = dep.to_project,
+                .call_count = dep.call_count,
+                .api_methods = try api_methods.toOwnedSlice(self.allocator),
+            });
+        }
+
         // Count unique projects.
         var project_set = std.StringHashMap(void).init(self.allocator);
         defer project_set.deinit();
@@ -255,6 +300,7 @@ pub const BoundaryAnalyzer = struct {
             .boundary_calls = try boundary_calls.toOwnedSlice(self.allocator),
             .api_surface = try api_surface.toOwnedSlice(self.allocator),
             .dependencies = try dependencies.toOwnedSlice(self.allocator),
+            .summaries = try summaries.toOwnedSlice(self.allocator),
             .total_calls = same_project_count + cross_count,
             .cross_project_calls = cross_count,
             .same_project_calls = same_project_count,
@@ -451,6 +497,186 @@ pub const BoundaryAnalyzer = struct {
         const trimmed = std.mem.trimEnd(u8, root_path, "/");
         if (std.mem.lastIndexOf(u8, trimmed, "/")) |i| return trimmed[i + 1 ..];
         return trimmed;
+    }
+
+    // ========================================================================
+    // Output Formats (used by the `check-boundaries` CLI; the MCP renders its
+    // own JSON from `BoundaryResult`).
+    // ========================================================================
+
+    pub fn toText(_: *const BoundaryAnalyzer, result: *const BoundaryResult, file: std.Io.File) !void {
+        var buf: [4096]u8 = undefined;
+        var w = file.writer(types.io, &buf);
+        const writer = &w.interface;
+
+        try writer.writeAll("Cross-Project Boundary Analysis\n");
+        try writer.writeAll("================================\n\n");
+
+        try writer.print("Projects: {d}\n", .{result.project_count});
+        try writer.print("Total resolved calls: {d}\n", .{result.total_calls});
+        try writer.print("Same-project calls: {d}\n", .{result.same_project_calls});
+        try writer.print("Cross-project calls: {d}\n\n", .{result.cross_project_calls});
+
+        if (result.summaries.len > 0) {
+            try writer.writeAll("Project Dependencies:\n");
+            try writer.writeAll("---------------------\n");
+            for (result.summaries) |summary| {
+                try writer.print("  {s} -> {s} ({d} calls, {d} API methods)\n", .{
+                    shortProjectName(summary.from_project),
+                    shortProjectName(summary.to_project),
+                    summary.call_count,
+                    summary.api_methods.len,
+                });
+                for (summary.api_methods) |method| {
+                    try writer.print("    - {s}\n", .{method});
+                }
+            }
+            try writer.writeAll("\n");
+        }
+
+        if (result.api_surface.len > 0) {
+            try writer.writeAll("Public API Surface (methods used across project boundaries):\n");
+            try writer.writeAll("------------------------------------------------------------\n");
+            for (result.api_surface) |api| {
+                try writer.print("  {s}\n", .{api.fqn});
+                try writer.print("    used by: ", .{});
+                for (api.used_by_projects, 0..) |proj, i| {
+                    if (i > 0) try writer.writeAll(", ");
+                    try writer.print("{s}", .{shortProjectName(proj)});
+                }
+                try writer.writeAll("\n");
+            }
+            try writer.writeAll("\n");
+        }
+
+        if (result.boundary_calls.len > 0) {
+            try writer.writeAll("Cross-Project Calls:\n");
+            try writer.writeAll("--------------------\n");
+            for (result.boundary_calls) |bc| {
+                try writer.print("  {s} -> {s}\n", .{ bc.caller_fqn, bc.callee_fqn });
+                try writer.print("    {s} -> {s} (line {d})\n", .{
+                    shortProjectName(bc.caller_project),
+                    shortProjectName(bc.callee_project),
+                    bc.line,
+                });
+            }
+        }
+
+        try writer.flush();
+    }
+
+    /// Output as DOT graph format (cross-project dependency graph).
+    pub fn toDot(self: *const BoundaryAnalyzer, result: *const BoundaryResult, file: std.Io.File) !void {
+        var buf: [4096]u8 = undefined;
+        var w = file.writer(types.io, &buf);
+        const writer = &w.interface;
+
+        try writer.writeAll("digraph ProjectDependencies {\n");
+        try writer.writeAll("    rankdir=LR;\n");
+        try writer.writeAll("    node [shape=box, fontname=\"Helvetica\", style=filled, fillcolor=\"#e1f5fe\"];\n");
+        try writer.writeAll("    edge [fontname=\"Helvetica\", fontsize=10];\n\n");
+
+        var project_set = std.StringHashMap(void).init(self.allocator);
+        defer project_set.deinit();
+        for (result.dependencies) |dep| {
+            try project_set.put(dep.from_project, {});
+            try project_set.put(dep.to_project, {});
+        }
+
+        var proj_it = project_set.keyIterator();
+        while (proj_it.next()) |proj| {
+            const name = shortProjectName(proj.*);
+            try writer.print("    \"{s}\";\n", .{name});
+        }
+
+        try writer.writeAll("\n");
+
+        for (result.dependencies) |dep| {
+            try writer.print("    \"{s}\" -> \"{s}\" [label=\"{d} calls\"];\n", .{
+                shortProjectName(dep.from_project),
+                shortProjectName(dep.to_project),
+                dep.call_count,
+            });
+        }
+
+        try writer.writeAll("}\n");
+        try writer.flush();
+    }
+
+    /// Output as JSON format.
+    pub fn toJson(_: *const BoundaryAnalyzer, result: *const BoundaryResult, file: std.Io.File) !void {
+        var buf: [4096]u8 = undefined;
+        var w = file.writer(types.io, &buf);
+        const writer = &w.interface;
+
+        try writer.writeAll("{\n");
+
+        try writer.print("  \"projects\": {d},\n", .{result.project_count});
+        try writer.print("  \"total_calls\": {d},\n", .{result.total_calls});
+        try writer.print("  \"same_project_calls\": {d},\n", .{result.same_project_calls});
+        try writer.print("  \"cross_project_calls\": {d},\n", .{result.cross_project_calls});
+
+        try writer.writeAll("  \"dependencies\": [\n");
+        for (result.dependencies, 0..) |dep, i| {
+            try writer.writeAll("    {\n");
+            try writer.writeAll("      \"from\": ");
+            try json_util.writeJsonString(writer, shortProjectName(dep.from_project));
+            try writer.writeAll(",\n      \"to\": ");
+            try json_util.writeJsonString(writer, shortProjectName(dep.to_project));
+            try writer.print(",\n      \"call_count\": {d}\n", .{dep.call_count});
+            if (i < result.dependencies.len - 1) {
+                try writer.writeAll("    },\n");
+            } else {
+                try writer.writeAll("    }\n");
+            }
+        }
+        try writer.writeAll("  ],\n");
+
+        try writer.writeAll("  \"api_surface\": [\n");
+        for (result.api_surface, 0..) |api, i| {
+            try writer.writeAll("    {\n");
+            try writer.writeAll("      \"fqn\": ");
+            try json_util.writeJsonString(writer, api.fqn);
+            try writer.writeAll(",\n      \"class\": ");
+            try json_util.writeJsonString(writer, api.class_fqcn);
+            try writer.writeAll(",\n      \"method\": ");
+            try json_util.writeJsonString(writer, api.method_name);
+            try writer.writeAll(",\n      \"used_by\": [");
+            for (api.used_by_projects, 0..) |proj, j| {
+                if (j > 0) try writer.writeAll(", ");
+                try json_util.writeJsonString(writer, shortProjectName(proj));
+            }
+            try writer.writeAll("]\n");
+            if (i < result.api_surface.len - 1) {
+                try writer.writeAll("    },\n");
+            } else {
+                try writer.writeAll("    }\n");
+            }
+        }
+        try writer.writeAll("  ],\n");
+
+        try writer.writeAll("  \"boundary_calls\": [\n");
+        for (result.boundary_calls, 0..) |bc, i| {
+            try writer.writeAll("    {\n");
+            try writer.writeAll("      \"caller\": ");
+            try json_util.writeJsonString(writer, bc.caller_fqn);
+            try writer.writeAll(",\n      \"callee\": ");
+            try json_util.writeJsonString(writer, bc.callee_fqn);
+            try writer.writeAll(",\n      \"from_project\": ");
+            try json_util.writeJsonString(writer, shortProjectName(bc.caller_project));
+            try writer.writeAll(",\n      \"to_project\": ");
+            try json_util.writeJsonString(writer, shortProjectName(bc.callee_project));
+            try writer.print(",\n      \"line\": {d}\n", .{bc.line});
+            if (i < result.boundary_calls.len - 1) {
+                try writer.writeAll("    },\n");
+            } else {
+                try writer.writeAll("    }\n");
+            }
+        }
+        try writer.writeAll("  ]\n");
+
+        try writer.writeAll("}\n");
+        try writer.flush();
     }
 };
 

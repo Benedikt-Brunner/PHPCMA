@@ -1,0 +1,390 @@
+{
+  "coverage": {
+    "files": 93,
+    "symbols": 156,
+    "classes": 139,
+    "interfaces": 10,
+    "traits": 0,
+    "functions": 7,
+    "methods": 1079,
+    "properties": 51,
+    "resolution_rate": 10.8
+  },
+  "type_checks": {
+    "interface_compliance": {
+      "pass": 249,
+      "fail": 0,
+      "unchecked": 0
+    },
+    "call_site_args": {
+      "pass": 230,
+      "fail": 0,
+      "unchecked": 4007
+    },
+    "property_types": {
+      "pass": 7,
+      "fail": 0,
+      "unchecked": 0
+    },
+    "return_types": {
+      "pass": 112,
+      "fail": 4,
+      "unchecked": 579
+    },
+    "null_safety": {
+      "pass": 1038,
+      "fail": 0,
+      "unchecked": 0
+    }
+  },
+  "dead_code": {
+    "dead_classes": 76,
+    "dead_interfaces": 0,
+    "dead_traits": 0,
+    "dead_functions": 6,
+    "dead_methods": 910,
+    "dead_properties": 51,
+    "kept_alive_by_unresolved": 55,
+    "kept_alive_by_string": 0,
+    "kept_alive_by_structure": 0,
+    "top_dead_candidates": [
+      {
+        "fqn": "Monolog\\Handler\\ZendMonitorHandlerTest",
+        "kind": "class",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/ZendMonitorHandlerTest.php",
+        "line": 14
+      },
+      {
+        "fqn": "Monolog\\Handler\\ZendMonitorHandlerTest::testGetDefaultFormatterReturnsNormalizerFormatter",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/ZendMonitorHandlerTest.php",
+        "line": 71
+      },
+      {
+        "fqn": "Monolog\\Handler\\ZendMonitorHandlerTest::tearDown",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/ZendMonitorHandlerTest.php",
+        "line": 23
+      },
+      {
+        "fqn": "Monolog\\Handler\\ZendMonitorHandlerTest::testWrite",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/ZendMonitorHandlerTest.php",
+        "line": 33
+      },
+      {
+        "fqn": "Monolog\\Handler\\ZendMonitorHandlerTest::setUp",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/ZendMonitorHandlerTest.php",
+        "line": 16
+      },
+      {
+        "fqn": "Monolog\\Handler\\NewRelicHandlerTest",
+        "kind": "class",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/NewRelicHandlerTest.php",
+        "line": 17
+      },
+      {
+        "fqn": "Monolog\\Handler\\NewRelicHandlerTest::testThehandlerCanAddExtraContextAndParamsToTheNewRelicTrace",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/NewRelicHandlerTest.php",
+        "line": 91
+      },
+      {
+        "fqn": "Monolog\\Handler\\NewRelicHandlerTest::testThehandlerCanAddExtraParamsToTheNewRelicTrace",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/NewRelicHandlerTest.php",
+        "line": 66
+      },
+      {
+        "fqn": "Monolog\\Handler\\NewRelicHandlerTest::setUp",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/NewRelicHandlerTest.php",
+        "line": 23
+      },
+      {
+        "fqn": "Monolog\\Handler\\NewRelicHandlerTest::testTheAppNameCanBeOverriddenFromEachLog",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/NewRelicHandlerTest.php",
+        "line": 130
+      },
+      {
+        "fqn": "Monolog\\Handler\\NewRelicHandlerTest::testTheAppNameCanBeInjectedFromtheConstructor",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/NewRelicHandlerTest.php",
+        "line": 122
+      },
+      {
+        "fqn": "Monolog\\Handler\\NewRelicHandlerTest::testThehandlerCanAddContextParamsToTheNewRelicTrace",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/NewRelicHandlerTest.php",
+        "line": 45
+      },
+      {
+        "fqn": "Monolog\\Handler\\NewRelicHandlerTest::testThehandlerThrowsAnExceptionIfTheNRExtensionIsNotLoaded",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/NewRelicHandlerTest.php",
+        "line": 30
+      },
+      {
+        "fqn": "Monolog\\Handler\\NewRelicHandlerTest::testThehandlerCanHandleTheRecordsFormattedUsingTheLineFormatter",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/NewRelicHandlerTest.php",
+        "line": 107
+      },
+      {
+        "fqn": "Monolog\\Handler\\NewRelicHandlerTest::testThehandlerCanHandleTheRecord",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/NewRelicHandlerTest.php",
+        "line": 39
+      },
+      {
+        "fqn": "Monolog\\Handler\\NewRelicHandlerTest::testThehandlerCanAddExplodedExtraParamsToTheNewRelicTrace",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/NewRelicHandlerTest.php",
+        "line": 77
+      },
+      {
+        "fqn": "Monolog\\Handler\\NewRelicHandlerTest::testThehandlerCanAddExplodedContextParamsToTheNewRelicTrace",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/NewRelicHandlerTest.php",
+        "line": 52
+      },
+      {
+        "fqn": "Monolog\\Handler\\NewRelicHandlerTest::testTheAppNameIsNullByDefault",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/NewRelicHandlerTest.php",
+        "line": 114
+      },
+      {
+        "fqn": "Monolog\\Handler\\NewRelicHandlerTest::testTheTransactionNameIsNullByDefault",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/NewRelicHandlerTest.php",
+        "line": 138
+      },
+      {
+        "fqn": "Monolog\\Handler\\NewRelicHandlerTest::testTheTransactionNameCanBeInjectedFromTheConstructor",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/NewRelicHandlerTest.php",
+        "line": 146
+      },
+      {
+        "fqn": "Monolog\\Handler\\NewRelicHandlerTest::testTheTransactionNameCanBeOverriddenFromEachLog",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/NewRelicHandlerTest.php",
+        "line": 154
+      },
+      {
+        "fqn": "Monolog\\Handler\\NewRelicHandlerTest::$appname",
+        "kind": "property",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/NewRelicHandlerTest.php",
+        "line": 19
+      },
+      {
+        "fqn": "Monolog\\Handler\\NewRelicHandlerTest::$customParameters",
+        "kind": "property",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/NewRelicHandlerTest.php",
+        "line": 20
+      },
+      {
+        "fqn": "Monolog\\Handler\\NewRelicHandlerTest::$transactionName",
+        "kind": "property",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/NewRelicHandlerTest.php",
+        "line": 21
+      },
+      {
+        "fqn": "Monolog\\Handler\\FilterHandlerTest",
+        "kind": "class",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/FilterHandlerTest.php",
+        "line": 16
+      },
+      {
+        "fqn": "Monolog\\Handler\\FilterHandlerTest::testHandleEmptyBatch",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/FilterHandlerTest.php",
+        "line": 176
+      },
+      {
+        "fqn": "Monolog\\Handler\\FilterHandlerTest::testIsHandling",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/FilterHandlerTest.php",
+        "line": 21
+      },
+      {
+        "fqn": "Monolog\\Handler\\FilterHandlerTest::testHandleRespectsBubble",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/FilterHandlerTest.php",
+        "line": 127
+      },
+      {
+        "fqn": "Monolog\\Handler\\FilterHandlerTest::testAcceptedLevelApi",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/FilterHandlerTest.php",
+        "line": 83
+      },
+      {
+        "fqn": "Monolog\\Handler\\FilterHandlerTest::testResetTestHandler",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/FilterHandlerTest.php",
+        "line": 188
+      },
+      {
+        "fqn": "Monolog\\Handler\\FilterHandlerTest::testHandleUsesProcessors",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/FilterHandlerTest.php",
+        "line": 107
+      },
+      {
+        "fqn": "Monolog\\Handler\\FilterHandlerTest::testHandleWithCallback",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/FilterHandlerTest.php",
+        "line": 143
+      },
+      {
+        "fqn": "Monolog\\Handler\\FilterHandlerTest::testHandleWithBadCallbackThrowsException",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/FilterHandlerTest.php",
+        "line": 163
+      },
+      {
+        "fqn": "Monolog\\Handler\\FilterHandlerTest::testHandleProcessOnlyNeededLevels",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/FilterHandlerTest.php",
+        "line": 40
+      },
+      {
+        "fqn": "Monolog\\Handler\\Slack\\SlackRecordTest",
+        "kind": "class",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/Slack/SlackRecordTest.php",
+        "line": 18
+      },
+      {
+        "fqn": "Monolog\\Handler\\Slack\\SlackRecordTest::testTextEqualsMessageIfNoAttachment",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/Slack/SlackRecordTest.php",
+        "line": 143
+      },
+      {
+        "fqn": "Monolog\\Handler\\Slack\\SlackRecordTest::testAddsLongAttachmentWithoutContextAndExtra",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/Slack/SlackRecordTest.php",
+        "line": 267
+      },
+      {
+        "fqn": "Monolog\\Handler\\Slack\\SlackRecordTest::testAddsTimestampToAttachment",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/Slack/SlackRecordTest.php",
+        "line": 329
+      },
+      {
+        "fqn": "Monolog\\Handler\\Slack\\SlackRecordTest::testExcludeExtraAndContextFields",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/Slack/SlackRecordTest.php",
+        "line": 348
+      },
+      {
+        "fqn": "Monolog\\Handler\\Slack\\SlackRecordTest::testGetAttachmentColor",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/Slack/SlackRecordTest.php",
+        "line": 35
+      },
+      {
+        "fqn": "Monolog\\Handler\\Slack\\SlackRecordTest::testNoUsernameByDefault",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/Slack/SlackRecordTest.php",
+        "line": 55
+      },
+      {
+        "fqn": "Monolog\\Handler\\Slack\\SlackRecordTest::testMapsLevelToColorAttachmentColor",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/Slack/SlackRecordTest.php",
+        "line": 195
+      },
+      {
+        "fqn": "Monolog\\Handler\\Slack\\SlackRecordTest::testTextEqualsFormatterOutput",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/Slack/SlackRecordTest.php",
+        "line": 153
+      },
+      {
+        "fqn": "Monolog\\Handler\\Slack\\SlackRecordTest::testAddsShortAttachmentWithContextAndExtra",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/Slack/SlackRecordTest.php",
+        "line": 234
+      },
+      {
+        "fqn": "Monolog\\Handler\\Slack\\SlackRecordTest::testContextHasException",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/Slack/SlackRecordTest.php",
+        "line": 340
+      },
+      {
+        "fqn": "Monolog\\Handler\\Slack\\SlackRecordTest::testAddsIcon",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/Slack/SlackRecordTest.php",
+        "line": 110
+      },
+      {
+        "fqn": "Monolog\\Handler\\Slack\\SlackRecordTest::dataStringify",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/Slack/SlackRecordTest.php",
+        "line": 63
+      },
+      {
+        "fqn": "Monolog\\Handler\\Slack\\SlackRecordTest::testNoIcon",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/Slack/SlackRecordTest.php",
+        "line": 102
+      },
+      {
+        "fqn": "Monolog\\Handler\\Slack\\SlackRecordTest::testAddsOneAttachment",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/Slack/SlackRecordTest.php",
+        "line": 133
+      },
+      {
+        "fqn": "Monolog\\Handler\\Slack\\SlackRecordTest::testAddsShortAttachmentWithoutContextAndExtra",
+        "kind": "method",
+        "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/Slack/SlackRecordTest.php",
+        "line": 220
+      }
+    ]
+  },
+  "confidence": {
+    "exact": 8.3,
+    "likely": 2.5,
+    "possible": 0.0,
+    "unresolved": 89.2
+  },
+  "violations": [
+    {
+      "severity": "WARN",
+      "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/ElasticsearchHandlerTest.php",
+      "line": 210,
+      "message": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/ElasticsearchHandlerTest.php:210: return null in non-nullable: Monolog\\Handler\\ElasticsearchHandlerTest::getCreatedDocIdV8 \u2014 declared string|null, got null"
+    },
+    {
+      "severity": "WARN",
+      "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Processor/ClosureContextProcessorTest.php",
+      "line": 66,
+      "message": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Processor/ClosureContextProcessorTest.php:66: missing return: Monolog\\Processor\\ClosureContextProcessorTest::getContexts \u2014 declared iterable, got void"
+    },
+    {
+      "severity": "WARN",
+      "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Formatter/NormalizerFormatterTest.php",
+      "line": 530,
+      "message": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Formatter/NormalizerFormatterTest.php:530: return type mismatch: Monolog\\Formatter\\NormalizerFormatterTest::createDeepTraceException \u2014 declared \\Exception, got \\RuntimeException"
+    },
+    {
+      "severity": "WARN",
+      "file": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/RotatingFileHandlerTest.php",
+      "line": 38,
+      "message": "/var/folders/1j/rtq0wcsn2yn0g8lp0dr29kb00000gn/T/tmp.T95l4MudSt/monolog/tests/Monolog/Handler/RotatingFileHandlerTest.php:38: void method returns value: Monolog\\Handler\\RotatingFileHandlerTest::setUp \u2014 declared void, got bool"
+    }
+  ],
+  "_metadata": {
+    "corpus": "monolog",
+    "snapshot_time": "2026-03-25T10:00:03Z",
+    "duration_seconds": 5.34
+  }
+}

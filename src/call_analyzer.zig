@@ -4,6 +4,7 @@ const types = @import("types.zig");
 const symbol_table = @import("symbol_table.zig");
 const type_resolver = @import("type_resolver.zig");
 const phpdoc = @import("phpdoc.zig");
+const json_util = @import("json_util.zig");
 
 const TypeInfo = types.TypeInfo;
 const ClassSymbol = types.ClassSymbol;
@@ -56,6 +57,12 @@ pub const CallAnalyzer = struct {
 
     pub fn deinit(self: *CallAnalyzer) void {
         self.type_resolver.deinit();
+        // `arg_types` is the only fresh heap the analyzer allocates per call
+        // (via resolveCallArgTypes -> toOwnedSlice). The inner TypeInfo data
+        // points into source/sym_table, so only the outer slice is freed here.
+        for (self.calls.items) |call| {
+            if (call.arg_types.len > 0) self.allocator.free(call.arg_types);
+        }
         self.calls.deinit(self.allocator);
     }
 
@@ -154,7 +161,7 @@ pub const CallAnalyzer = struct {
         // Get class name
         if (node.childByFieldName("name")) |name_node| {
             const class_name = getNodeText(source, name_node);
-            const fqcn = self.type_resolver.file_context.resolveFQCN(class_name);
+            const fqcn = try self.type_resolver.file_context.resolveFQCN(class_name);
             self.current_class = fqcn;
 
             // Set in type resolver
@@ -281,7 +288,7 @@ pub const CallAnalyzer = struct {
             if (node.childByFieldName("type")) |type_list| {
                 if (type_list.namedChildCount() == 1) {
                     if (type_list.namedChild(0)) |type_node| {
-                        const fqcn = self.type_resolver.file_context.resolveFQCN(getNodeText(source, type_node));
+                        const fqcn = try self.type_resolver.file_context.resolveFQCN(getNodeText(source, type_node));
                         const type_info = try TypeInfo.simple(self.allocator, fqcn);
                         const var_name = getNodeText(source, name_node);
                         try scope.setVariableType(var_name, type_info);
@@ -333,7 +340,7 @@ pub const CallAnalyzer = struct {
         if (text.len == 0) return null;
         var info = try phpdoc.parseTypeString(self.allocator, text);
         if ((info.kind == .simple or info.kind == .nullable) and !info.is_builtin) {
-            const resolved = self.type_resolver.file_context.resolveFQCN(info.base_type);
+            const resolved = try self.type_resolver.file_context.resolveFQCN(info.base_type);
             info.base_type = try self.allocator.dupe(u8, resolved);
         }
         return info;
@@ -362,6 +369,8 @@ pub const CallAnalyzer = struct {
             .file_path = self.current_file,
             .arg_count = countCallArgs(node),
             .arg_types = try resolveCallArgTypes(self, node, source),
+            .has_named_args = callHasNamedArgs(node),
+            .is_first_class_callable = callIsFirstClassCallable(node),
             .result_used = detectResultUse(node),
             .resolved_target = null,
             .resolution_confidence = 0.0,
@@ -561,7 +570,7 @@ pub const CallAnalyzer = struct {
                 return;
             }
         } else {
-            fqcn = self.type_resolver.file_context.resolveFQCN(class_name);
+            fqcn = try self.type_resolver.file_context.resolveFQCN(class_name);
         }
 
         var call = EnhancedFunctionCall{
@@ -573,6 +582,8 @@ pub const CallAnalyzer = struct {
             .file_path = self.current_file,
             .arg_count = countCallArgs(node),
             .arg_types = try resolveCallArgTypes(self, node, source),
+            .has_named_args = callHasNamedArgs(node),
+            .is_first_class_callable = callIsFirstClassCallable(node),
             .result_used = detectResultUse(node),
             .resolved_target = null,
             .resolution_confidence = 1.0, // Static calls are always resolvable
@@ -629,6 +640,8 @@ pub const CallAnalyzer = struct {
             .file_path = self.current_file,
             .arg_count = countCallArgs(node),
             .arg_types = try resolveCallArgTypes(self, node, source),
+            .has_named_args = callHasNamedArgs(node),
+            .is_first_class_callable = callIsFirstClassCallable(node),
             .result_used = detectResultUse(node),
             .resolved_target = null,
             .resolution_confidence = 0.0,
@@ -763,13 +776,25 @@ pub const ProjectCallGraph = struct {
     }
 
     pub fn deinit(self: *ProjectCallGraph) void {
+        for (self.calls.items) |*call| {
+            call.deinitOwned(self.allocator);
+        }
         self.calls.deinit(self.allocator);
     }
 
     /// Add calls from a file analyzer
     pub fn addCalls(self: *ProjectCallGraph, analyzer: *const CallAnalyzer) !void {
         for (analyzer.getCalls()) |call| {
-            try self.calls.append(self.allocator, call);
+            var owned = call;
+            // The analyzer frees its own `arg_types` on deinit, so the graph
+            // must own a copy of any slice it retains. Inner TypeInfo data is
+            // borrowed (points into source/sym_table), so a shallow dupe is
+            // sufficient.
+            if (call.arg_types.len > 0) {
+                owned.arg_types = try self.allocator.dupe(?TypeInfo, call.arg_types);
+                owned.owns_arg_types = true;
+            }
+            try self.calls.append(self.allocator, owned);
             self.total_calls += 1;
             if (call.resolved_target != null) {
                 self.resolved_calls += 1;
@@ -896,6 +921,62 @@ pub const ProjectCallGraph = struct {
     }
 
     /// Output as text summary
+    /// Output the call graph as JSON.
+    pub fn toJson(self: *const ProjectCallGraph, file: std.Io.File) !void {
+        var buf: [4096]u8 = undefined;
+        var w = file.writer(types.io, &buf);
+        const writer = &w.interface;
+
+        try writer.writeAll("{\n");
+        try writer.print("  \"version\": \"0.4.0\",\n", .{});
+        try writer.print("  \"total_calls\": {d},\n", .{self.total_calls});
+        try writer.print("  \"resolved_calls\": {d},\n", .{self.resolved_calls});
+        try writer.print("  \"unresolved_calls\": {d},\n", .{self.unresolved_calls});
+        try writer.print("  \"resolution_rate\": {d:.1},\n", .{self.getResolutionRate()});
+
+        // Symbols from the symbol table
+        const stats = self.symbol_table.getStats();
+        try writer.writeAll("  \"symbols\": {\n");
+        try writer.print("    \"classes\": {d},\n", .{stats.class_count});
+        try writer.print("    \"interfaces\": {d},\n", .{stats.interface_count});
+        try writer.print("    \"traits\": {d},\n", .{stats.trait_count});
+        try writer.print("    \"functions\": {d},\n", .{stats.function_count});
+        try writer.print("    \"methods\": {d},\n", .{stats.method_count});
+        try writer.print("    \"properties\": {d}\n", .{stats.property_count});
+        try writer.writeAll("  },\n");
+
+        // Call graph entries
+        try writer.writeAll("  \"call_graph\": [");
+        for (self.calls.items, 0..) |call, i| {
+            if (i > 0) try writer.writeAll(",");
+            try writer.writeAll("\n    {\n");
+            try writer.writeAll("      \"caller\": ");
+            try json_util.writeJsonString(writer, call.caller_fqn);
+            try writer.writeAll(",\n      \"callee\": ");
+            try json_util.writeJsonString(writer, call.callee_name);
+            try writer.writeAll(",\n");
+            if (call.resolved_target) |target| {
+                try writer.writeAll("      \"resolved_target\": ");
+                try json_util.writeJsonString(writer, target);
+                try writer.writeAll(",\n");
+            } else {
+                try writer.writeAll("      \"resolved_target\": null,\n");
+            }
+            try writer.print("      \"confidence\": {d:.2},\n", .{call.resolution_confidence});
+            try writer.print("      \"line\": {d},\n", .{call.line});
+            try writer.writeAll("      \"file\": ");
+            try json_util.writeJsonString(writer, call.file_path);
+            try writer.writeAll("\n    }");
+        }
+        if (self.calls.items.len > 0) {
+            try writer.writeAll("\n  ");
+        }
+        try writer.writeAll("]\n");
+
+        try writer.writeAll("}\n");
+        try writer.flush();
+    }
+
     pub fn toText(self: *const ProjectCallGraph, file: std.Io.File) !void {
         // Header
         const header = try std.fmt.allocPrint(self.allocator,
@@ -993,6 +1074,36 @@ fn countCallArgs(node: ts.Node) u32 {
         if (std.mem.eql(u8, child.kind(), "argument")) count += 1;
     }
     return count;
+}
+
+/// True when the call is a PHP 8.1 first-class callable reference (`f(...)`,
+/// `Foo::bar(...)`, `$o->m(...)`). The grammar represents the `...` placeholder
+/// as a `variadic_placeholder` child of the `arguments` node. This is not an
+/// invocation, so arity/type checks must be skipped for these call sites.
+fn callIsFirstClassCallable(node: ts.Node) bool {
+    const args_node = node.childByFieldName("arguments") orelse return false;
+    var i: u32 = 0;
+    const n = args_node.namedChildCount();
+    while (i < n) : (i += 1) {
+        const child = args_node.namedChild(i) orelse continue;
+        if (std.mem.eql(u8, child.kind(), "variadic_placeholder")) return true;
+    }
+    return false;
+}
+
+/// True when the call uses any PHP named argument (`f(name: $x)`). The grammar
+/// marks a named argument with a `name` field on the `argument` node. Positional
+/// arg analysis is unsound for such calls, so downstream checks skip them.
+fn callHasNamedArgs(node: ts.Node) bool {
+    const args_node = node.childByFieldName("arguments") orelse return false;
+    var i: u32 = 0;
+    const n = args_node.namedChildCount();
+    while (i < n) : (i += 1) {
+        const child = args_node.namedChild(i) orelse continue;
+        if (!std.mem.eql(u8, child.kind(), "argument")) continue;
+        if (child.childByFieldName("name") != null) return true;
+    }
+    return false;
 }
 
 /// The value expression of an `argument` node (skipping the optional `name:`
@@ -1829,6 +1940,82 @@ pub const CalledBeforeAnalyzer = struct {
     }
 
     /// Output analysis result as text
+    pub fn toJson(self: *CalledBeforeAnalyzer, result: CalledBeforeResult, before_fn: []const u8, after_fn: []const u8, file: std.Io.File) !void {
+        _ = self;
+        var buf: [4096]u8 = undefined;
+        var w = file.writer(types.io, &buf);
+        const writer = &w.interface;
+
+        try writer.writeAll("{\n");
+        try writer.writeAll("  \"constraint\": {\n");
+        try writer.writeAll("    \"before\": ");
+        try json_util.writeJsonString(writer, before_fn);
+        try writer.writeAll(",\n    \"after\": ");
+        try json_util.writeJsonString(writer, after_fn);
+        try writer.writeAll("\n  },\n");
+        try writer.print("  \"satisfied\": {s},\n", .{if (result.satisfied) "true" else "false"});
+
+        // Violations
+        try writer.writeAll("  \"violations\": [");
+        for (result.violations, 0..) |violation, i| {
+            if (i > 0) try writer.writeAll(",");
+            try writer.writeAll("\n    {\n");
+            try writer.writeAll("      \"context_function\": ");
+            try json_util.writeJsonString(writer, violation.context_function);
+            try writer.writeAll(",\n      \"file\": ");
+            try json_util.writeJsonString(writer, violation.file_path);
+            try writer.print(",\n      \"after_line\": {d},\n", .{violation.after_line});
+            if (violation.before_line) |bl| {
+                try writer.print("      \"before_line\": {d},\n", .{bl});
+            } else {
+                try writer.writeAll("      \"before_line\": null,\n");
+            }
+            const kind_str = switch (violation.kind) {
+                .wrong_order => "wrong_order",
+                .missing_before => "missing_before",
+                .conditional_before => "conditional_before",
+            };
+            try writer.print("      \"kind\": \"{s}\"\n", .{kind_str});
+            try writer.writeAll("    }");
+        }
+        if (result.violations.len > 0) {
+            try writer.writeAll("\n  ");
+        }
+        try writer.writeAll("],\n");
+
+        // Matches
+        try writer.writeAll("  \"matches\": [");
+        for (result.matches, 0..) |match, i| {
+            if (i > 0) try writer.writeAll(",");
+            try writer.writeAll("\n    {\n");
+            try writer.writeAll("      \"context_function\": ");
+            try json_util.writeJsonString(writer, match.context_function);
+            try writer.writeAll(",\n      \"file\": ");
+            try json_util.writeJsonString(writer, match.file_path);
+            try writer.print(",\n      \"after_line\": {d},\n", .{match.after_line});
+            try writer.writeAll("      \"after_callee\": ");
+            try json_util.writeJsonString(writer, match.after_callee);
+            try writer.print(",\n      \"before_line\": {d},\n", .{match.before_line});
+            try writer.writeAll("      \"before_callee\": ");
+            try json_util.writeJsonString(writer, match.before_callee);
+            try writer.writeAll("\n    }");
+        }
+        if (result.matches.len > 0) {
+            try writer.writeAll("\n  ");
+        }
+        try writer.writeAll("],\n");
+
+        // Summary
+        try writer.writeAll("  \"summary\": {\n");
+        try writer.print("    \"satisfied_count\": {d},\n", .{result.satisfied_in.len});
+        try writer.print("    \"violation_count\": {d},\n", .{result.violations.len});
+        try writer.print("    \"match_count\": {d}\n", .{result.matches.len});
+        try writer.writeAll("  }\n");
+
+        try writer.writeAll("}\n");
+        try writer.flush();
+    }
+
     pub fn toText(self: *CalledBeforeAnalyzer, result: CalledBeforeResult, before_fn: []const u8, after_fn: []const u8, file: std.Io.File) !void {
         // Extract short names for display
         const before_short = extractShortName(before_fn);

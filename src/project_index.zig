@@ -10,6 +10,7 @@ const plugin_registry = @import("plugins/plugin_registry.zig");
 const references = @import("references.zig");
 const di_config = @import("di_config.zig");
 const composer = @import("composer.zig");
+const framework_stubs = @import("framework_stubs.zig");
 
 const SymbolTable = symbol_table.SymbolTable;
 const ResolvedView = symbol_table.ResolvedView;
@@ -91,6 +92,12 @@ pub const ProjectIndex = struct {
     call_graph: ProjectCallGraph,
     resolved: ?*ResolvedView, // own arena; null only mid-rebuild
 
+    // When true, `buildDerived` injects the framework API stub catalog
+    // (Shopware/Symfony/Doctrine/PSR) into the symbol table so vendor-only
+    // symbols resolve. Real project loads enable this; the pure in-memory
+    // call-graph unit tests disable it to keep symbol counts deterministic.
+    register_stubs: bool,
+
     // ------------------------------------------------------------------------
     // Construction / teardown
     // ------------------------------------------------------------------------
@@ -135,6 +142,7 @@ pub const ProjectIndex = struct {
             .file_sources = undefined,
             .call_graph = undefined,
             .resolved = null,
+            .register_stubs = true,
         };
         return self;
     }
@@ -361,6 +369,16 @@ pub const ProjectIndex = struct {
             try self.file_sources.put(unit.path, unit.source);
         }
 
+        // Pass A2: inject framework API stubs (Shopware/Symfony/Doctrine) into
+        // the raw symbol table BEFORE any inheritance/resolution pass, so both
+        // the Tier-2 ResolvedView and the legacy `all_methods` view (and call
+        // analysis) see the same world. Only registers classes/interfaces that
+        // user/vendor code did not already define. Allocated in `derived_arena`
+        // so it is reclaimed on every wholesale rebuild.
+        if (self.register_stubs) {
+            try framework_stubs.registerFrameworkStubs(a, &self.sym_table);
+        }
+
         // Pass B: resolve inheritance/traits (Tier-2 view, never mutates raw).
         self.resolved = try ResolvedView.build(self.gpa, &self.sym_table);
         self.sym_table.resolved = self.resolved;
@@ -370,6 +388,14 @@ pub const ProjectIndex = struct {
         // resolve to the container-injected concrete (Phase B DI-aware
         // resolution).
         try self.loadDiBindings(a);
+
+        // Pass B3: populate the legacy Tier-2 inheritance view
+        // (ClassSymbol.all_methods/all_properties). The local MCP path uses
+        // ResolvedView, but the origin analyzers (dead_code, type/return/null
+        // checks, boundary, report) read all_methods/all_properties directly.
+        // Building both here lets one index feed both the MCP tools and the
+        // CLI. Idempotent and arena-backed.
+        try self.sym_table.resolveInheritance();
 
         // Pass C: type-directed call analysis over cached trees (deterministic).
         self.call_graph = ProjectCallGraph.init(a, &self.sym_table);
@@ -591,6 +617,7 @@ pub fn createInMemoryWithConfigsForTest(
 ) !*ProjectIndex {
     const self = try ProjectIndex.initShell(gpa, configs);
     errdefer self.destroy();
+    self.register_stubs = false; // pure call-graph tests: no framework noise
     for (sources) |pair| {
         try addInMemory(self, pair[0], pair[1]);
     }
@@ -603,6 +630,7 @@ pub fn createInMemoryWithConfigsForTest(
 fn createInMemory(gpa: std.mem.Allocator, sources: []const [2][]const u8) !*ProjectIndex {
     const self = try ProjectIndex.initShell(gpa, &.{});
     errdefer self.destroy();
+    self.register_stubs = false; // pure call-graph tests: no framework noise
     for (sources) |pair| {
         try addInMemory(self, pair[0], pair[1]);
     }

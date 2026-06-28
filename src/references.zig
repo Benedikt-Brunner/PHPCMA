@@ -75,7 +75,7 @@ const Collector = struct {
         else if (types.TypeInfo.isBuiltin(text))
             return
         else
-            self.file_ctx.resolveFQCN(text);
+            try self.file_ctx.resolveFQCN(text);
 
         if (std.mem.eql(u8, resolved, self.target)) {
             try self.record(kind, anchor);

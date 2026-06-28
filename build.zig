@@ -95,9 +95,7 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addImport("cli", cli_dep.module("cli"));
 
-    // ----------------------------------------------------------------
-    // 4. Setup the MCP server library (muhammad-fiaz/mcp.zig)
-    // ----------------------------------------------------------------
+    // MCP server library (muhammad-fiaz/mcp.zig) — powers the `mcp` subcommand.
     const mcp_dep = b.dependency("mcp", .{
         .target = target,
         .optimize = optimize,
@@ -106,6 +104,32 @@ pub fn build(b: *std.Build) void {
 
     // Link LibC (Required by Tree-sitter)
     exe.root_module.link_libc = true;
+
+    const symbol_dump_exe = b.addExecutable(.{
+        .name = "phpcma-symbol-dump",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/symbol_dump.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    symbol_dump_exe.root_module.addImport("tree-sitter", ts_dep.module("tree_sitter"));
+    symbol_dump_exe.root_module.addImport("cli", cli_dep.module("cli"));
+    symbol_dump_exe.root_module.addIncludePath(php_src_root);
+    symbol_dump_exe.root_module.addCSourceFile(.{
+        .file = php_src_root.path(b, "parser.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    symbol_dump_exe.root_module.addCSourceFile(.{
+        .file = php_src_root.path(b, "scanner.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    symbol_dump_exe.root_module.link_libc = true;
+
+    const symbol_dump_step = b.step("symbol-dump", "Build the PHPCMA symbol dump helper");
+    const install_symbol_dump = b.addInstallArtifact(symbol_dump_exe, .{});
+    symbol_dump_step.dependOn(&install_symbol_dump.step);
+
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
     // step). By default the install prefix is `zig-out/` but can be overridden
@@ -128,33 +152,6 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
 
-    // ----------------------------------------------------------------
-    // Unit tests
-    // ----------------------------------------------------------------
-    const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    test_mod.addImport("tree-sitter", ts_dep.module("tree_sitter"));
-    test_mod.addImport("cli", cli_dep.module("cli"));
-    test_mod.addImport("mcp", mcp_dep.module("mcp"));
-    test_mod.addIncludePath(php_src_root);
-    test_mod.addCSourceFile(.{
-        .file = php_src_root.path(b, "parser.c"),
-        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
-    });
-    test_mod.addCSourceFile(.{
-        .file = php_src_root.path(b, "scanner.c"),
-        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
-    });
-    test_mod.link_libc = true;
-
-    const unit_tests = b.addTest(.{ .root_module = test_mod });
-    const run_unit_tests = b.addRunArtifact(unit_tests);
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_unit_tests.step);
-
     // By making the run step depend on the default step, it will be run from the
     // installation directory rather than directly from within the cache directory.
     run_cmd.step.dependOn(b.getInstallStep());
@@ -164,4 +161,417 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
+
+    // ----------------------------------------------------------------
+    // Tests
+    // ----------------------------------------------------------------
+    const test_step = b.step("test", "Run unit tests");
+
+    const main_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    // Add tree-sitter module
+    main_tests.root_module.addImport("tree-sitter", ts_dep.module("tree_sitter"));
+
+    // Add CLI module
+    main_tests.root_module.addImport("cli", cli_dep.module("cli"));
+
+    // Add MCP module (main.zig's test block imports mcp_server.zig)
+    main_tests.root_module.addImport("mcp", mcp_dep.module("mcp"));
+
+    // Add PHP grammar C sources
+    main_tests.root_module.addIncludePath(php_src_root);
+    main_tests.root_module.addCSourceFile(.{
+        .file = php_src_root.path(b, "parser.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    main_tests.root_module.addCSourceFile(.{
+        .file = php_src_root.path(b, "scanner.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    main_tests.root_module.link_libc = true;
+
+    const run_main_tests = b.addRunArtifact(main_tests);
+    test_step.dependOn(&run_main_tests.step);
+
+    const report_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/report.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    report_tests.root_module.addImport("tree-sitter", ts_dep.module("tree_sitter"));
+    report_tests.root_module.addImport("cli", cli_dep.module("cli"));
+    report_tests.root_module.addIncludePath(php_src_root);
+    report_tests.root_module.addCSourceFile(.{
+        .file = php_src_root.path(b, "parser.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    report_tests.root_module.addCSourceFile(.{
+        .file = php_src_root.path(b, "scanner.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    report_tests.root_module.link_libc = true;
+    const run_report_tests = b.addRunArtifact(report_tests);
+    test_step.dependOn(&run_report_tests.step);
+
+    const phpdoc_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/phpdoc.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const run_phpdoc_tests = b.addRunArtifact(phpdoc_tests);
+    test_step.dependOn(&run_phpdoc_tests.step);
+
+    const cfg_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cfg.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    cfg_tests.root_module.addImport("tree-sitter", ts_dep.module("tree_sitter"));
+    cfg_tests.root_module.addIncludePath(php_src_root);
+    cfg_tests.root_module.addCSourceFile(.{
+        .file = php_src_root.path(b, "parser.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    cfg_tests.root_module.addCSourceFile(.{
+        .file = php_src_root.path(b, "scanner.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    cfg_tests.root_module.link_libc = true;
+
+    const run_cfg_tests = b.addRunArtifact(cfg_tests);
+    test_step.dependOn(&run_cfg_tests.step);
+
+    const null_safety_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/null_safety.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    null_safety_tests.root_module.addImport("tree-sitter", ts_dep.module("tree_sitter"));
+    null_safety_tests.root_module.addImport("cli", cli_dep.module("cli"));
+    null_safety_tests.root_module.addIncludePath(php_src_root);
+    null_safety_tests.root_module.addCSourceFile(.{
+        .file = php_src_root.path(b, "parser.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    null_safety_tests.root_module.addCSourceFile(.{
+        .file = php_src_root.path(b, "scanner.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    null_safety_tests.root_module.link_libc = true;
+
+    const run_null_safety_tests = b.addRunArtifact(null_safety_tests);
+    test_step.dependOn(&run_null_safety_tests.step);
+
+    const generics_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/generics.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const run_generics_tests = b.addRunArtifact(generics_tests);
+    test_step.dependOn(&run_generics_tests.step);
+
+    const return_type_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/return_type_checker.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    return_type_tests.root_module.addImport("tree-sitter", ts_dep.module("tree_sitter"));
+    return_type_tests.root_module.addImport("cli", cli_dep.module("cli"));
+    return_type_tests.root_module.addIncludePath(php_src_root);
+    return_type_tests.root_module.addCSourceFile(.{
+        .file = php_src_root.path(b, "parser.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    return_type_tests.root_module.addCSourceFile(.{
+        .file = php_src_root.path(b, "scanner.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    return_type_tests.root_module.link_libc = true;
+
+    const run_return_type_tests = b.addRunArtifact(return_type_tests);
+    test_step.dependOn(&run_return_type_tests.step);
+
+    const dead_code_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/dead_code.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    dead_code_tests.root_module.addImport("tree-sitter", ts_dep.module("tree_sitter"));
+    dead_code_tests.root_module.addImport("cli", cli_dep.module("cli"));
+    dead_code_tests.root_module.addIncludePath(php_src_root);
+    dead_code_tests.root_module.addCSourceFile(.{
+        .file = php_src_root.path(b, "parser.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    dead_code_tests.root_module.addCSourceFile(.{
+        .file = php_src_root.path(b, "scanner.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    dead_code_tests.root_module.link_libc = true;
+
+    const run_dead_code_tests = b.addRunArtifact(dead_code_tests);
+    test_step.dependOn(&run_dead_code_tests.step);
+
+    const test_gen_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_gen.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const run_test_gen_tests = b.addRunArtifact(test_gen_tests);
+    test_step.dependOn(&run_test_gen_tests.step);
+
+    const call_graph_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/call_graph_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    call_graph_tests.root_module.addImport("tree-sitter", ts_dep.module("tree_sitter"));
+    call_graph_tests.root_module.addImport("cli", cli_dep.module("cli"));
+    call_graph_tests.root_module.addIncludePath(php_src_root);
+    call_graph_tests.root_module.addCSourceFile(.{
+        .file = php_src_root.path(b, "parser.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    call_graph_tests.root_module.addCSourceFile(.{
+        .file = php_src_root.path(b, "scanner.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    call_graph_tests.root_module.link_libc = true;
+
+    const run_call_graph_tests = b.addRunArtifact(call_graph_tests);
+    test_step.dependOn(&run_call_graph_tests.step);
+
+    const gen_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gen_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    gen_tests.root_module.addImport("tree-sitter", ts_dep.module("tree_sitter"));
+    gen_tests.root_module.addImport("cli", cli_dep.module("cli"));
+    gen_tests.root_module.addIncludePath(php_src_root);
+    gen_tests.root_module.addCSourceFile(.{
+        .file = php_src_root.path(b, "parser.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    gen_tests.root_module.addCSourceFile(.{
+        .file = php_src_root.path(b, "scanner.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    gen_tests.root_module.link_libc = true;
+
+    const run_gen_tests = b.addRunArtifact(gen_tests);
+    test_step.dependOn(&run_gen_tests.step);
+
+    // ----------------------------------------------------------------
+    // Corpus Tests (requires corpus on disk)
+    // ----------------------------------------------------------------
+    const corpus_step = b.step("corpus-test", "Run corpus integration tests (requires PHPCMA_CORPUS_ROOT)");
+
+    const corpus_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/corpus_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    corpus_tests.root_module.addImport("tree-sitter", ts_dep.module("tree_sitter"));
+    corpus_tests.root_module.addImport("cli", cli_dep.module("cli"));
+    corpus_tests.root_module.addIncludePath(php_src_root);
+    corpus_tests.root_module.addCSourceFile(.{
+        .file = php_src_root.path(b, "parser.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    corpus_tests.root_module.addCSourceFile(.{
+        .file = php_src_root.path(b, "scanner.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    corpus_tests.root_module.link_libc = true;
+
+    const run_corpus_tests = b.addRunArtifact(corpus_tests);
+    corpus_step.dependOn(&run_corpus_tests.step);
+
+    // Differential tests (PHPCMA vs PHP reflection)
+    const diff_step = b.step("diff-test", "Run differential tests comparing PHPCMA against PHP reflection");
+
+    const diff_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/differential_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    diff_tests.root_module.addImport("tree-sitter", ts_dep.module("tree_sitter"));
+    diff_tests.root_module.addImport("cli", cli_dep.module("cli"));
+    diff_tests.root_module.addIncludePath(php_src_root);
+    diff_tests.root_module.addCSourceFile(.{
+        .file = php_src_root.path(b, "parser.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    diff_tests.root_module.addCSourceFile(.{
+        .file = php_src_root.path(b, "scanner.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    diff_tests.root_module.link_libc = true;
+
+    const run_diff_tests = b.addRunArtifact(diff_tests);
+    diff_step.dependOn(&run_diff_tests.step);
+    test_step.dependOn(&run_diff_tests.step);
+
+    // ----------------------------------------------------------------
+    // Fuzz Testing
+    // ----------------------------------------------------------------
+    const fuzz_step = b.step("fuzz", "Run fuzz tests against the PHP analysis pipeline");
+
+    const fuzz_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fuzz_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    fuzz_tests.root_module.addImport("tree-sitter", ts_dep.module("tree_sitter"));
+    fuzz_tests.root_module.addImport("cli", cli_dep.module("cli"));
+    fuzz_tests.root_module.addIncludePath(php_src_root);
+    fuzz_tests.root_module.addCSourceFile(.{
+        .file = php_src_root.path(b, "parser.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    fuzz_tests.root_module.addCSourceFile(.{
+        .file = php_src_root.path(b, "scanner.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    fuzz_tests.root_module.link_libc = true;
+
+    const run_fuzz_tests = b.addRunArtifact(fuzz_tests);
+    fuzz_step.dependOn(&run_fuzz_tests.step);
+
+    // ----------------------------------------------------------------
+    // Distribution: Cross-compilation for all major platforms
+    // ----------------------------------------------------------------
+    const dist_step = b.step("dist", "Build ReleaseFast binaries for all major platforms");
+
+    const dist_targets: []const std.Target.Query = &.{
+        .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu },
+        .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu },
+        .{ .cpu_arch = .x86_64, .os_tag = .macos },
+        .{ .cpu_arch = .aarch64, .os_tag = .macos },
+        .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu },
+    };
+
+    for (dist_targets) |dist_target| {
+        const resolved = b.resolveTargetQuery(dist_target);
+
+        const dist_ts_dep = b.dependency("tree_sitter", .{
+            .target = resolved,
+            .optimize = .ReleaseFast,
+        });
+
+        const dist_cli_dep = b.dependency("cli", .{
+            .target = resolved,
+            .optimize = .ReleaseFast,
+        });
+
+        const dist_mcp_dep = b.dependency("mcp", .{
+            .target = resolved,
+            .optimize = .ReleaseFast,
+        });
+
+        const dist_exe = b.addExecutable(.{
+            .name = "phpcma",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/main.zig"),
+                .target = resolved,
+                .optimize = .ReleaseFast,
+            }),
+        });
+
+        dist_exe.root_module.addImport("tree-sitter", dist_ts_dep.module("tree_sitter"));
+        dist_exe.root_module.addImport("cli", dist_cli_dep.module("cli"));
+        dist_exe.root_module.addImport("mcp", dist_mcp_dep.module("mcp"));
+        dist_exe.root_module.addIncludePath(php_src_root);
+        dist_exe.root_module.addCSourceFile(.{
+            .file = php_src_root.path(b, "parser.c"),
+            .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+        });
+        dist_exe.root_module.addCSourceFile(.{
+            .file = php_src_root.path(b, "scanner.c"),
+            .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+        });
+        dist_exe.root_module.link_libc = true;
+
+        const target_triple = dist_target.zigTriple(b.allocator) catch @panic("OOM");
+        const install = b.addInstallArtifact(dist_exe, .{
+            .dest_dir = .{ .override = .{ .custom = b.fmt("dist/{s}", .{target_triple}) } },
+        });
+        dist_step.dependOn(&install.step);
+    }
+
+    // ----------------------------------------------------------------
+    // Benchmarks (ReleaseFast)
+    // ----------------------------------------------------------------
+    const bench_step = b.step("bench", "Run performance benchmarks");
+
+    // Build tree-sitter dep with ReleaseFast to avoid UBSan link errors
+    const ts_dep_fast = b.dependency("tree_sitter", .{
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+
+    const bench_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+
+    // Add tree-sitter module (ReleaseFast build)
+    bench_tests.root_module.addImport("tree-sitter", ts_dep_fast.module("tree_sitter"));
+
+    // Add CLI module
+    bench_tests.root_module.addImport("cli", cli_dep.module("cli"));
+
+    // Add PHP grammar C sources
+    bench_tests.root_module.addIncludePath(php_src_root);
+    bench_tests.root_module.addCSourceFile(.{
+        .file = php_src_root.path(b, "parser.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    bench_tests.root_module.addCSourceFile(.{
+        .file = php_src_root.path(b, "scanner.c"),
+        .flags = &[_][]const u8{ "-std=c99", "-O3", "-fno-sanitize=undefined" },
+    });
+    bench_tests.root_module.link_libc = true;
+
+    const run_bench_tests = b.addRunArtifact(bench_tests);
+    bench_step.dependOn(&run_bench_tests.step);
 }

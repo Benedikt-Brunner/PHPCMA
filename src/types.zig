@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 // ============================================================================
 // Global I/O handle (Zig 0.16 std.Io model)
@@ -8,7 +9,42 @@ const std = @import("std");
 /// Used by filesystem and stream operations across modules so that the
 /// zero-argument CLI action callbacks (and other helpers) can perform I/O
 /// without threading `io` through every signature.
-pub var io: std.Io = undefined;
+///
+/// In test builds it defaults to the test runner's threaded I/O so that
+/// unit tests exercising filesystem/stream helpers work without an explicit
+/// `main`-time initialization.
+pub var io: std.Io = if (builtin.is_test) std.testing.io else undefined;
+
+/// Monotonic elapsed-time timer, a drop-in replacement for the removed
+/// `std.time.Timer` under the Zig 0.16 `std.Io` clock model. Uses the global
+/// `io` handle and the monotonic (`.awake`) clock.
+pub const Timer = struct {
+    start_ts: std.Io.Timestamp,
+
+    /// Start a new timer at the current monotonic time.
+    pub fn start() Timer {
+        return .{ .start_ts = std.Io.Clock.now(.awake, io) };
+    }
+
+    /// Nanoseconds elapsed since the timer was started (or last reset).
+    pub fn read(self: *Timer) u64 {
+        const now = std.Io.Clock.now(.awake, io);
+        return @intCast(self.start_ts.durationTo(now).nanoseconds);
+    }
+
+    /// Reset the timer's start point to now.
+    pub fn reset(self: *Timer) void {
+        self.start_ts = std.Io.Clock.now(.awake, io);
+    }
+
+    /// Return elapsed nanoseconds and reset the start point to now.
+    pub fn lap(self: *Timer) u64 {
+        const now = std.Io.Clock.now(.awake, io);
+        const elapsed: u64 = @intCast(self.start_ts.durationTo(now).nanoseconds);
+        self.start_ts = now;
+        return elapsed;
+    }
+};
 
 // ============================================================================
 // Type Information
@@ -19,6 +55,7 @@ pub const TypeInfo = struct {
     kind: Kind,
     base_type: []const u8, // For simple/nullable: the type name (FQCN or builtin)
     type_parts: []const []const u8, // For union/intersection types
+    type_params: []const TypeInfo = &.{}, // For generic types: Collection<User> -> [User]
     is_builtin: bool,
 
     pub const Kind = enum {
@@ -27,6 +64,7 @@ pub const TypeInfo = struct {
         union_type, // Foo|Bar
         intersection, // Foo&Bar
         array_type, // array, int[], Foo[]
+        generic, // Collection<User>, Repository<Product>
         mixed,
         void_type,
         never,
@@ -42,25 +80,30 @@ pub const TypeInfo = struct {
     };
 
     pub fn isBuiltin(type_name: []const u8) bool {
-        for (builtins) |builtin| {
-            if (std.mem.eql(u8, type_name, builtin)) return true;
+        // Framework stubs fold large type catalogs through this at comptime;
+        // raise the backwards-branch quota so that evaluation does not abort.
+        @setEvalBranchQuota(100000);
+        for (builtins) |builtin_name| {
+            if (std.mem.eql(u8, type_name, builtin_name)) return true;
         }
         return false;
     }
 
     pub fn simple(allocator: std.mem.Allocator, type_name: []const u8) !TypeInfo {
+        _ = allocator;
         return .{
             .kind = .simple,
-            .base_type = try allocator.dupe(u8, type_name),
+            .base_type = type_name,
             .type_parts = &.{},
             .is_builtin = isBuiltin(type_name),
         };
     }
 
     pub fn nullable(allocator: std.mem.Allocator, type_name: []const u8) !TypeInfo {
+        _ = allocator;
         return .{
             .kind = .nullable,
-            .base_type = try allocator.dupe(u8, type_name),
+            .base_type = type_name,
             .type_parts = &.{},
             .is_builtin = isBuiltin(type_name),
         };
@@ -83,6 +126,18 @@ pub const TypeInfo = struct {
                     if (i > 0) try result.appendSlice(allocator, "&");
                     try result.appendSlice(allocator, part);
                 }
+                break :blk try result.toOwnedSlice(allocator);
+            },
+            .generic => blk: {
+                var result: std.ArrayListUnmanaged(u8) = .empty;
+                try result.appendSlice(allocator, self.base_type);
+                try result.append(allocator, '<');
+                for (self.type_params, 0..) |param, i| {
+                    if (i > 0) try result.appendSlice(allocator, ", ");
+                    const param_str = try param.format(allocator);
+                    try result.appendSlice(allocator, param_str);
+                }
+                try result.append(allocator, '>');
                 break :blk try result.toOwnedSlice(allocator);
             },
             .array_type => std.fmt.allocPrint(allocator, "{s}[]", .{self.base_type}),
@@ -147,6 +202,11 @@ pub const ParameterInfo = struct {
     is_by_reference: bool,
     is_promoted: bool, // PHP 8.0 constructor property promotion
     phpdoc_type: ?TypeInfo, // From @param annotation
+    /// Visibility of a promoted property (only meaningful when `is_promoted`).
+    promoted_visibility: Visibility = .public,
+    /// Whether a promoted property is declared `readonly` (only meaningful when
+    /// `is_promoted`).
+    promoted_readonly: bool = false,
 };
 
 // ============================================================================
@@ -185,6 +245,9 @@ pub const MethodSymbol = struct {
     return_type: ?TypeInfo, // Native PHP return type
     phpdoc_return: ?TypeInfo, // From @return annotation
 
+    // Generic type parameters (@template T, @template V of SomeClass)
+    template_params: []const TemplateParam = &.{},
+
     // Location
     start_line: u32,
     end_line: u32,
@@ -221,12 +284,17 @@ pub const MethodSymbol = struct {
 // ============================================================================
 
 /// A generic type parameter declared via `@template Name [of Bound] [= Default]`.
-/// `fallback` is the FQCN to use when no subclass binds the parameter — the
-/// default if present, otherwise the bound — already resolved against the
-/// declaring file's imports. Null when the parameter is unconstrained.
+///
+/// Two consumers read this struct with different needs, so both fields are kept:
+///   - `fallback` (local resolver): the FQCN to use when no subclass binds the
+///     parameter — the default if present, otherwise the bound — already
+///     resolved against the declaring file's imports.
+///   - `bound` (generics.zig): the raw `@template T of SomeClass` bound.
+/// Both default to null so each producer can set only the field it populates.
 pub const TemplateParam = struct {
-    name: []const u8,
-    fallback: ?[]const u8,
+    name: []const u8, // e.g., "T", "V"
+    fallback: ?[]const u8 = null,
+    bound: ?[]const u8 = null, // e.g., "SomeClass" for @template T of SomeClass
 };
 
 pub const ClassSymbol = struct {
@@ -247,15 +315,28 @@ pub const ClassSymbol = struct {
     implements: []const []const u8, // Interface FQCNs
     uses: []const []const u8, // Trait FQCNs
 
-    // Generics (from class-level PHPDoc)
-    template_params: []const TemplateParam, // @template names declared on this class, in order
-    extends_type_args: []const []const u8, // concrete/template args bound to the parent via @extends Base<...>
+    // Generics (from class-level PHPDoc). Superset of both branches' fields,
+    // all defaulted so producers set only what they populate:
+    //   - local resolver: template_params (ordered) + extends_type_args
+    //   - generics.zig:   template_params + generic_extends + generic_implements
+    template_params: []const TemplateParam = &.{}, // @template names declared on this class, in order
+    extends_type_args: []const []const u8 = &.{}, // concrete/template args bound to the parent via @extends Base<...>
+    generic_extends: ?TypeInfo = null, // @extends Collection<User>
+    generic_implements: []const TypeInfo = &.{}, // @implements Repository<User>
 
     // Members (directly declared). This is immutable Tier-1 (raw) data; the
-    // inherited/resolved view lives in the Tier-2 `ResolvedView`, keyed by FQCN,
-    // and never mutates these raw symbols.
+    // local resolver's inherited view lives in the Tier-2 `ResolvedView`
+    // (keyed by FQCN, never mutates these raw symbols).
     methods: std.StringHashMap(MethodSymbol),
     properties: std.StringHashMap(PropertySymbol),
+
+    // Resolved members including inherited (populated by
+    // `SymbolTable.resolveInheritance`). The origin-side analyzers
+    // (dead_code, type checks, framework_stubs) read these directly; the
+    // local MCP path uses `ResolvedView` instead. Both can coexist.
+    all_methods: std.StringHashMap(*const MethodSymbol),
+    all_properties: std.StringHashMap(*const PropertySymbol),
+    parent_chain: []const []const u8 = &.{}, // Ordered list of ancestors (nearest first)
 
     allocator: std.mem.Allocator,
 
@@ -286,13 +367,21 @@ pub const ClassSymbol = struct {
             .extends_type_args = &.{},
             .methods = std.StringHashMap(MethodSymbol).init(allocator),
             .properties = std.StringHashMap(PropertySymbol).init(allocator),
+            .all_methods = std.StringHashMap(*const MethodSymbol).init(allocator),
+            .all_properties = std.StringHashMap(*const PropertySymbol).init(allocator),
+            .parent_chain = &.{},
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *ClassSymbol) void {
+        if (self.parent_chain.len > 0) {
+            self.allocator.free(self.parent_chain);
+        }
         self.methods.deinit();
         self.properties.deinit();
+        self.all_methods.deinit();
+        self.all_properties.deinit();
     }
 
     pub fn addMethod(self: *ClassSymbol, method: MethodSymbol) !void {
@@ -500,7 +589,7 @@ pub const FileContext = struct {
     }
 
     /// Resolve a type name to FQCN using this file's namespace and use statements
-    pub fn resolveFQCN(self: *const FileContext, type_name: []const u8) []const u8 {
+    pub fn resolveFQCN(self: *const FileContext, type_name: []const u8) error{OutOfMemory}![]const u8 {
         // Already fully qualified
         if (type_name.len > 0 and type_name[0] == '\\') {
             return type_name[1..]; // Remove leading backslash
@@ -650,7 +739,9 @@ pub const UnresolvedReason = enum {
 pub const EnhancedFunctionCall = struct {
     // Original call info
     caller_fqn: []const u8, // FQN of the calling function/method
+    owns_caller_fqn: bool = false,
     callee_name: []const u8, // Name of the called function/method
+    owns_callee_name: bool = false,
     call_type: CallType,
     line: u32,
     column: u32,
@@ -663,12 +754,25 @@ pub const EnhancedFunctionCall = struct {
     /// partiality as receiver resolution). Empty when no arguments. Used by the
     /// type-aware `impact` breaking-change analysis.
     arg_types: []const ?TypeInfo = &.{},
+    owns_arg_types: bool = false,
+    /// True when the call site uses any PHP named argument (`f(name: $x)`).
+    /// Named arguments bind to parameters by name, not position, so the
+    /// positional `arg_count`/`arg_types` cannot be soundly checked against a
+    /// parameter list — consumers must skip positional arg analysis for these.
+    has_named_args: bool = false,
+    /// True when the call site is a PHP 8.1 first-class callable reference
+    /// (`f(...)`, `Foo::bar(...)`, `$o->m(...)`). This does not invoke the
+    /// callee; it creates a Closure referencing it. The `(...)` placeholder is
+    /// not an argument, so `arg_count` is 0 and positional arity/type checks are
+    /// meaningless — consumers must skip invocation-arity analysis for these.
+    is_first_class_callable: bool = false,
     /// How the call's *result* is consumed at this site. Drives return-type
     /// narrowing analysis (dereferencing a now-nullable result is breaking).
     result_used: ResultUse = .ignored,
 
     // Resolution info
     resolved_target: ?[]const u8, // FQCN of resolved method
+    owns_resolved_target: bool = false,
     resolution_confidence: f32,
     resolution_method: ResolutionMethod,
     unresolved_reason: UnresolvedReason = .none, // diagnostic: why an unresolved instance call failed
@@ -694,6 +798,20 @@ pub const EnhancedFunctionCall = struct {
             return allocator.dupe(u8, target);
         }
         return allocator.dupe(u8, self.callee_name);
+    }
+
+    /// Free any heap data this call owns (set by the parallel analysis path,
+    /// which duplicates call strings into the caller allocator). Single-threaded
+    /// analysis leaves the `owns_*` flags false, so this is a no-op there.
+    pub fn deinitOwned(self: *const EnhancedFunctionCall, allocator: std.mem.Allocator) void {
+        if (self.owns_caller_fqn) allocator.free(self.caller_fqn);
+        if (self.owns_callee_name) allocator.free(self.callee_name);
+        if (self.owns_resolved_target) {
+            if (self.resolved_target) |target| allocator.free(target);
+        }
+        if (self.owns_arg_types and self.arg_types.len > 0) {
+            allocator.free(self.arg_types);
+        }
     }
 };
 
@@ -729,3 +847,83 @@ pub const ProjectConfig = struct {
         self.autoload_psr0.deinit();
     }
 };
+
+// ============================================================================
+// Tests: FileContext.resolveFQCN
+// ============================================================================
+
+test "resolveFQCN: already qualified strips leading backslash" {
+    const allocator = std.testing.allocator;
+    var ctx = FileContext.init(allocator, "test.php");
+    defer ctx.deinit();
+
+    const result = try ctx.resolveFQCN("\\App\\Models\\User");
+    try std.testing.expectEqualStrings("App\\Models\\User", result);
+}
+
+test "resolveFQCN: builtin types unchanged" {
+    const allocator = std.testing.allocator;
+    var ctx = FileContext.init(allocator, "test.php");
+    defer ctx.deinit();
+    ctx.namespace = "App";
+
+    const result = try ctx.resolveFQCN("string");
+    try std.testing.expectEqualStrings("string", result);
+}
+
+test "resolveFQCN: use statement exact match" {
+    const allocator = std.testing.allocator;
+    var ctx = FileContext.init(allocator, "test.php");
+    defer ctx.deinit();
+    ctx.namespace = "App";
+
+    try ctx.addUseStatement(.{ .fqcn = "Vendor\\Lib\\Logger", .alias = null, .kind = .class });
+
+    const result = try ctx.resolveFQCN("Logger");
+    try std.testing.expectEqualStrings("Vendor\\Lib\\Logger", result);
+}
+
+test "resolveFQCN: use statement with alias" {
+    const allocator = std.testing.allocator;
+    var ctx = FileContext.init(allocator, "test.php");
+    defer ctx.deinit();
+    ctx.namespace = "App";
+
+    try ctx.addUseStatement(.{ .fqcn = "Vendor\\Lib\\Logger", .alias = "Log", .kind = .class });
+
+    const result = try ctx.resolveFQCN("Log");
+    try std.testing.expectEqualStrings("Vendor\\Lib\\Logger", result);
+}
+
+test "resolveFQCN: qualified name with imported prefix" {
+    const allocator = std.testing.allocator;
+    var ctx = FileContext.init(allocator, "test.php");
+    defer ctx.deinit();
+    ctx.namespace = "App";
+
+    try ctx.addUseStatement(.{ .fqcn = "Vendor\\Foo", .alias = null, .kind = .class });
+
+    const result = try ctx.resolveFQCN("Foo\\Bar");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Vendor\\Foo\\Bar", result);
+}
+
+test "resolveFQCN: namespace prepend when no use match" {
+    const allocator = std.testing.allocator;
+    var ctx = FileContext.init(allocator, "test.php");
+    defer ctx.deinit();
+    ctx.namespace = "App\\Services";
+
+    const result = try ctx.resolveFQCN("UserService");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("App\\Services\\UserService", result);
+}
+
+test "resolveFQCN: no namespace no use returns unchanged" {
+    const allocator = std.testing.allocator;
+    var ctx = FileContext.init(allocator, "test.php");
+    defer ctx.deinit();
+
+    const result = try ctx.resolveFQCN("SomeClass");
+    try std.testing.expectEqualStrings("SomeClass", result);
+}

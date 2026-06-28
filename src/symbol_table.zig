@@ -25,6 +25,11 @@ pub const SymbolTable = struct {
     // `null` until a view is attached; lookups then fall back to raw members.
     resolved: ?*const ResolvedView = null,
 
+    // Guards the origin-style in-place `resolveInheritance` (which populates
+    // each `ClassSymbol.all_methods`/`all_properties`). The local MCP path uses
+    // `ResolvedView` instead and leaves this false.
+    inheritance_resolved: bool = false,
+
     pub fn init(allocator: std.mem.Allocator) SymbolTable {
         return .{
             .classes = std.StringHashMap(ClassSymbol).init(allocator),
@@ -250,6 +255,147 @@ pub const SymbolTable = struct {
         });
         defer self.allocator.free(msg);
         try file.writeStreamingAll(types.io, msg);
+    }
+
+    pub fn resolveInheritance(self: *SymbolTable) !void {
+        if (self.inheritance_resolved) return;
+
+        // Get classes in topological order (parents before children)
+        const sorted = try self.topologicalSortClasses();
+        defer self.allocator.free(sorted);
+
+        // Resolve each class in order
+        for (sorted) |fqcn| {
+            try self.resolveClassInheritance(fqcn);
+        }
+
+        self.inheritance_resolved = true;
+    }
+
+    /// Topologically sort classes so parents come before children
+    fn topologicalSortClasses(self: *SymbolTable) ![]const []const u8 {
+        var result: std.ArrayListUnmanaged([]const u8) = .empty;
+        var visited = std.StringHashMap(void).init(self.allocator);
+        defer visited.deinit();
+        var in_progress = std.StringHashMap(void).init(self.allocator);
+        defer in_progress.deinit();
+
+        var it = self.classes.keyIterator();
+        while (it.next()) |fqcn| {
+            try self.topologicalVisit(fqcn.*, &result, &visited, &in_progress);
+        }
+
+        return result.toOwnedSlice(self.allocator);
+    }
+
+    fn topologicalVisit(
+        self: *SymbolTable,
+        fqcn: []const u8,
+        result: *std.ArrayListUnmanaged([]const u8),
+        visited: *std.StringHashMap(void),
+        in_progress: *std.StringHashMap(void),
+    ) !void {
+        if (visited.contains(fqcn)) return;
+        if (in_progress.contains(fqcn)) {
+            // Cycle detected - just skip
+            return;
+        }
+
+        try in_progress.put(fqcn, {});
+
+        // Visit parent first
+        if (self.classes.get(fqcn)) |class| {
+            if (class.extends) |parent_fqcn| {
+                try self.topologicalVisit(parent_fqcn, result, visited, in_progress);
+            }
+        }
+
+        _ = in_progress.remove(fqcn);
+        try visited.put(fqcn, {});
+        try result.append(self.allocator, fqcn);
+    }
+
+    /// Resolve inheritance for a single class
+    fn resolveClassInheritance(self: *SymbolTable, fqcn: []const u8) !void {
+        const class = self.classes.getPtr(fqcn) orelse return;
+
+        // Build parent chain (with cycle detection)
+        var chain: std.ArrayListUnmanaged([]const u8) = .empty;
+        var seen = std.StringHashMap(void).init(self.allocator);
+        defer seen.deinit();
+        try seen.put(fqcn, {});
+        var current_fqcn = class.extends;
+        while (current_fqcn) |parent_fqcn| {
+            if (seen.contains(parent_fqcn)) break; // Cycle detected
+            try chain.append(self.allocator, parent_fqcn);
+            try seen.put(parent_fqcn, {});
+            if (self.classes.get(parent_fqcn)) |parent| {
+                current_fqcn = parent.extends;
+            } else {
+                break;
+            }
+        }
+        class.parent_chain = try chain.toOwnedSlice(self.allocator);
+
+        // Copy parent methods and properties
+        if (class.extends) |parent_fqcn| {
+            if (self.classes.getPtr(parent_fqcn)) |parent| {
+                // Copy parent's all_methods
+                var method_it = parent.all_methods.iterator();
+                while (method_it.next()) |entry| {
+                    // Only copy if not overridden
+                    if (!class.methods.contains(entry.key_ptr.*)) {
+                        try class.all_methods.put(entry.key_ptr.*, entry.value_ptr.*);
+                    }
+                }
+
+                // Copy parent's all_properties
+                var prop_it = parent.all_properties.iterator();
+                while (prop_it.next()) |entry| {
+                    if (!class.properties.contains(entry.key_ptr.*)) {
+                        try class.all_properties.put(entry.key_ptr.*, entry.value_ptr.*);
+                    }
+                }
+            }
+        }
+
+        // Apply traits
+        for (class.uses) |trait_fqcn| {
+            try self.applyTrait(class, trait_fqcn);
+        }
+
+        // Add own methods (override inherited)
+        var own_method_it = class.methods.iterator();
+        while (own_method_it.next()) |entry| {
+            try class.all_methods.put(entry.key_ptr.*, entry.value_ptr);
+        }
+
+        // Add own properties
+        var own_prop_it = class.properties.iterator();
+        while (own_prop_it.next()) |entry| {
+            try class.all_properties.put(entry.key_ptr.*, entry.value_ptr);
+        }
+    }
+
+    /// Apply trait methods and properties to a class
+    fn applyTrait(self: *SymbolTable, class: *ClassSymbol, trait_fqcn: []const u8) !void {
+        const trait = self.traits.get(trait_fqcn) orelse return;
+
+        // Copy trait methods (unless already defined)
+        var method_it = trait.methods.iterator();
+        while (method_it.next()) |entry| {
+            if (!class.all_methods.contains(entry.key_ptr.*)) {
+                try class.all_methods.put(entry.key_ptr.*, entry.value_ptr);
+            }
+        }
+
+        // Copy trait properties
+        var prop_it = trait.properties.iterator();
+        while (prop_it.next()) |entry| {
+            if (!class.all_properties.contains(entry.key_ptr.*)) {
+                try class.all_properties.put(entry.key_ptr.*, entry.value_ptr);
+            }
+        }
     }
 };
 

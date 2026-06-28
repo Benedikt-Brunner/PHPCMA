@@ -135,15 +135,21 @@ pub const SymbolCollector = struct {
         var fqcn: ?[]const u8 = null;
         var alias: ?[]const u8 = null;
 
+        // A `namespace_use_clause` lists the import path first — a `qualified_name`
+        // (`use Foo\Bar`) or a bare `name` (`use Foo`) — optionally followed by a
+        // trailing `name` that is the alias (`use Foo\Bar as Baz` parses as
+        // `qualified_name "Foo\Bar"` + `name "Baz"`; `use Foo as Bar` as two
+        // `name`s). So: the first path token is the FQCN, any subsequent `name`
+        // is the alias.
         var i: u32 = 0;
         while (i < node.namedChildCount()) : (i += 1) {
             if (node.namedChild(i)) |child| {
                 const child_kind = child.kind();
                 if (std.mem.eql(u8, child_kind, "qualified_name") or std.mem.eql(u8, child_kind, "name")) {
-                    fqcn = getNodeText(self.source, child);
-                } else if (std.mem.eql(u8, child_kind, "namespace_aliasing_clause")) {
-                    if (child.namedChild(0)) |alias_node| {
-                        alias = getNodeText(self.source, alias_node);
+                    if (fqcn == null) {
+                        fqcn = getNodeText(self.source, child);
+                    } else {
+                        alias = getNodeText(self.source, child);
                     }
                 }
             }
@@ -293,7 +299,7 @@ pub const SymbolCollector = struct {
         const fallback_raw = default orelse bound;
         const fallback: ?[]const u8 = if (fallback_raw) |f| blk: {
             if (f.len == 0 or types.TypeInfo.isBuiltin(f)) break :blk null;
-            break :blk try self.allocator.dupe(u8, self.file_context.resolveFQCN(f));
+            break :blk try self.allocator.dupe(u8, try self.file_context.resolveFQCN(f));
         } else null;
 
         return .{ .name = name, .fallback = fallback };
@@ -349,7 +355,7 @@ pub const SymbolCollector = struct {
         if (types.TypeInfo.isBuiltin(arg)) return try self.allocator.dupe(u8, arg);
         // Strip any nested generics on the arg itself (e.g. `Foo<Bar>` -> `Foo`).
         const base = if (std.mem.indexOfScalar(u8, arg, '<')) |lt| arg[0..lt] else arg;
-        return try self.allocator.dupe(u8, self.file_context.resolveFQCN(base));
+        return try self.allocator.dupe(u8, try self.file_context.resolveFQCN(base));
     }
 
     fn parseExtendsClause(self: *SymbolCollector, node: ts.Node, class: *ClassSymbol) !void {
@@ -359,7 +365,7 @@ pub const SymbolCollector = struct {
                 const child_kind = child.kind();
                 if (std.mem.eql(u8, child_kind, "name") or std.mem.eql(u8, child_kind, "qualified_name")) {
                     const parent_name = getNodeText(self.source, child);
-                    class.extends = try self.allocator.dupe(u8, self.file_context.resolveFQCN(parent_name));
+                    class.extends = try self.allocator.dupe(u8, try self.file_context.resolveFQCN(parent_name));
                     break;
                 }
             }
@@ -376,7 +382,7 @@ pub const SymbolCollector = struct {
                 const child_kind = child.kind();
                 if (std.mem.eql(u8, child_kind, "name") or std.mem.eql(u8, child_kind, "qualified_name")) {
                     const parent_name = getNodeText(self.source, child);
-                    const fqcn = self.file_context.resolveFQCN(parent_name);
+                    const fqcn = try self.file_context.resolveFQCN(parent_name);
                     try extends_list.append(self.allocator, try self.allocator.dupe(u8, fqcn));
                 }
             }
@@ -392,7 +398,7 @@ pub const SymbolCollector = struct {
                 const child_kind = child.kind();
                 if (std.mem.eql(u8, child_kind, "name") or std.mem.eql(u8, child_kind, "qualified_name")) {
                     const iface_name = getNodeText(self.source, child);
-                    const fqcn = self.file_context.resolveFQCN(iface_name);
+                    const fqcn = try self.file_context.resolveFQCN(iface_name);
                     try implements_list.append(self.allocator, try self.allocator.dupe(u8, fqcn));
                 }
             }
@@ -453,9 +459,9 @@ pub const SymbolCollector = struct {
                 if (!param.is_promoted) continue;
                 try class.addProperty(.{
                     .name = try self.allocator.dupe(u8, param.name),
-                    .visibility = .private,
+                    .visibility = param.promoted_visibility,
                     .is_static = false,
-                    .is_readonly = false,
+                    .is_readonly = param.promoted_readonly,
                     .declared_type = param.type_info,
                     .phpdoc_type = param.phpdoc_type,
                     .default_value_type = null,
@@ -552,6 +558,32 @@ pub const SymbolCollector = struct {
             param.has_default = true;
         }
 
+        // For a promoted property, capture its declared visibility and `readonly`
+        // modifier from the parameter's modifier children (a
+        // `property_promotion_parameter` carries `visibility_modifier` and an
+        // optional `readonly_modifier`). PHP defaults promoted properties to
+        // `public` when no visibility is written.
+        if (param.is_promoted) {
+            var i: u32 = 0;
+            while (i < node.childCount()) : (i += 1) {
+                if (node.child(i)) |child| {
+                    const child_kind = child.kind();
+                    if (std.mem.eql(u8, child_kind, "visibility_modifier")) {
+                        const text = getNodeText(self.source, child);
+                        if (std.mem.eql(u8, text, "private")) {
+                            param.promoted_visibility = .private;
+                        } else if (std.mem.eql(u8, text, "protected")) {
+                            param.promoted_visibility = .protected;
+                        } else {
+                            param.promoted_visibility = .public;
+                        }
+                    } else if (std.mem.eql(u8, child_kind, "readonly_modifier")) {
+                        param.promoted_readonly = true;
+                    }
+                }
+            }
+        }
+
         return param;
     }
 
@@ -598,7 +630,7 @@ pub const SymbolCollector = struct {
         {
             return self.allocator.dupe(u8, token);
         }
-        return self.allocator.dupe(u8, self.file_context.resolveFQCN(token));
+        return self.allocator.dupe(u8, try self.file_context.resolveFQCN(token));
     }
 
     /// True when `info` refers to one of the current class's template parameters
@@ -736,7 +768,7 @@ pub const SymbolCollector = struct {
                 const child_kind = child.kind();
                 if (std.mem.eql(u8, child_kind, "name") or std.mem.eql(u8, child_kind, "qualified_name")) {
                     const trait_name = getNodeText(self.source, child);
-                    const fqcn = self.file_context.resolveFQCN(trait_name);
+                    const fqcn = try self.file_context.resolveFQCN(trait_name);
                     try traits.append(self.allocator, try self.allocator.dupe(u8, fqcn));
                 }
             }

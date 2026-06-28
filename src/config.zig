@@ -44,6 +44,147 @@ pub const PhpcmaConfig = struct {
     }
 };
 
+/// A called-before constraint from config
+pub const CalledBeforeConstraint = struct {
+    before: []const u8,
+    after: []const u8,
+};
+
+/// PHPCMA settings that can appear in .phpcma.json or composer.json extra.phpcma
+pub const PhpcmaSettings = struct {
+    checks: []const []const u8 = &.{},
+    strict: bool = false,
+    min_confidence: f64 = 0.0,
+    called_before: []const CalledBeforeConstraint = &.{},
+    plugins: []const []const u8 = &.{},
+    exclude: []const []const u8 = &.{},
+
+    pub fn deinit(self: *PhpcmaSettings, allocator: std.mem.Allocator) void {
+        for (self.checks) |s| allocator.free(s);
+        if (self.checks.len > 0) allocator.free(self.checks);
+
+        for (self.called_before) |cb| {
+            allocator.free(cb.before);
+            allocator.free(cb.after);
+        }
+        if (self.called_before.len > 0) allocator.free(self.called_before);
+
+        for (self.plugins) |s| allocator.free(s);
+        if (self.plugins.len > 0) allocator.free(self.plugins);
+
+        for (self.exclude) |s| allocator.free(s);
+        if (self.exclude.len > 0) allocator.free(self.exclude);
+    }
+};
+
+/// Parse a "phpcma" JSON object into PhpcmaSettings
+pub fn parsePhpcmaSettings(allocator: std.mem.Allocator, obj: std.json.Value) !PhpcmaSettings {
+    if (obj != .object) return PhpcmaSettings{};
+
+    var settings = PhpcmaSettings{};
+
+    // checks: string array
+    if (obj.object.get("checks")) |checks_val| {
+        if (checks_val == .array) {
+            var list: std.ArrayListUnmanaged([]const u8) = .empty;
+            for (checks_val.array.items) |item| {
+                if (item == .string) {
+                    try list.append(allocator, try allocator.dupe(u8, item.string));
+                }
+            }
+            settings.checks = try list.toOwnedSlice(allocator);
+        }
+    }
+
+    // strict: bool
+    if (obj.object.get("strict")) |strict_val| {
+        if (strict_val == .bool) {
+            settings.strict = strict_val.bool;
+        }
+    }
+
+    // min-confidence: float
+    if (obj.object.get("min-confidence")) |mc_val| {
+        switch (mc_val) {
+            .float => settings.min_confidence = mc_val.float,
+            .integer => settings.min_confidence = @floatFromInt(mc_val.integer),
+            else => {},
+        }
+    }
+
+    // called-before: array of {before, after}
+    if (obj.object.get("called-before")) |cb_val| {
+        if (cb_val == .array) {
+            var list: std.ArrayListUnmanaged(CalledBeforeConstraint) = .empty;
+            for (cb_val.array.items) |item| {
+                if (item == .object) {
+                    const before = item.object.get("before") orelse continue;
+                    const after = item.object.get("after") orelse continue;
+                    if (before != .string or after != .string) continue;
+                    try list.append(allocator, .{
+                        .before = try allocator.dupe(u8, before.string),
+                        .after = try allocator.dupe(u8, after.string),
+                    });
+                }
+            }
+            settings.called_before = try list.toOwnedSlice(allocator);
+        }
+    }
+
+    // plugins: string array
+    if (obj.object.get("plugins")) |plugins_val| {
+        if (plugins_val == .array) {
+            var list: std.ArrayListUnmanaged([]const u8) = .empty;
+            for (plugins_val.array.items) |item| {
+                if (item == .string) {
+                    try list.append(allocator, try allocator.dupe(u8, item.string));
+                }
+            }
+            settings.plugins = try list.toOwnedSlice(allocator);
+        }
+    }
+
+    // exclude: string array
+    if (obj.object.get("exclude")) |exclude_val| {
+        if (exclude_val == .array) {
+            var list: std.ArrayListUnmanaged([]const u8) = .empty;
+            for (exclude_val.array.items) |item| {
+                if (item == .string) {
+                    try list.append(allocator, try allocator.dupe(u8, item.string));
+                }
+            }
+            settings.exclude = try list.toOwnedSlice(allocator);
+        }
+    }
+
+    return settings;
+}
+
+/// Extract PhpcmaSettings from a composer.json's extra.phpcma section
+pub fn parseComposerExtraPhpcma(allocator: std.mem.Allocator, composer_path: []const u8) !?PhpcmaSettings {
+    const file = std.fs.openFileAbsolute(composer_path, .{}) catch {
+        return null;
+    };
+    defer file.close();
+
+    const content = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch {
+        return null;
+    };
+    defer allocator.free(content);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch {
+        return null;
+    };
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    const extra = root.object.get("extra") orelse return null;
+    if (extra != .object) return null;
+    const phpcma = extra.object.get("phpcma") orelse return null;
+
+    return try parsePhpcmaSettings(allocator, phpcma);
+}
+
 /// Parse a .phpcma.json configuration file and discover all composer projects
 pub fn parseConfigFile(allocator: std.mem.Allocator, config_path: []const u8) !PhpcmaConfig {
     // Determine root path (directory containing .phpcma.json)

@@ -43,6 +43,11 @@ out="$(printf '%s\n' \
   '{"jsonrpc":"2.0","id":37,"method":"tools/call","params":{"name":"impact","arguments":{"fqn":"Test\\Logger::log","simulate":{"param_type_change":{"position":0,"to":"Test\\Logger"}}}}}' \
   '{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"impact","arguments":{"fqn":"Test\\Logger::log"}}}' \
   '{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"query","arguments":{"query":{"start":{"fqn":"Test\\Notify\\SmsNotifier::send"},"traverse":{"direction":"callers","max_depth":3},"select":"edges"}}}}' \
+  '{"jsonrpc":"2.0","id":40,"method":"tools/call","params":{"name":"check_dead","arguments":{}}}' \
+  '{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"check_types","arguments":{}}}' \
+  '{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"null_safety","arguments":{}}}' \
+  '{"jsonrpc":"2.0","id":43,"method":"tools/call","params":{"name":"return_types","arguments":{}}}' \
+  '{"jsonrpc":"2.0","id":44,"method":"tools/call","params":{"name":"report","arguments":{}}}' \
   | "$bin" mcp 2>/dev/null)"
 
 fail() { echo "FAIL: $1" >&2; echo "--- full output ---" >&2; echo "$out" >&2; exit 1; }
@@ -70,7 +75,7 @@ sys.exit(1)
 PY
 }
 
-check 2 "sorted([t['name'] for t in r['tools']]) == ['called_before','check_conformance','dependencies','describe_symbol','find_by_type','impact','load_project','query','references','resolve_interface']" "tools/list" || fail "tools/list"
+check 2 "sorted([t['name'] for t in r['tools']]) == ['called_before','check_boundaries','check_conformance','check_dead','check_types','dependencies','describe_symbol','find_by_type','impact','load_project','null_safety','query','references','report','resolve_interface','return_types']" "tools/list" || fail "tools/list"
 check 3 "'PHPCMA project loaded' in txt" "load_project" || fail "load_project"
 # Priming payload exposes active plugins, synthetic-edge count, and the
 # unresolved-reason breakdown (milestone 0 observability/transparency).
@@ -131,6 +136,45 @@ check 22 "json.loads(txt)['groups'][0]['caller_count'] >= 1 and json.loads(txt)[
 # resolve to SmsNotifier::send (confidence 0.85 == di_config_binding).
 check 21 "[e for e in json.loads(txt)['edges'] if e['from'] == 'Test\\\\Notify\\\\SignupService::register' and abs(e['confidence'] - 0.85) < 0.01]" "phase-b di binding on disk" || fail "phase-b di binding"
 
+# --- Analyzer tools over the loaded index ------------------------------------
+# check_dead: liveness sweep returns a summary + trust caveats.
+check 40 "'dead_total' in json.loads(txt)['summary'] and 'resolution_rate' in json.loads(txt)['caveats'] and 'kept_alive_by_unresolved' in json.loads(txt)['caveats']" "check_dead summary" || fail "check_dead"
+# check_types: single composer project => no cross-project calls/violations.
+check 41 "json.loads(txt)['summary']['cross_project_calls'] == 0 and json.loads(txt)['summary']['violations'] == 0" "check_types empty" || fail "check_types"
+# null_safety: returns aggregate guarded/unguarded counts.
+check 42 "'guarded_accesses' in json.loads(txt)['summary'] and 'unguarded_accesses' in json.loads(txt)['summary'] and isinstance(json.loads(txt)['violations'], list)" "null_safety summary" || fail "null_safety"
+# return_types: CFG-based check reports analyzed/verified/uncertain tallies.
+check 43 "json.loads(txt)['summary']['methods_analyzed'] >= 1 and 'methods_verified' in json.loads(txt)['summary'] and 'methods_uncertain' in json.loads(txt)['summary']" "return_types summary" || fail "return_types"
+# report: canonical unified report — coverage + type_checks + dead_code present.
+check 44 "'coverage' in json.loads(txt) and 'type_checks' in json.loads(txt) and 'dead_code' in json.loads(txt) and 'resolution_rate' in json.loads(txt)['coverage']" "report shape" || fail "report"
+
+# Golden equivalence: the MCP `report` tool emits byte-identical JSON to the
+# `report` CLI command (`report == CLI report`).
+echo "==> golden check: MCP report == CLI report --format json"
+"$bin" report -c "$composer" --format json > /tmp/phpcma_cli_report.json 2>/dev/null
+python3 - "$out" <<'PY'
+import sys, json
+out = sys.argv[1]
+cli = open('/tmp/phpcma_cli_report.json').read()
+mcp_txt = None
+for line in out.splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    o = json.loads(line)
+    if o.get("id") == 44:
+        mcp_txt = o["result"]["content"][0]["text"]
+        break
+if mcp_txt is None:
+    print("FAIL [report golden]: no report response", file=sys.stderr); sys.exit(1)
+if mcp_txt != cli:
+    print("FAIL [report golden]: MCP report != CLI report", file=sys.stderr)
+    print(f"  MCP len={len(mcp_txt)} CLI len={len(cli)}", file=sys.stderr)
+    sys.exit(1)
+print("    OK: report JSON is byte-identical")
+PY
+[ $? -eq 0 ] || fail "report golden equivalence"
+
 # --- Cross-package dependencies tool against a monorepo fixture ---------------
 mono="$repo_root/test-project-mono/.phpcma.json"
 echo "==> driving dependencies session (monorepo: $mono)"
@@ -144,6 +188,7 @@ mono_out="$(printf '%s\n' \
   '{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"dependencies","arguments":{"min_call_count":99}}}' \
   '{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"dependencies","arguments":{"include_api_surface":true,"to":"beta"}}}' \
   '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"impact","arguments":{"fqn":"Alpha\\Api::getData","verbose":true}}}' \
+  '{"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"check_boundaries","arguments":{}}}' \
   | "$bin" mcp 2>/dev/null)"
 
 mono_check() { # <id> <python-expr over `r`> <label>
@@ -196,5 +241,10 @@ mono_check 12 "json.loads(txt)['symbol_project'] == 'alpha'" "impact symbol proj
 mono_check 12 "json.loads(txt)['risk'] == 'public_api_low'" "impact risk" || mono_fail "impact risk"
 mono_check 12 "json.loads(txt)['summary']['cross_package_callers'] == 1" "impact cross count" || mono_fail "impact cross count"
 mono_check 12 "json.loads(txt)['groups'][0]['project'] == 'beta' and json.loads(txt)['groups'][0]['callers'][0]['caller'] == 'Beta\\\\Consumer::run'" "impact grouped caller" || mono_fail "impact grouped caller"
+
+# check_boundaries: the boundary verdict sees both projects and the one
+# cross-package call, attributed beta -> alpha.
+mono_check 17 "json.loads(txt)['summary']['projects'] == 2 and json.loads(txt)['summary']['cross_package_calls'] == 1" "check_boundaries summary" || mono_fail "check_boundaries summary"
+mono_check 17 "json.loads(txt)['dependencies'][0]['from'] == 'beta' and json.loads(txt)['dependencies'][0]['to'] == 'alpha'" "check_boundaries edge" || mono_fail "check_boundaries edge"
 
 echo "==> all MCP smoke checks passed"
