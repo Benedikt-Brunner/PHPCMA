@@ -151,14 +151,14 @@ Linear pipeline, evaluated server-side over the in-RAM graph:
   "start":    { "fqn": "App\\Service::save" },
               { "match": { "kind": "method|function|class",
                            "name": "*::save",
-                           "namespace_prefix": "Shopware\\",
+                           "namespace_prefix": "App\\",
                            "file": "src/..." } },
   "traverse": { "direction": "callers|callees",
                 "min_depth": 1, "max_depth": 5,
                 "edge_filter": { "min_confidence": 0.5,
                                  "include_synthetic": true,
                                  "include_unresolved": false } },
-  "where":    { "kind": "method", "namespace_prefix": "Shopware\\" },
+  "where":    { "kind": "method", "namespace_prefix": "App\\" },
   "select":   "nodes | edges | count | paths",
   "limit": 200, "cursor": "..."
 }

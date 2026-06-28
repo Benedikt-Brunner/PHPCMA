@@ -392,7 +392,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_gen_tests.step);
 
     // ----------------------------------------------------------------
-    // Corpus Tests (requires corpus on disk)
+    // Corpus Tests (require a real PHP corpus on disk via PHPCMA_CORPUS_ROOT)
     // ----------------------------------------------------------------
     const corpus_step = b.step("corpus-test", "Run corpus integration tests (requires PHPCMA_CORPUS_ROOT)");
 

@@ -360,7 +360,7 @@ echo ""
 # ============================================================================
 CORPUS_CONFIG="${PHPCMA_CORPUS_ROOT:-.}/.phpcma.json"
 if [ -f "$CORPUS_CONFIG" ]; then
-    echo "Test 12: Resolution rate on corpus (vs baseline 31.4%)"
+    echo "Test 12: Resolution rate on corpus (framework stubs should improve it)"
     OUTPUT=$("$PHPCMA" report --config="$CORPUS_CONFIG" --format=text 2>&1) || true
     EXIT_CODE=$?
 
@@ -371,15 +371,15 @@ if [ -f "$CORPUS_CONFIG" ]; then
     if [ -n "$RATE" ]; then
         TOTAL=$((TOTAL + 1))
         RATE_INT=$(echo "$RATE" | cut -d. -f1)
-        # Baseline was 31.4%. Framework stubs should push this above 31.4%.
-        # The theoretical max uplift from stubs alone is +24.6pp → ~56%.
-        # We conservatively check for > 31% to verify improvement.
+        # Framework API stubs should push the resolution rate up. We
+        # conservatively require it to clear a low floor (> 31%) to confirm
+        # the stubs are wired in and improving resolution on a real corpus.
         if [ "$RATE_INT" -ge 32 ]; then
             PASS=$((PASS + 1))
-            echo "  ✓ resolution rate ${RATE}% > 31.4% baseline (stubs improve resolution)"
+            echo "  ✓ resolution rate ${RATE}% clears the floor (stubs improve resolution)"
         else
             FAIL=$((FAIL + 1))
-            echo "  ✗ resolution rate ${RATE}% <= 31.4% baseline (no improvement from stubs)"
+            echo "  ✗ resolution rate ${RATE}% below floor (no improvement from stubs)"
         fi
     else
         TOTAL=$((TOTAL + 1))

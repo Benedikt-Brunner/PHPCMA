@@ -3717,10 +3717,10 @@ fn dumpDiagnosticSamplesIfEnabled(index: *ProjectIndex) void {
 }
 
 /// Split every call edge by the origin of its *caller* file — first-party
-/// (anywhere outside a `vendor/` checkout) vs core/vendor — and
-/// report resolved/total for each. This isolates how well the first-party code's
-/// own outgoing calls resolve once core/vendor is indexed, separate from the
-/// (large) volume of core-internal edges. Diagnostic-only.
+/// (anywhere outside a `vendor/` directory) vs core/vendor — and report
+/// resolved/total for each. This isolates how well the first-party code's own
+/// outgoing calls resolve once core/vendor is indexed, separate from the
+/// (large) volume of vendor-internal edges. Diagnostic-only.
 fn dumpResolutionByOrigin(index: *ProjectIndex) void {
     var fp_total: usize = 0;
     var fp_resolved: usize = 0;

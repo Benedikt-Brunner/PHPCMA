@@ -33,9 +33,9 @@ test "writeJsonString escapes backslashes" {
     var buf: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
 
-    try writeJsonString(&w, "BenediktBrunner\\ProductBundle");
+    try writeJsonString(&w, "App\\ProductBundle");
     const result = w.buffered();
-    try std.testing.expectEqualStrings("\"BenediktBrunner\\\\ProductBundle\"", result);
+    try std.testing.expectEqualStrings("\"App\\\\ProductBundle\"", result);
 }
 
 test "writeJsonString escapes quotes" {
