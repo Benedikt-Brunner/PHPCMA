@@ -20,10 +20,10 @@ to detect regressions in parsing, type resolution, and dead code analysis.
 zig build -Doptimize=ReleaseFast
 
 # For a single composer project:
-./scripts/corpus-snapshot.sh /path/to/project test/corpus/project-name.golden.json
+./scripts/corpus-snapshot.sh /path/to/project tests/corpus/project-name.golden.json
 
 # For a monorepo with .phpcma.json:
-./scripts/corpus-snapshot.sh /path/to/monorepo test/corpus/name.golden.json --config
+./scripts/corpus-snapshot.sh /path/to/monorepo tests/corpus/name.golden.json --config
 ```
 
 ## Updating a golden file after intentional changes
@@ -31,8 +31,8 @@ zig build -Doptimize=ReleaseFast
 When you've made changes that intentionally affect analysis results:
 
 ```bash
-./scripts/corpus-snapshot.sh /path/to/project test/corpus/project-name.golden.json
-git add test/corpus/project-name.golden.json
+./scripts/corpus-snapshot.sh /path/to/project tests/corpus/project-name.golden.json
+git add tests/corpus/project-name.golden.json
 git commit -m "chore: update golden file after <description>"
 ```
 
@@ -43,7 +43,7 @@ git commit -m "chore: update golden file after <description>"
 ./zig-out/bin/PHPCMA report --composer=/path/to/project/composer.json --format=json > /tmp/actual.json
 
 # Compare against golden file
-python3 scripts/corpus-compare.py /tmp/actual.json test/corpus/project-name.golden.json
+python3 scripts/corpus-compare.py /tmp/actual.json tests/corpus/project-name.golden.json
 ```
 
 ## CI corpus: monolog/monolog

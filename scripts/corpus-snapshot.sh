@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # corpus-snapshot.sh — Run PHPCMA report on a corpus and save JSON output as golden file.
-# Usage: ./scripts/corpus-snapshot.sh /path/to/project test/corpus/project-name.golden.json
+# Usage: ./scripts/corpus-snapshot.sh /path/to/project tests/corpus/project-name.golden.json
 #
 # For monorepo mode (with .phpcma.json):
-#   ./scripts/corpus-snapshot.sh /path/to/monorepo test/corpus/name.golden.json --config
+#   ./scripts/corpus-snapshot.sh /path/to/monorepo tests/corpus/name.golden.json --config
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

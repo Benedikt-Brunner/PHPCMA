@@ -213,7 +213,7 @@ worst possible outcome — worse than being slow.
 - **Arena lifecycle test:** many `load_project`/reload cycles under leak
   detection — per-file arena reset reclaims; Tier-2 reset has no
   use-after-reset into Tier-1.
-- Existing `test-project/` fixtures and inline Zig `test` blocks are the
+- Existing `fixtures/project/` fixtures and inline Zig `test` blocks are the
   substrate.
 
 ## Implementation order (suggested)

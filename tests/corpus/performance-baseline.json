@@ -1,5 +1,5 @@
 {
-  "corpus": "test-project",
+  "corpus": "project",
   "files": 10,
   "wall_clock_median_ms": 6,
   "cpu_time_median_ms": 4,

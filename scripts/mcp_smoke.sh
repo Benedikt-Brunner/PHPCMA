@@ -7,14 +7,14 @@
 # so it can gate CI / pre-push.
 #
 # Usage: scripts/mcp_smoke.sh [path/to/composer.json]
-#   Defaults to the bundled test-project.
+#   Defaults to the bundled fixtures/project.
 
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-composer="${1:-$repo_root/test-project/composer.json}"
+composer="${1:-$repo_root/fixtures/project/composer.json}"
 bin="$repo_root/zig-out/bin/PHPCMA"
 
 echo "==> building"
@@ -176,7 +176,7 @@ PY
 [ $? -eq 0 ] || fail "report golden equivalence"
 
 # --- Cross-package dependencies tool against a monorepo fixture ---------------
-mono="$repo_root/test-project-mono/.phpcma.json"
+mono="$repo_root/fixtures/monorepo/.phpcma.json"
 echo "==> driving dependencies session (monorepo: $mono)"
 mono_out="$(printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"smoke","version":"1.0"}}}' \

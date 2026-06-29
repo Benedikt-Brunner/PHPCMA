@@ -725,7 +725,7 @@ test "file discovery on test-project finds all 15 PHP files" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var config = try parseComposerJsonRelative(allocator, "test-project/composer.json");
+    var config = try parseComposerJsonRelative(allocator, "fixtures/project/composer.json");
     defer config.deinit();
 
     const files = try discoverFiles(allocator, &config);

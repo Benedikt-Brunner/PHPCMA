@@ -160,7 +160,7 @@ inlines collect→resolve→callgraph in `main.zig` with `parallel.zig`; local h
    strategy to stay crash-free under parallelism.
 
 **Exit gate:** single `ProjectIndex` build path; CLI and MCP produce identical
-`sym_table`/`call_graph`; resolution rate on `test-project/` ≥ pre-merge with
+`sym_table`/`call_graph`; resolution rate on `fixtures/project/` ≥ pre-merge with
 framework stubs measurably improving it; `zig build test` green.
 
 ---
@@ -212,8 +212,8 @@ projection. `zig build test` green.
 side build.
 
 1. **CI (`.github/workflows/ci.yml`):** add a job step that builds the `mcp`
-   binary and runs `scripts/mcp_smoke.sh` against `test-project/` and
-   `test-project-mono/`. Gate merges on it, same as origin's other test
+   binary and runs `scripts/mcp_smoke.sh` against `fixtures/project/` and
+   `fixtures/monorepo/`. Gate merges on it, same as origin's other test
    pipelines.
 2. **Contributor gate ([`AGENTS.md`](../AGENTS.md)):** origin's rule is "ALL test
    pipelines pass before commit." Add `mcp_smoke.sh` to that enumerated list so
@@ -242,7 +242,7 @@ binary documents `phpcma mcp`; composer plugin docs cover MCP setup.
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
-| Struct-superset merges in `call_analyzer`/`types`/`symbol_table` silently change resolution behavior | High | After Phase 1, diff resolution rate on `test-project/` before vs after; add an invariant test (origin already has call-graph correctness invariants). |
+| Struct-superset merges in `call_analyzer`/`types`/`symbol_table` silently change resolution behavior | High | After Phase 1, diff resolution rate on `fixtures/project/` before vs after; add an invariant test (origin already has call-graph correctness invariants). |
 | `boundary_analyzer` v1↔v2 reconciliation loses a local capability | Medium | Before deleting v1, list its public fns; port anything v2 lacks; keep v1 in `mcp-wip` branch for reference. |
 | Origin's inline `main.zig` pipeline and local `ProjectIndex` diverge in symbol-collection details (origin inlines collection; local extracted it) | Medium | Phase 2 makes `ProjectIndex` the single source; add a test asserting CLI and MCP produce identical edge counts on a fixture. |
 | Memory model mismatch (per-thread arenas vs ProjectIndex allocator) causes use-after-free under parallelism | Medium | Adopt origin's converged arena strategy in `ProjectIndex`; run origin's 9 parallel memory-safety tests against the merged build. |

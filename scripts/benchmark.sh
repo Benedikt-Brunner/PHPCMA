@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PHPCMA="$PROJECT_ROOT/zig-out/bin/PHPCMA"
 RUNS=5
-CORPUS_COMPOSER="$PROJECT_ROOT/test-project/composer.json"
+CORPUS_COMPOSER="$PROJECT_ROOT/fixtures/project/composer.json"
 OUTPUT=""
 
 while [[ $# -gt 0 ]]; do

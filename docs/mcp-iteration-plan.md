@@ -8,7 +8,7 @@ Nothing remains deferred.
 **Final tally:** `zig build test` → 60/60 (from a 29-test baseline);
 `bash scripts/mcp_smoke.sh` → passed. MCP tool surface grew from 3 to 6 tools:
 `load_project`, `query`, `called_before` (pre-existing) plus `dependencies`,
-`impact`, `references` (new). Resolution rate on `test-project/` rose from
+`impact`, `references` (new). Resolution rate on `fixtures/project/` rose from
 0% instance-call resolution to 100% (21/21 edges) after the DI/property fixes.
 
 **Post-plan follow-on (done):**
@@ -91,7 +91,7 @@ All four goals landed: `zig build test` 34/34 green (+5 tests),
 - 0.3: `ConfigFingerprint` — same-path reload re-parses config when the file
   changed on disk ([mcp_server.zig](../src/mcp_server.zig)).
 - 0.4: active-plugins line + synthetic-edge count in the priming payload.
-- Fixture: `test-project/tests/LoggerUsageTest.php` (`Tests\` namespace) exercises
+- Fixture: `fixtures/project/tests/LoggerUsageTest.php` (`Tests\` namespace) exercises
   `exclude_tests` end-to-end in the smoke script.
 
 ### Goal 0.1 — Test/production edge classification ✅
@@ -159,7 +159,7 @@ cross_package_calls[], api_surface_used[]}`; each cross-package finding carries
 `resolution` + `is_test`; `exclude_tests` honored (default true); `caveats`
 surfaces `unresolved_calls`/`resolution_rate`/`tests_excluded` (the
 never-silently-under-report guarantee). 4 unit tests + a monorepo smoke session
-(`test-project-mono/`). 38/38 tests green; smoke green.
+(`fixtures/monorepo/`). 38/38 tests green; smoke green.
 
 Scope note vs. original wording: the tool reports cross-package *coupling* (the
 raw signal) rather than judging calls "illegal" against a declared dependency
@@ -244,7 +244,7 @@ fixed, which is the bulk of the win.
   `resolution_method = .interface_single_impl` with confidence `0.6` (real but
   inferred), distinct from `1.0` concrete resolution.
 
-**Quantified delta (recorded):** on `test-project/`, instance-call resolution
+**Quantified delta (recorded):** on `fixtures/project/`, instance-call resolution
 went from **0% (all name-bridged/unresolved)** to **100% (21/21 edges resolved,
 0 unresolved)** in the `load_project` priming payload. The full interprocedural
 chain `DeepCaller::process → MiddleService → InnerService → Logger::log` now
@@ -255,7 +255,7 @@ resolves (previously invisible). A new single-implementor interface call
 - `DI-aware: interface-typed property resolves to single implementor`
 - `DI-aware: interface with two implementors stays unresolved (ambiguous)`
 - `constructor-promoted property resolves a concrete method call`
-- Fixtures added: `test-project/src/Notify/{NotifierInterface,EmailNotifier,
+- Fixtures added: `fixtures/project/src/Notify/{NotifierInterface,EmailNotifier,
   SignupService}.php`.
 - `zig build test --summary all` → 43/43; `bash scripts/mcp_smoke.sh` → passed
   (smoke updated: resolution-rate trust-signal assertion; the per-reason
@@ -300,7 +300,7 @@ the DI container, not the type system. Phase B reads that config.
   overrides the single implementor` (via `_defaults.bind`). ✅
 - No false edges to unknown concretes: `DI-aware Phase B: binding to an unknown
   concrete is ignored` (call stays unresolved). ✅
-- End-to-end on disk: `test-project/config/services.yaml` binds the now-ambiguous
+- End-to-end on disk: `fixtures/project/config/services.yaml` binds the now-ambiguous
   `Test\Notify\NotifierInterface` (two implementors) to `SmsNotifier`; smoke
   asserts `SignupService::register → SmsNotifier::send` at confidence 0.85.
 - `zig build test --summary all` → 60/60; `bash scripts/mcp_smoke.sh` → passed.

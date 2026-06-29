@@ -443,7 +443,7 @@ scan. No traversal.
 - `resolve_interface: single implementor → single_impl 0.6`.
 - `resolve_interface: services.yaml binding wins over multiple implementors →
   di_config 0.85` (reuse the Phase-B fixture
-  `test-project/config/services.yaml`).
+  `fixtures/project/config/services.yaml`).
 - `resolve_interface: reverse — class reports the interfaces it is bound for`.
 - Smoke: `resolve_interface` on the bound `NotifierInterface` asserts
   `resolves_to=SmsNotifier`, `kind=di_config`.

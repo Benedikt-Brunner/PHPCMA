@@ -5,7 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-RESULT_DIR="$REPO_ROOT/test/differential"
+RESULT_DIR="$REPO_ROOT/tests/differential"
 RESULT_FILE="$RESULT_DIR/results.md"
 
 DEFAULT_PACKAGES=(

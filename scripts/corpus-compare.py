@@ -2,7 +2,7 @@
 """Compare actual PHPCMA report JSON against a golden file.
 
 Usage:
-    python3 scripts/corpus-compare.py actual.json test/corpus/monolog.golden.json
+    python3 scripts/corpus-compare.py actual.json tests/corpus/monolog.golden.json
 
 Exit codes:
     0 — All checks passed

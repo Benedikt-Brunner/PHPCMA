@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PHPCMA="$PROJECT_ROOT/zig-out/bin/PHPCMA"
 TEST_PHP="$PROJECT_ROOT/test.php"
-TEST_PROJECT="$PROJECT_ROOT/test-project/composer.json"
+TEST_PROJECT="$PROJECT_ROOT/fixtures/project/composer.json"
 TMPDIR_E2E="$(mktemp -d)"
 
 PASS=0
